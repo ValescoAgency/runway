@@ -2,13 +2,13 @@
   "name": "@valescoagency/runway",
   "version": "0.1.0",
   "private": true,
-  "description": "Linear-driven orchestrator that runs coding agents in Sandcastle.",
+  "description": "Linear-driven orchestrator + scaffolder for coding agents on Sandcastle. `runway init` scaffolds a target repo (sandcastle + varlock + 1Password); `runway run` drains a Linear queue against it.",
   "type": "module",
   "bin": {
     "runway": "./bin/runway.mjs"
   },
   "scripts": {
-    "dev": "tsx src/cli.ts",
+    "runway": "tsx src/cli.ts",
     "typecheck": "tsc --noEmit",
     "lint": "echo 'lint not configured yet'"
   },
