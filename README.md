@@ -56,6 +56,22 @@ cp .sandcastle/.env.example .sandcastle/.env
 Sandcastle owns the per-repo `.sandcastle/` directory. Runway never
 writes to it.
 
+## Secrets — recommended: varlock + 1Password
+
+If you don't want any secret sitting at rest in any `.env` file,
+runway integrates [varlock](https://varlock.dev). Two layers (host +
+in-container), both opt-in. Full walk-through:
+[`docs/secrets-with-varlock.md`](docs/secrets-with-varlock.md).
+
+TL;DR for the host layer:
+
+```bash
+varlock run --schema /path/to/runway/.env.schema -- runway --max 3
+```
+
+Without varlock, runway falls back to plain `process.env` and
+sandcastle reads `.sandcastle/.env` per its docs.
+
 ## Setup runway itself
 
 ```bash

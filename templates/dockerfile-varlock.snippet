@@ -1,0 +1,38 @@
+# =============================================================================
+# Append this to your `.sandcastle/Dockerfile` AFTER `npx sandcastle init`,
+# right before the final `ENTRYPOINT ["sleep", "infinity"]` line.
+# =============================================================================
+
+# Pull the varlock binary from its official image (multi-stage).
+COPY --from=ghcr.io/dmno-dev/varlock:latest /usr/local/bin/varlock /usr/local/bin/varlock
+
+# Install the 1Password CLI so varlock can resolve `op://` references.
+USER root
+RUN curl -sS https://downloads.1password.com/linux/keys/1password.asc \
+      | gpg --dearmor -o /usr/share/keyrings/1password-archive-keyring.gpg \
+  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/1password-archive-keyring.gpg] https://downloads.1password.com/linux/debian/$(dpkg --print-architecture) stable main" \
+      > /etc/apt/sources.list.d/1password.list \
+  && apt-get update && apt-get install -y 1password-cli \
+  && rm -rf /var/lib/apt/lists/*
+
+# Shim the `claude` binary so every invocation runs through varlock.
+# The real binary moves to claude.real; the shim resolves secrets from
+# 1Password (using OP_SERVICE_ACCOUNT_TOKEN passed in by runway) and
+# execs the real claude with secrets in its process env. Secrets exist
+# only inside the lifetime of one claude invocation — never in any
+# image layer, never on the container filesystem.
+RUN mv /home/agent/.local/bin/claude /home/agent/.local/bin/claude.real \
+  && printf '%s\n' \
+       '#!/usr/bin/env bash' \
+       'set -euo pipefail' \
+       'exec varlock run --env-file /home/agent/workspace/.env.schema -- /home/agent/.local/bin/claude.real "$@"' \
+       > /home/agent/.local/bin/claude \
+  && chmod +x /home/agent/.local/bin/claude \
+  && chown agent:agent /home/agent/.local/bin/claude
+
+USER ${AGENT_UID}:${AGENT_GID}
+
+# Final ENTRYPOINT remains:
+#   ENTRYPOINT ["sleep", "infinity"]
+# Sandcastle will `docker exec <container> claude ...` and our shim
+# transparently wraps each invocation.

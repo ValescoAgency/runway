@@ -17,6 +17,14 @@ import { z } from "zod";
  */
 const ConfigSchema = z.object({
   linearApiKey: z.string().min(1, "LINEAR_API_KEY required"),
+  /**
+   * Optional. If present, forwarded into the sandcastle container so
+   * the in-container varlock + 1Password-CLI shim can resolve agent
+   * secrets at run time. If absent, the container falls back to
+   * sandcastle's normal `.sandcastle/.env` flow. See
+   * docs/secrets-with-varlock.md.
+   */
+  opServiceAccountToken: z.string().optional(),
   linearTeam: z.string().default("VA"),
   readyStatus: z.string().default("Todo"),
   inProgressStatus: z.string().default("In Progress"),
@@ -30,6 +38,7 @@ export type Config = z.infer<typeof ConfigSchema>;
 export function loadConfig(): Config {
   return ConfigSchema.parse({
     linearApiKey: process.env.LINEAR_API_KEY,
+    opServiceAccountToken: process.env.OP_SERVICE_ACCOUNT_TOKEN,
     linearTeam: process.env.RUNWAY_LINEAR_TEAM,
     readyStatus: process.env.RUNWAY_READY_STATUS,
     inProgressStatus: process.env.RUNWAY_IN_PROGRESS_STATUS,

@@ -112,7 +112,9 @@ async function processIssue(
   );
   const implementResult = await run({
     agent: claudeCode("claude-opus-4-6"),
-    sandbox: docker(),
+    sandbox: docker({
+      env: dockerEnv(config),
+    }),
     cwd,
     prompt: implementPrompt,
     branchStrategy: { type: "branch", branch },
@@ -138,7 +140,9 @@ async function processIssue(
   );
   const reviewResult = await run({
     agent: claudeCode("claude-opus-4-6"),
-    sandbox: docker(),
+    sandbox: docker({
+      env: dockerEnv(config),
+    }),
     cwd,
     prompt: reviewPrompt,
     branchStrategy: { type: "head" },
@@ -246,6 +250,21 @@ function stringifyResult(result: unknown): string {
     return JSON.stringify(result);
   }
   return String(result);
+}
+
+/**
+ * Env vars to inject into every sandcastle container. Today this is
+ * just OP_SERVICE_ACCOUNT_TOKEN (when present) so the in-container
+ * varlock shim can authenticate with 1Password and resolve
+ * ANTHROPIC_API_KEY / GH_TOKEN at agent run time. See
+ * docs/secrets-with-varlock.md for the full flow.
+ */
+function dockerEnv(config: Config): Record<string, string> {
+  const env: Record<string, string> = {};
+  if (config.opServiceAccountToken) {
+    env.OP_SERVICE_ACCOUNT_TOKEN = config.opServiceAccountToken;
+  }
+  return env;
 }
 
 function buildPrBody(issue: RunwayIssue): string {
