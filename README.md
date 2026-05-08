@@ -1,10 +1,19 @@
 # runway
 
-Linear-driven coding-agent orchestrator. Reads issues from Linear, runs
-[Sandcastle](https://github.com/mattpocock/sandcastle) per issue
-(Claude Code inside Docker), reviews the diff with a sub-agent, opens a
-PR, and updates Linear. Built for the "kick off, walk away, come back
-to a stack of PRs" workflow.
+A small CLI for two jobs: **scaffold** a target repo for autonomous
+coding-agent runs, then **drain** a Linear queue against it. Wraps
+[Sandcastle](https://github.com/mattpocock/sandcastle) (Claude Code
+inside Docker), [varlock](https://varlock.dev) + 1Password for
+zero-secrets-at-rest, and the `gh` CLI for PR creation.
+
+## Two commands
+
+| | |
+|---|---|
+| `runway init` | Scaffold the cwd repo for runway: `npx sandcastle init` + Valesco's varlock + 1Password customizations. Run **once per target repo**. |
+| `runway run` | Drain a Linear queue. For each `Todo` issue: branch, agent works, sub-agent reviews, PR opens (or `needs-human` label). Run **whenever you want a batch of work done**. |
+
+`runway --help` for the full usage; `runway <cmd> --help` per command.
 
 ## What runway is and isn't
 
@@ -47,14 +56,23 @@ runway (this CLI, on your Mac, run from inside the target repo)
 
 ```bash
 cd /path/to/your/repo
-npx sandcastle init
-# fills .sandcastle/{Dockerfile, prompt.md, .env.example, config.json}
-cp .sandcastle/.env.example .sandcastle/.env
-# fill ANTHROPIC_API_KEY and GH_TOKEN there
+runway init \
+  --op-account=valesco \
+  --op-vault=runway \
+  --anthropic-item=anthropic-api-key \
+  --gh-token-item=gh-token
 ```
 
-Sandcastle owns the per-repo `.sandcastle/` directory. Runway never
-writes to it.
+This runs `npx sandcastle init`, patches the generated `.sandcastle/Dockerfile`
+to bake in `varlock` + the 1Password CLI + a `claude` shim, scaffolds
+`.env.schema` at the repo root with op:// references to your 1Password vault,
+and deletes `.sandcastle/.env` so no secrets sit at rest. Review the diff,
+commit on a feature branch, open a PR.
+
+Pass `--tier=1` if you want the plain Sandcastle setup with `.sandcastle/.env`
+and no varlock (faster but secrets land on disk).
+
+Architecture walkthrough: [`docs/secrets-with-varlock.md`](docs/secrets-with-varlock.md).
 
 ## Secrets — recommended: varlock + 1Password
 
@@ -98,10 +116,12 @@ export LINEAR_API_KEY=lin_api_...
 
 ```bash
 cd /path/to/the/repo/you/want/agents/working/on
-runway              # drain the entire ready queue
-runway --max 3      # process at most 3 issues then exit
+runway run             # drain the entire ready queue
+runway run --max 3     # process at most 3 issues then exit
 runway --help
 ```
+
+`runway` (no subcommand) is an alias for `runway run` for back-compat.
 
 The CLI exits with 0 even if some issues hit HITL or errored — those
 are normal outcomes. Check Linear for the `needs-human` label and the

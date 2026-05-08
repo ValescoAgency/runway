@@ -1,89 +1,77 @@
-import { loadConfig } from "./config.js";
-import { createLinearGateway } from "./linear.js";
-import { createGithubGateway } from "./github.js";
-import {
-  assertSandcastleInitialised,
-  drainQueue,
-} from "./orchestrator.js";
+import { runCommand, printRunUsage } from "./commands/run.js";
+import { initCommand, printInitUsage } from "./commands/init.js";
 
-interface CliOptions {
-  readonly max?: number;
+interface Subcommand {
+  readonly name: string;
+  readonly summary: string;
+  readonly run: (argv: readonly string[]) => Promise<void>;
+  readonly help: () => void;
 }
 
-function parseArgs(argv: readonly string[]): CliOptions {
-  const opts: { max?: number } = {};
-  for (let i = 0; i < argv.length; i += 1) {
-    const a = argv[i];
-    if (a === "--max" || a === "-n") {
-      const v = argv[i + 1];
-      if (!v) throw new Error("--max requires a number");
-      const n = Number.parseInt(v, 10);
-      if (!Number.isFinite(n) || n <= 0) {
-        throw new Error(`--max must be a positive integer, got "${v}"`);
-      }
-      opts.max = n;
-      i += 1;
-    } else if (a === "--help" || a === "-h") {
-      printUsage();
-      process.exit(0);
-    } else if (a) {
-      throw new Error(`unknown argument: ${a}`);
-    }
-  }
-  return opts;
-}
+const SUBCOMMANDS: readonly Subcommand[] = [
+  {
+    name: "run",
+    summary: "Drain a Linear queue against the cwd repo (default verb).",
+    run: runCommand,
+    help: printRunUsage,
+  },
+  {
+    name: "init",
+    summary: "Scaffold a target repo (sandcastle init + varlock layer).",
+    run: initCommand,
+    help: printInitUsage,
+  },
+];
 
-function printUsage(): void {
+function printRootUsage(): void {
   console.log(`runway — Linear-driven coding agent orchestrator
 
 USAGE
-  cd /path/to/your/repo
-  runway [run] [--max N]
+  runway <command> [options]
 
-PREREQUISITES
-  - The current directory must be a git repo with a .sandcastle/
-    directory. Run \`npx sandcastle init\` once per target repo.
-  - Docker Desktop (or Podman) running.
-  - \`gh\` CLI authenticated (\`gh auth status\`).
-  - LINEAR_API_KEY exported in your shell.
+COMMANDS`);
+  for (const cmd of SUBCOMMANDS) {
+    console.log(`  ${cmd.name.padEnd(8)} ${cmd.summary}`);
+  }
+  console.log(`
+  Run \`runway <command> --help\` for command-specific options.
 
-OPTIONS
-  --max, -n N     Process at most N issues then exit. Default: drain queue.
-  --help, -h      Show this help.
-
-ENVIRONMENT
-  LINEAR_API_KEY              required
-  RUNWAY_LINEAR_TEAM          default "VA"
-  RUNWAY_READY_STATUS         default "Todo"
-  RUNWAY_IN_PROGRESS_STATUS   default "In Progress"
-  RUNWAY_IN_REVIEW_STATUS     default "In Review"
-  RUNWAY_HITL_LABEL           default "needs-human"
-  RUNWAY_MAX_ITERATIONS       default 5
+GLOBAL
+  --help, -h     Show this help.
+  --version, -V  Show version.
 `);
 }
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
-  const args = argv[0] === "run" ? argv.slice(1) : argv;
 
-  const opts = parseArgs(args);
-  const cwd = process.cwd();
-  assertSandcastleInitialised(cwd);
+  if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h") {
+    printRootUsage();
+    process.exit(0);
+  }
+  if (argv[0] === "--version" || argv[0] === "-V") {
+    // Read package.json at runtime — single source of truth.
+    const { readFile } = await import("node:fs/promises");
+    const { fileURLToPath } = await import("node:url");
+    const { dirname, join } = await import("node:path");
+    const here = dirname(fileURLToPath(import.meta.url));
+    const pkg = JSON.parse(
+      await readFile(join(here, "..", "package.json"), "utf8"),
+    );
+    console.log(pkg.version);
+    process.exit(0);
+  }
 
-  const config = loadConfig();
-  const linear = createLinearGateway(config);
-  const github = createGithubGateway();
-
-  console.log(
-    `[runway] draining queue from team ${config.linearTeam} (status="${config.readyStatus}") against ${cwd}`,
-  );
-  const result = await drainQueue(
-    { config, linear, github, cwd },
-    { max: opts.max },
-  );
-  console.log(
-    `[runway] done — processed=${result.processed} opened=${result.opened} hitl=${result.hitl} errored=${result.errored}`,
-  );
+  // First arg may be a subcommand name. If it isn't, treat the whole
+  // argv as `run <argv>` (back-compat: `runway --max 3` still works).
+  const first = argv[0];
+  const matched = SUBCOMMANDS.find((c) => c.name === first);
+  if (matched) {
+    await matched.run(argv.slice(1));
+  } else {
+    // Implicit `run` — back-compat for old invocations.
+    await runCommand(argv);
+  }
 }
 
 main().catch((err) => {
