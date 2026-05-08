@@ -4,14 +4,19 @@ import { z } from "zod";
  * Runway runtime config. Loaded from process.env at startup. We fail
  * fast if a required value is missing — no point starting the loop and
  * blowing up halfway through an issue.
+ *
+ * Notable absences vs. typical agent runners:
+ *   - No ANTHROPIC_API_KEY here. Sandcastle reads it from the target
+ *     repo's `.sandcastle/.env` per its own conventions.
+ *   - No GH_TOKEN here. We use the `gh` CLI for PR creation; if the
+ *     user is logged in (`gh auth status`), it Just Works. If they
+ *     aren't, `gh pr create` errors out with a clear message — no need
+ *     for runway to second-guess.
+ *   - No RUNWAY_TARGET_REPO. Runway runs from inside the target repo
+ *     (`process.cwd()`), the same way `sandcastle run` does.
  */
 const ConfigSchema = z.object({
-  anthropicApiKey: z.string().min(1, "ANTHROPIC_API_KEY required"),
-  ghToken: z.string().min(1, "GH_TOKEN required"),
   linearApiKey: z.string().min(1, "LINEAR_API_KEY required"),
-  targetRepo: z
-    .string()
-    .min(1, "RUNWAY_TARGET_REPO required (absolute path to a local clone)"),
   linearTeam: z.string().default("VA"),
   readyStatus: z.string().default("Todo"),
   inProgressStatus: z.string().default("In Progress"),
@@ -24,10 +29,7 @@ export type Config = z.infer<typeof ConfigSchema>;
 
 export function loadConfig(): Config {
   return ConfigSchema.parse({
-    anthropicApiKey: process.env.ANTHROPIC_API_KEY,
-    ghToken: process.env.GH_TOKEN,
     linearApiKey: process.env.LINEAR_API_KEY,
-    targetRepo: process.env.RUNWAY_TARGET_REPO,
     linearTeam: process.env.RUNWAY_LINEAR_TEAM,
     readyStatus: process.env.RUNWAY_READY_STATUS,
     inProgressStatus: process.env.RUNWAY_IN_PROGRESS_STATUS,

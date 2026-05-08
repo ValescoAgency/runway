@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { run, claudeCode } from "@ai-hero/sandcastle";
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
 import { execa } from "execa";
@@ -5,16 +7,19 @@ import type { Config } from "./config.js";
 import type { LinearGateway, RunwayIssue } from "./linear.js";
 import type { GithubGateway } from "./github.js";
 import {
-  implementPromptArgs,
+  implementVars,
   loadImplementPrompt,
   loadReviewPrompt,
-  reviewPromptArgs,
+  renderPrompt,
+  reviewVars,
 } from "./prompts.js";
 
 export interface OrchestratorDeps {
   readonly config: Config;
   readonly linear: LinearGateway;
   readonly github: GithubGateway;
+  /** Absolute path of the target repo. Defaults to process.cwd(). */
+  readonly cwd: string;
 }
 
 export interface OrchestratorResult {
@@ -27,6 +32,20 @@ export interface OrchestratorResult {
 const REVIEW_VERDICT_RE = /^REVIEW:\s*(APPROVED|REJECTED)(?:\s+—\s+(.*))?$/m;
 
 /**
+ * Confirms the cwd looks like a sandcastle-initialised repo. If not,
+ * we error early with a clear message rather than letting Sandcastle
+ * fail deep inside Docker setup.
+ */
+export function assertSandcastleInitialised(cwd: string): void {
+  const sandcastleDir = join(cwd, ".sandcastle");
+  if (!existsSync(sandcastleDir)) {
+    throw new Error(
+      `No .sandcastle/ directory in ${cwd}. Run \`npx sandcastle init\` here first.`,
+    );
+  }
+}
+
+/**
  * Drains the Linear queue until empty (or until --max is hit). One
  * issue at a time in v1; parallel runs are a follow-up.
  */
@@ -34,7 +53,7 @@ export async function drainQueue(
   deps: OrchestratorDeps,
   opts: { max?: number } = {},
 ): Promise<OrchestratorResult> {
-  const { config, linear, github } = deps;
+  const { config, linear } = deps;
   const max = opts.max ?? Number.POSITIVE_INFINITY;
   let processed = 0;
   let opened = 0;
@@ -77,7 +96,7 @@ async function processIssue(
   issue: RunwayIssue,
   deps: OrchestratorDeps,
 ): Promise<Verdict> {
-  const { config, linear, github } = deps;
+  const { config, linear, github, cwd } = deps;
   const branch = `agent/${issue.identifier.toLowerCase()}`;
 
   await linear.transition(issue.id, config.inProgressStatus);
@@ -87,13 +106,15 @@ async function processIssue(
   );
 
   // 1. Implementation pass.
-  const implementPrompt = await loadImplementPrompt();
+  const implementPrompt = renderPrompt(
+    await loadImplementPrompt(),
+    implementVars(issue),
+  );
   const implementResult = await run({
     agent: claudeCode("claude-opus-4-6"),
     sandbox: docker(),
-    cwd: config.targetRepo,
+    cwd,
     prompt: implementPrompt,
-    promptArgs: implementPromptArgs(issue),
     branchStrategy: { type: "branch", branch },
     maxIterations: config.maxIterations,
     name: `impl-${issue.identifier}`,
@@ -109,15 +130,17 @@ async function processIssue(
   }
 
   // 2. Review pass — read-only-ish, just looking at the diff.
-  const diff = await captureDiff(config.targetRepo, branch);
-  const commitLog = await captureCommitLog(config.targetRepo, branch);
-  const reviewPrompt = await loadReviewPrompt();
+  const diff = await captureDiff(cwd, branch);
+  const commitLog = await captureCommitLog(cwd, branch);
+  const reviewPrompt = renderPrompt(
+    await loadReviewPrompt(),
+    reviewVars({ issue, diff, commits: commitLog }),
+  );
   const reviewResult = await run({
     agent: claudeCode("claude-opus-4-6"),
     sandbox: docker(),
-    cwd: config.targetRepo,
+    cwd,
     prompt: reviewPrompt,
-    promptArgs: reviewPromptArgs({ issue, diff, commits: commitLog }),
     branchStrategy: { type: "head" },
     maxIterations: 1,
     name: `review-${issue.identifier}`,
@@ -134,10 +157,10 @@ async function processIssue(
   }
 
   // 3. Push + PR.
-  await github.pushBranch(config.targetRepo, branch);
+  await github.pushBranch(cwd, branch);
   const prBody = buildPrBody(issue);
   const prUrl = await github.openPullRequest({
-    repoPath: config.targetRepo,
+    repoPath: cwd,
     branch,
     issue,
     body: prBody,
@@ -209,8 +232,6 @@ function parseReviewVerdict(result: unknown): ParsedVerdict {
 function stringifyResult(result: unknown): string {
   if (typeof result === "string") return result;
   if (result && typeof result === "object") {
-    // Try a few likely shapes without locking us to a specific
-    // sandcastle internal type.
     const r = result as {
       iterations?: Array<{ output?: string; text?: string }>;
       output?: string;

@@ -12,20 +12,20 @@ to a stack of PRs" workflow.
 |---|---|
 | A small Node CLI that orchestrates Sandcastle runs from a Linear queue | A sandbox or agent runtime — Sandcastle does that |
 | The replacement for the AFK label-handler / preflight / contracts pipeline | A governance layer; trust comes from your review of the PR, not gates |
-| Single-target-repo in v1 | Multi-repo (yet) |
+| Repo-agnostic — runs in whatever cwd you launch it from | Multi-repo (yet) — one repo per `runway run` invocation |
 | Sequential | Parallel (yet) |
 
 ## Architecture
 
 ```
-Linear (Todo, assignee=agent)
+Linear (Todo, team=VA)
   ↓ poll
-runway (this CLI, on your Mac)
+runway (this CLI, on your Mac, run from inside the target repo)
   ↓ for each issue
-  │   sandcastle.run({ agent: claudeCode, sandbox: docker, ... })
+  │   sandcastle.run({ agent: claudeCode, sandbox: docker, cwd: process.cwd(), ... })
   │   → branch agent/<issue-id>, commits, tests
   │
-  │   sandcastle.run({ ..., prompt: review.md })
+  │   sandcastle.run({ ..., prompt: review template })
   │   → REVIEW: APPROVED  | REVIEW: REJECTED — <reason>
   │
   ├── approved  → git push → gh pr create → Linear "In Review"
@@ -36,48 +36,60 @@ runway (this CLI, on your Mac)
 ## Prerequisites
 
 - macOS or Linux
-- Docker Desktop (or Podman) — Sandcastle's `docker()` provider needs it
+- Docker Desktop (or Podman)
 - Node 22+
 - `gh` CLI authenticated against the org that hosts your target repo
 - Linear API key with read+write on the team you're targeting
-- Anthropic API key
+- Anthropic API key (set in the **target repo's** `.sandcastle/.env`,
+  not in runway's env — Sandcastle reads it)
 
-## Setup
+## One-time setup per target repo
 
 ```bash
-pnpm install
+cd /path/to/your/repo
+npx sandcastle init
+# fills .sandcastle/{Dockerfile, prompt.md, .env.example, config.json}
 cp .sandcastle/.env.example .sandcastle/.env
-# fill in the values
+# fill ANTHROPIC_API_KEY and GH_TOKEN there
 ```
 
-Required env (see [`.sandcastle/.env.example`](.sandcastle/.env.example)):
+Sandcastle owns the per-repo `.sandcastle/` directory. Runway never
+writes to it.
 
-- `ANTHROPIC_API_KEY`
-- `GH_TOKEN`
-- `LINEAR_API_KEY`
-- `RUNWAY_TARGET_REPO` — absolute path to a clean local clone of the
-  target repo. Runway operates in this directory; Sandcastle creates
-  worktrees off it.
+## Setup runway itself
 
-Optional knobs are documented in the same file (status names, label
-names, max iterations).
+```bash
+git clone git@github.com:ValescoAgency/runway.git
+cd runway
+pnpm install
+pnpm link --global   # so `runway` is on your $PATH
+```
+
+Export runway's own env (in your shell rc, or wherever you keep API keys):
+
+```bash
+export LINEAR_API_KEY=lin_api_...
+# Optional overrides:
+# export RUNWAY_LINEAR_TEAM=VA
+# export RUNWAY_READY_STATUS="Todo"
+# export RUNWAY_IN_PROGRESS_STATUS="In Progress"
+# export RUNWAY_IN_REVIEW_STATUS="In Review"
+# export RUNWAY_HITL_LABEL="needs-human"
+# export RUNWAY_MAX_ITERATIONS=5
+```
 
 ## Usage
 
 ```bash
-# drain the entire queue
-pnpm dev
-
-# or via the bin
-runway run
-
-# process at most 3 issues then exit
-runway run --max 3
+cd /path/to/the/repo/you/want/agents/working/on
+runway              # drain the entire ready queue
+runway --max 3      # process at most 3 issues then exit
+runway --help
 ```
 
 The CLI exits with 0 even if some issues hit HITL or errored — those
-are normal outcomes, not runway failures. Check Linear for the
-`needs-human` label and the per-issue comments for what happened.
+are normal outcomes. Check Linear for the `needs-human` label and the
+per-issue comments for what happened.
 
 ## Linear conventions
 
@@ -99,7 +111,7 @@ you set.
 ## Sub-agent review
 
 Every implementation run is followed by a fresh Sandcastle run with
-[`prompts/review.md`](.sandcastle/prompts/review.md). The reviewer reads the diff
+[`prompts/review.md`](prompts/review.md). The reviewer reads the diff
 and the issue body and outputs one of:
 
 ```
@@ -116,7 +128,7 @@ NOT to ship, not to rubber-stamp.
 ## What's deliberately missing in v1
 
 - Parallel runs (one issue at a time)
-- Multi-repo dispatch (single `RUNWAY_TARGET_REPO`)
+- Multi-repo dispatch from a single command (cd into each repo)
 - Vercel Sandbox provider (Docker only — swap to `vercel()` later)
 - DAG / dependency awareness across issues
 - Auto-rebase / merge of approved PRs (you do that)
@@ -125,5 +137,4 @@ These are tractable, just not v1.
 
 ## Status
 
-v0.1 — scaffold complete, untested against a live queue. See
-[CHANGELOG.md](CHANGELOG.md) once it exists.
+v0.1 — scaffold complete, untested against a live queue.
