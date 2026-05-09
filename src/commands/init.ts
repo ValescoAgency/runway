@@ -14,7 +14,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // runway/src/commands/init.ts → runway/templates/
 const TEMPLATES_DIR = join(__dirname, "..", "..", "templates");
 
-interface InitOptions {
+export interface InitOptions {
   readonly tier: 1 | 2;
   readonly opVault?: string;
   readonly anthropicItem?: string;
@@ -163,7 +163,7 @@ export async function initCommand(argv: readonly string[]): Promise<void> {
 // Preflight
 // ---------------------------------------------------------------------------
 
-async function preflight(cwd: string, opts: InitOptions): Promise<void> {
+export async function preflight(cwd: string, opts: InitOptions): Promise<void> {
   console.log(`[runway init] preflight (tier ${opts.tier})`);
   const ok = (msg: string) => console.log(`  ✓ ${msg}`);
   const fail = (msg: string): never => {
@@ -259,7 +259,7 @@ async function checkBinary(bin: string, errMsg: string): Promise<void> {
  * Dockerfile + a built image; nothing else `init` produces matters
  * for our use case.
  */
-async function writeDockerfile(cwd: string, opts: InitOptions): Promise<void> {
+export async function writeDockerfile(cwd: string, opts: InitOptions): Promise<void> {
   const sandcastleDir = join(cwd, ".sandcastle");
   const dockerfilePath = join(sandcastleDir, "Dockerfile");
 
@@ -295,7 +295,7 @@ async function writeDockerfile(cwd: string, opts: InitOptions): Promise<void> {
  * align AGENT_UID/AGENT_GID to the host user so bind-mounts don't trip on
  * permissions. Mirrors what `sandcastle docker build-image` does.
  */
-async function buildAgentImage(cwd: string): Promise<void> {
+export async function buildAgentImage(cwd: string): Promise<void> {
   const dirName =
     cwd
       .replace(/[\\/]+$/, "")
@@ -330,7 +330,7 @@ async function buildAgentImage(cwd: string): Promise<void> {
 // Varlock layer (tier 2 only)
 // ---------------------------------------------------------------------------
 
-async function applyVarlockLayer(
+export async function applyVarlockLayer(
   cwd: string,
   opts: InitOptions,
 ): Promise<void> {
@@ -412,7 +412,7 @@ async function applyVarlockLayer(
 // Verify
 // ---------------------------------------------------------------------------
 
-async function verify(cwd: string, opts: InitOptions): Promise<void> {
+export async function verify(cwd: string, opts: InitOptions): Promise<void> {
   console.log(`[runway init] verify (tier ${opts.tier})`);
   const ok = (msg: string) => console.log(`  ✓ ${msg}`);
   const fail = (msg: string): never => {

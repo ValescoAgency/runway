@@ -2,6 +2,10 @@ import { doctorCommand, printDoctorUsage } from "./commands/doctor.js";
 import { initCommand, printInitUsage } from "./commands/init.js";
 import { runCommand, printRunUsage } from "./commands/run.js";
 import { upgradeCommand, printUpgradeUsage } from "./commands/upgrade.js";
+import {
+  upgradeRepoCommand,
+  printUpgradeRepoUsage,
+} from "./commands/upgrade-repo.js";
 
 interface Subcommand {
   readonly name: string;
@@ -35,6 +39,12 @@ const SUBCOMMANDS: readonly Subcommand[] = [
     run: upgradeCommand,
     help: printUpgradeUsage,
   },
+  {
+    name: "upgrade-repo",
+    summary: "Refresh a target repo's runway scaffold against current templates.",
+    run: upgradeRepoCommand,
+    help: printUpgradeRepoUsage,
+  },
 ];
 
 function printRootUsage(): void {
@@ -45,7 +55,7 @@ USAGE
 
 COMMANDS`);
   for (const cmd of SUBCOMMANDS) {
-    console.log(`  ${cmd.name.padEnd(8)} ${cmd.summary}`);
+    console.log(`  ${cmd.name.padEnd(13)} ${cmd.summary}`);
   }
   console.log(`
   Run \`runway <command> --help\` for command-specific options.
