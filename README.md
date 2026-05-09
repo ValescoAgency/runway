@@ -6,12 +6,13 @@ coding-agent runs, then **drain** a Linear queue against it. Wraps
 inside Docker), [varlock](https://varlock.dev) + 1Password for
 zero-secrets-at-rest, and the `gh` CLI for PR creation.
 
-## Two commands
+## Three commands
 
 | | |
 |---|---|
 | `runway init` | Scaffold the cwd repo for runway: `npx sandcastle init` + Valesco's varlock + 1Password customizations. Run **once per target repo**. |
 | `runway run` | Drain a Linear queue. For each `Todo` issue: branch, agent works, sub-agent reviews, PR opens (or `needs-human` label). Run **whenever you want a batch of work done**. |
+| `runway upgrade` | Update the runway CLI itself: `git pull` the local clone, `pnpm install`, typecheck. `--check` for a dry-run, `--force` to override dirty/branch refusals. |
 
 `runway --help` for the full usage; `runway <cmd> --help` per command.
 

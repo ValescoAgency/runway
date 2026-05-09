@@ -1,5 +1,6 @@
 import { runCommand, printRunUsage } from "./commands/run.js";
 import { initCommand, printInitUsage } from "./commands/init.js";
+import { upgradeCommand, printUpgradeUsage } from "./commands/upgrade.js";
 
 interface Subcommand {
   readonly name: string;
@@ -10,16 +11,22 @@ interface Subcommand {
 
 const SUBCOMMANDS: readonly Subcommand[] = [
   {
+    name: "init",
+    summary: "Scaffold a target repo (sandcastle init + varlock layer).",
+    run: initCommand,
+    help: printInitUsage,
+  },
+  {
     name: "run",
     summary: "Drain a Linear queue against the cwd repo (default verb).",
     run: runCommand,
     help: printRunUsage,
   },
   {
-    name: "init",
-    summary: "Scaffold a target repo (sandcastle init + varlock layer).",
-    run: initCommand,
-    help: printInitUsage,
+    name: "upgrade",
+    summary: "Update the runway CLI itself (git pull + pnpm install).",
+    run: upgradeCommand,
+    help: printUpgradeUsage,
   },
 ];
 
