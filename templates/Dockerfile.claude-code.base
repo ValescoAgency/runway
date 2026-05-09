@@ -1,0 +1,55 @@
+# Canonical claude-code Dockerfile — vendored from
+# @ai-hero/sandcastle's InitService.ts (CLAUDE_CODE_DOCKERFILE constant).
+# Kept here so `runway init` can write it directly, without invoking
+# `sandcastle init` (which has interactive prompts that hang in
+# non-TTY environments like CI / Mac Mini cron).
+#
+# Drift policy: when sandcastle bumps its claude-code Dockerfile,
+# refresh this file. The diff should be tiny — runway's tier 2 layer
+# patches AFTER this base, so adopters re-run `runway init --force`
+# to roll forward.
+
+FROM node:22-bookworm
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+  git \
+  curl \
+  jq \
+  && rm -rf /var/lib/apt/lists/*
+
+# Build-args for UID/GID alignment: defaults match the host user's
+# UID/GID at build time so image-built files and bind-mounted files
+# share an owner without runtime chown.
+ARG AGENT_UID=1000
+ARG AGENT_GID=1000
+
+# Rename the base image's "node" user to "agent" and align UID/GID.
+#
+# Divergence from sandcastle's stock Dockerfile: stock runs
+# `groupmod -g $AGENT_GID node` unconditionally, which fails on macOS
+# hosts where the host GID is 20 (`staff`) — Debian's `dialout` group
+# already has GID 20, and `groupmod` refuses to assign a duplicate
+# GID. We guard with `getent group` so groupmod only runs if the
+# target GID is unused; if it's already taken, we point the agent
+# user at the pre-existing group via `usermod -g <gid>` and the
+# image still works (the in-image group name is irrelevant — only the
+# numeric GID matters for bind-mount permissions).
+RUN if ! getent group $AGENT_GID >/dev/null; then \
+      groupmod -g $AGENT_GID node; \
+    fi \
+ && usermod -u $AGENT_UID -g $AGENT_GID -d /home/agent -m -l agent node
+USER ${AGENT_UID}:${AGENT_GID}
+
+# Install Claude Code CLI
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+# Add Claude to PATH
+ENV PATH="/home/agent/.local/bin:$PATH"
+
+WORKDIR /home/agent
+
+# In worktree sandbox mode, Sandcastle bind-mounts the git worktree at
+# the sandbox repo dir and overrides the working directory to that dir
+# at container start.
+ENTRYPOINT ["sleep", "infinity"]
