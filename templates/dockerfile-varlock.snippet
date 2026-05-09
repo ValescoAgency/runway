@@ -1,14 +1,19 @@
-# =============================================================================
-# Append this to your `.sandcastle/Dockerfile` AFTER `npx sandcastle init`,
-# right before the final `ENTRYPOINT ["sleep", "infinity"]` line.
-# =============================================================================
+# --- runway tier-2 layer (varlock + 1Password) ---
+# Spliced in by `runway init --tier=2` immediately before the
+# final `ENTRYPOINT ["sleep", "infinity"]` line.
 
-# Pull the varlock binary from its official image (multi-stage).
-COPY --from=ghcr.io/dmno-dev/varlock:latest /usr/local/bin/varlock /usr/local/bin/varlock
+# Install varlock via npm. The official `ghcr.io/dmno-dev/varlock`
+# image is musl/Alpine — copying its binary into a glibc base
+# (node:22-bookworm) produces an ELF that the loader can't resolve
+# ("not found" on exec). npm install gets the right binary for the
+# image's libc.
+USER root
+RUN npm install -g varlock
 
 # Install the 1Password CLI so varlock can resolve `op://` references.
-USER root
-RUN curl -sS https://downloads.1password.com/linux/keys/1password.asc \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl gnupg \
+  && curl -sS https://downloads.1password.com/linux/keys/1password.asc \
       | gpg --dearmor -o /usr/share/keyrings/1password-archive-keyring.gpg \
   && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/1password-archive-keyring.gpg] https://downloads.1password.com/linux/debian/$(dpkg --print-architecture) stable main" \
       > /etc/apt/sources.list.d/1password.list \
@@ -28,7 +33,7 @@ RUN mv /home/agent/.local/bin/claude /home/agent/.local/bin/claude.real \
        'exec varlock run --env-file /home/agent/workspace/.env.schema -- /home/agent/.local/bin/claude.real "$@"' \
        > /home/agent/.local/bin/claude \
   && chmod +x /home/agent/.local/bin/claude \
-  && chown agent:agent /home/agent/.local/bin/claude
+  && chown ${AGENT_UID}:${AGENT_GID} /home/agent/.local/bin/claude
 
 USER ${AGENT_UID}:${AGENT_GID}
 

@@ -1,6 +1,11 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { mkdtempSync, rmSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execa, type ExecaError } from "execa";
@@ -16,6 +21,7 @@ interface InitOptions {
   readonly ghTokenItem?: string;
   readonly allowDirty: boolean;
   readonly force: boolean;
+  readonly skipBuild: boolean;
 }
 
 export function printInitUsage(): void {
@@ -28,18 +34,20 @@ posture. Run from the target repo's root.
 USAGE
   cd /path/to/your/target/repo
   runway init [--tier=2] [--op-vault=... --anthropic-item=... --gh-token-item=...]
-              [--allow-dirty] [--force]
+              [--allow-dirty] [--force] [--skip-build]
 
 OPTIONS
-  --tier=1            Sandcastle init only. Secrets at rest in .sandcastle/.env.
-                      Faster setup, weaker security posture.
-  --tier=2            DEFAULT. Sandcastle init + varlock + 1Password CLI inside
-                      the container. Zero secrets at rest.
+  --tier=1            Plain sandcastle scaffold. No varlock; secrets need
+                      another mechanism (env vars, repo .env, etc.).
+  --tier=2            DEFAULT. Adds varlock + 1Password CLI inside the
+                      container. Zero secrets at rest.
   --op-vault=NAME     1Password vault name (e.g. "runway"). Required for tier 2.
   --anthropic-item=N  Item name in the vault that holds ANTHROPIC_API_KEY. Required for tier 2.
   --gh-token-item=N   Item name in the vault that holds GH_TOKEN. Required for tier 2.
   --allow-dirty       Skip the "working tree clean" preflight check.
-  --force             Re-init: delete existing .sandcastle/ before scaffolding.
+  --force             Overwrite an existing .sandcastle/Dockerfile.
+  --skip-build        Don't \`docker build\` the agent image. Faster init,
+                      slower first \`runway run\` (image builds then).
   --help, -h          Show this help.
 
 NOTE
@@ -51,11 +59,17 @@ NOTE
 
 WHAT THIS COMMAND DOES
   1. Preflight: docker, gh, node, (tier 2) varlock + op CLI, git state.
-  2. \`npx sandcastle init\` to scaffold .sandcastle/.
-  3. (Tier 2) Patch .sandcastle/Dockerfile, write .env.schema, drop .sandcastle/.env.
-  4. Verify: no inline secrets, Dockerfile shimmed, schema declares both keys.
+  2. Write .sandcastle/Dockerfile (vendored claude-code base; tier 2
+     also splices in the varlock + op CLI + claude shim layer).
+  3. (Tier 2) Write .env.schema at repo root with op:// references.
+  4. \`docker build\` the agent image (skip with --skip-build).
+  5. Verify: no inline secrets, Dockerfile correct shape, image present.
 
 WHAT IT DOES NOT DO
+  - Run \`sandcastle init\`. Sandcastle's interactive prompts hang in
+    non-TTY environments, and runway uses sandcastle's programmatic
+    \`run()\` API which only needs the Dockerfile + image — none of
+    the prompt.md / main.ts / config.json artifacts \`init\` produces.
   - Push or open a PR. You review and ship.
   - Touch 1Password. You're responsible for putting items in your vault.
   - Modify .github/workflows/.
@@ -69,6 +83,7 @@ function parseInitArgs(argv: readonly string[]): InitOptions {
   let ghTokenItem: string | undefined;
   let allowDirty = false;
   let force = false;
+  let skipBuild = false;
 
   for (const arg of argv) {
     if (arg === "--help" || arg === "-h") {
@@ -82,6 +97,8 @@ function parseInitArgs(argv: readonly string[]): InitOptions {
       allowDirty = true;
     } else if (arg === "--force") {
       force = true;
+    } else if (arg === "--skip-build") {
+      skipBuild = true;
     } else if (arg.startsWith("--op-vault=")) {
       opVault = arg.slice("--op-vault=".length);
     } else if (arg.startsWith("--anthropic-item=")) {
@@ -112,6 +129,7 @@ function parseInitArgs(argv: readonly string[]): InitOptions {
     ghTokenItem,
     allowDirty,
     force,
+    skipBuild,
   };
 }
 
@@ -120,9 +138,12 @@ export async function initCommand(argv: readonly string[]): Promise<void> {
   const cwd = process.cwd();
 
   await preflight(cwd, opts);
-  await sandcastleInit(cwd, opts);
+  await writeDockerfile(cwd, opts);
   if (opts.tier === 2) {
     await applyVarlockLayer(cwd, opts);
+  }
+  if (!opts.skipBuild) {
+    await buildAgentImage(cwd);
   }
   await verify(cwd, opts);
 
@@ -225,35 +246,84 @@ async function checkBinary(bin: string, errMsg: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Sandcastle init
+// Dockerfile
 // ---------------------------------------------------------------------------
 
-async function sandcastleInit(cwd: string, opts: InitOptions): Promise<void> {
+/**
+ * Write `.sandcastle/Dockerfile` directly from the vendored
+ * `templates/Dockerfile.claude-code.base`. We don't invoke
+ * `sandcastle init` because it has unconditional interactive prompts
+ * (sandbox provider, backlog manager, label creation) with no CLI
+ * flag override — they hang in non-TTY environments. Runway only
+ * uses sandcastle's programmatic `run()` API, which needs the
+ * Dockerfile + a built image; nothing else `init` produces matters
+ * for our use case.
+ */
+async function writeDockerfile(cwd: string, opts: InitOptions): Promise<void> {
   const sandcastleDir = join(cwd, ".sandcastle");
-  if (existsSync(sandcastleDir)) {
-    if (!opts.force) {
-      console.log(
-        "[runway init] .sandcastle/ already exists — skipping init (pass --force to delete and re-init)",
-      );
-      return;
-    }
-    console.log("[runway init] --force given, removing existing .sandcastle/");
-    rmSync(sandcastleDir, { recursive: true, force: true });
-  }
+  const dockerfilePath = join(sandcastleDir, "Dockerfile");
 
-  console.log(
-    "[runway init] running `npx -y -p @ai-hero/sandcastle@latest sandcastle init`",
-  );
-  await execa(
-    "npx",
-    ["-y", "-p", "@ai-hero/sandcastle@latest", "sandcastle", "init"],
-    { cwd, stdio: "inherit" },
-  );
+  if (existsSync(dockerfilePath) && !opts.force) {
+    console.log(
+      "[runway init] .sandcastle/Dockerfile already exists — skipping (pass --force to overwrite)",
+    );
+    return;
+  }
 
   if (!existsSync(sandcastleDir)) {
-    throw new Error("sandcastle init did not produce .sandcastle/");
+    mkdirSync(sandcastleDir, { recursive: true });
   }
-  console.log("[runway init] .sandcastle/ scaffolded");
+
+  const base = readFileSync(
+    join(TEMPLATES_DIR, "Dockerfile.claude-code.base"),
+    "utf8",
+  );
+  writeFileSync(dockerfilePath, base);
+  console.log(`  ✓ wrote ${dockerfilePath}`);
+}
+
+// ---------------------------------------------------------------------------
+// Build agent image
+// ---------------------------------------------------------------------------
+
+/**
+ * `docker build` the .sandcastle/ Dockerfile so the image is ready
+ * for the first `runway run`. Skipped if --skip-build was passed.
+ *
+ * Image name follows sandcastle's convention: `sandcastle:<sanitized-dirname>`
+ * (defaultImageName from @ai-hero/sandcastle's mountUtils.ts). Build args
+ * align AGENT_UID/AGENT_GID to the host user so bind-mounts don't trip on
+ * permissions. Mirrors what `sandcastle docker build-image` does.
+ */
+async function buildAgentImage(cwd: string): Promise<void> {
+  const dirName =
+    cwd
+      .replace(/[\\/]+$/, "")
+      .split(/[\\/]/)
+      .pop() ?? "local";
+  const sanitized =
+    dirName.toLowerCase().replace(/[^a-z0-9_.-]/g, "-") || "local";
+  const imageName = `sandcastle:${sanitized}`;
+
+  const uid = String(process.getuid?.() ?? 1000);
+  const gid = String(process.getgid?.() ?? 1000);
+
+  console.log(`[runway init] building agent image ${imageName} (this can take ~2–5 min on first run)`);
+  await execa(
+    "docker",
+    [
+      "build",
+      "--build-arg",
+      `AGENT_UID=${uid}`,
+      "--build-arg",
+      `AGENT_GID=${gid}`,
+      "-t",
+      imageName,
+      ".sandcastle",
+    ],
+    { cwd, stdio: "inherit" },
+  );
+  console.log(`  ✓ built ${imageName}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -354,12 +424,27 @@ async function verify(cwd: string, opts: InitOptions): Promise<void> {
     fail(".sandcastle/Dockerfile missing");
   ok(".sandcastle/Dockerfile present");
 
-  if (opts.tier === 1) {
-    if (!existsSync(join(cwd, ".sandcastle", ".env.example"))) {
-      console.log("  ⚠  .sandcastle/.env.example missing — sandcastle init may have failed");
-    } else {
-      ok(".sandcastle/.env.example present");
+  // Image presence — if we built it, confirm `docker images` sees it.
+  if (!opts.skipBuild) {
+    const dirName =
+      cwd
+        .replace(/[\\/]+$/, "")
+        .split(/[\\/]/)
+        .pop() ?? "local";
+    const imageName = `sandcastle:${
+      dirName.toLowerCase().replace(/[^a-z0-9_.-]/g, "-") || "local"
+    }`;
+    try {
+      await execa("docker", ["image", "inspect", imageName], { cwd });
+      ok(`docker image ${imageName} built`);
+    } catch {
+      fail(
+        `docker image ${imageName} not found — build step must have failed`,
+      );
     }
+  }
+
+  if (opts.tier === 1) {
     console.log("[runway init] verify OK (tier 1)");
     return;
   }
