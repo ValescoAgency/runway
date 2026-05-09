@@ -57,11 +57,15 @@ runway (this CLI, on your Mac, run from inside the target repo)
 ```bash
 cd /path/to/your/repo
 runway init \
-  --op-account=valesco \
   --op-vault=runway \
   --anthropic-item=anthropic-api-key \
   --gh-token-item=gh-token
 ```
+
+(No `--op-account` — runway uses 1Password service-account auth
+(`OP_SERVICE_ACCOUNT_TOKEN`) exclusively, and the token already
+encodes the tenant. `op://` URIs runway writes are
+`op://<vault>/<item>`, not `op://<account>/<vault>/<item>`.)
 
 This runs `npx sandcastle init`, patches the generated `.sandcastle/Dockerfile`
 to bake in `varlock` + the 1Password CLI + a `claude` shim, scaffolds
