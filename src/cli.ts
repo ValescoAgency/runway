@@ -1,5 +1,6 @@
 import { runCommand, printRunUsage } from "./commands/run.js";
 import { initCommand, printInitUsage } from "./commands/init.js";
+import { doctorCommand, printDoctorUsage } from "./commands/doctor.js";
 
 interface Subcommand {
   readonly name: string;
@@ -10,16 +11,22 @@ interface Subcommand {
 
 const SUBCOMMANDS: readonly Subcommand[] = [
   {
-    name: "run",
-    summary: "Drain a Linear queue against the cwd repo (default verb).",
-    run: runCommand,
-    help: printRunUsage,
+    name: "doctor",
+    summary: "Read-only preflight: tooling, env, repo state, agent image.",
+    run: doctorCommand,
+    help: printDoctorUsage,
   },
   {
     name: "init",
     summary: "Scaffold a target repo (sandcastle init + varlock layer).",
     run: initCommand,
     help: printInitUsage,
+  },
+  {
+    name: "run",
+    summary: "Drain a Linear queue against the cwd repo (default verb).",
+    run: runCommand,
+    help: printRunUsage,
   },
 ];
 
