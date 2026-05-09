@@ -10,6 +10,7 @@ zero-secrets-at-rest, and the `gh` CLI for PR creation.
 
 | | |
 |---|---|
+| `runway doctor` | Read-only preflight diagnostic: host tooling, env vars, repo state, and the agent docker image. Use when something stopped working and you want a sanity report. `--json` for CI / scripted health checks. |
 | `runway init` | Scaffold the cwd repo for runway: `npx sandcastle init` + Valesco's varlock + 1Password customizations. Run **once per target repo**. |
 | `runway run` | Drain a Linear queue. For each `Todo` issue: branch, agent works, sub-agent reviews, PR opens (or `needs-human` label). Run **whenever you want a batch of work done**. |
 | `runway upgrade` | Update the runway CLI itself: `git pull` the local clone, `pnpm install`, typecheck. `--check` for a dry-run, `--force` to override dirty/branch refusals. |

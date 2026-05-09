@@ -1,5 +1,6 @@
-import { runCommand, printRunUsage } from "./commands/run.js";
+import { doctorCommand, printDoctorUsage } from "./commands/doctor.js";
 import { initCommand, printInitUsage } from "./commands/init.js";
+import { runCommand, printRunUsage } from "./commands/run.js";
 import { upgradeCommand, printUpgradeUsage } from "./commands/upgrade.js";
 
 interface Subcommand {
@@ -10,6 +11,12 @@ interface Subcommand {
 }
 
 const SUBCOMMANDS: readonly Subcommand[] = [
+  {
+    name: "doctor",
+    summary: "Read-only preflight: tooling, env, repo state, agent image.",
+    run: doctorCommand,
+    help: printDoctorUsage,
+  },
   {
     name: "init",
     summary: "Scaffold a target repo (sandcastle init + varlock layer).",
