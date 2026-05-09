@@ -6,16 +6,24 @@ coding-agent runs, then **drain** a Linear queue against it. Wraps
 inside Docker), [varlock](https://varlock.dev) + 1Password for
 zero-secrets-at-rest, and the `gh` CLI for PR creation.
 
-## Three commands
+## Five commands
 
 | | |
 |---|---|
 | `runway doctor` | Read-only preflight diagnostic: host tooling, env vars, repo state, and the agent docker image. Use when something stopped working and you want a sanity report. `--json` for CI / scripted health checks. |
-| `runway init` | Scaffold the cwd repo for runway: `npx sandcastle init` + Valesco's varlock + 1Password customizations. Run **once per target repo**. |
+| `runway init` | Scaffold the cwd repo for runway: write `.sandcastle/Dockerfile` + (tier 2) `.env.schema` with op:// references. Run **once per target repo**. |
 | `runway run` | Drain a Linear queue. For each `Todo` issue: branch, agent works, sub-agent reviews, PR opens (or `needs-human` label). Run **whenever you want a batch of work done**. |
 | `runway upgrade` | Update the runway CLI itself: `git pull` the local clone, `pnpm install`, typecheck. `--check` for a dry-run, `--force` to override dirty/branch refusals. |
+| `runway upgrade-repo` | Re-render the cwd repo's runway scaffold against the current vendored templates. Use after a runway version bump that changed the Dockerfile or template shape — `init` writes them, `upgrade-repo` keeps them current without re-prompting for op:// values. |
 
 `runway --help` for the full usage; `runway <cmd> --help` per command.
+
+`runway init` and `runway upgrade-repo` are siblings: `init` is the
+first-time scaffold (you provide the op:// vault/items), `upgrade-repo`
+is the re-render (extracts those values from the existing `.env.schema`
+so you never re-type them). Override the extracted values via
+`--op-vault=…`, `--anthropic-item=…`, `--gh-token-item=…` if needed,
+or use `--check` for a CI dry-run that exits 1 on drift.
 
 ## What runway is and isn't
 
