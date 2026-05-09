@@ -1,15 +1,47 @@
 {
   "name": "@valescoagency/runway",
   "version": "0.1.0",
-  "private": true,
-  "description": "Linear-driven orchestrator + scaffolder for coding agents on Sandcastle. `runway init` scaffolds a target repo (sandcastle + varlock + 1Password); `runway run` drains a Linear queue against it.",
+  "description": "Linear-driven orchestrator + scaffolder for coding agents on Sandcastle. `runway init` scaffolds a target repo (sandcastle + varlock + 1Password); `runway run` drains a Linear queue against it; `runway doctor`, `runway upgrade`, `runway upgrade-repo` round out the lifecycle.",
+  "license": "MIT",
+  "author": {
+    "name": "Valesco Agency",
+    "email": "jason@valescoagency.com",
+    "url": "https://valescoagency.com"
+  },
+  "homepage": "https://github.com/ValescoAgency/runway#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ValescoAgency/runway.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ValescoAgency/runway/issues"
+  },
+  "keywords": [
+    "claude-code",
+    "sandcastle",
+    "linear",
+    "orchestrator",
+    "agent",
+    "varlock",
+    "1password",
+    "valesco",
+    "cli"
+  ],
   "type": "module",
   "bin": {
-    "runway": "./bin/runway.mjs"
+    "runway": "./dist/cli.js"
   },
+  "files": [
+    "dist",
+    "templates",
+    "LICENSE",
+    "README.md"
+  ],
   "scripts": {
-    "runway": "tsx src/cli.ts",
+    "build": "tsc && chmod +x dist/cli.js",
     "typecheck": "tsc --noEmit",
+    "dev": "tsx src/cli.ts",
+    "prepublishOnly": "pnpm typecheck && pnpm build",
     "lint": "echo 'lint not configured yet'"
   },
   "dependencies": {
@@ -25,5 +57,8 @@
   },
   "engines": {
     "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
