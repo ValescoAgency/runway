@@ -11,7 +11,6 @@ const TEMPLATES_DIR = join(__dirname, "..", "..", "templates");
 
 interface InitOptions {
   readonly tier: 1 | 2;
-  readonly opAccount?: string;
   readonly opVault?: string;
   readonly anthropicItem?: string;
   readonly ghTokenItem?: string;
@@ -28,8 +27,7 @@ posture. Run from the target repo's root.
 
 USAGE
   cd /path/to/your/target/repo
-  runway init [--tier=2] [--op-account=... --op-vault=... \\
-              --anthropic-item=... --gh-token-item=...]
+  runway init [--tier=2] [--op-vault=... --anthropic-item=... --gh-token-item=...]
               [--allow-dirty] [--force]
 
 OPTIONS
@@ -37,13 +35,19 @@ OPTIONS
                       Faster setup, weaker security posture.
   --tier=2            DEFAULT. Sandcastle init + varlock + 1Password CLI inside
                       the container. Zero secrets at rest.
-  --op-account=NAME   1Password account shorthand (e.g. "valesco"). Required for tier 2.
   --op-vault=NAME     1Password vault name (e.g. "runway"). Required for tier 2.
   --anthropic-item=N  Item name in the vault that holds ANTHROPIC_API_KEY. Required for tier 2.
   --gh-token-item=N   Item name in the vault that holds GH_TOKEN. Required for tier 2.
   --allow-dirty       Skip the "working tree clean" preflight check.
   --force             Re-init: delete existing .sandcastle/ before scaffolding.
   --help, -h          Show this help.
+
+NOTE
+  No --op-account flag — runway uses 1Password service-account auth
+  exclusively (OP_SERVICE_ACCOUNT_TOKEN). The token already encodes
+  which 1Password tenant to talk to, so the op:// URI omits the
+  account segment: \`op://<vault>/<item>\` rather than
+  \`op://<account>/<vault>/<item>\`.
 
 WHAT THIS COMMAND DOES
   1. Preflight: docker, gh, node, (tier 2) varlock + op CLI, git state.
@@ -60,7 +64,6 @@ WHAT IT DOES NOT DO
 
 function parseInitArgs(argv: readonly string[]): InitOptions {
   let tier: 1 | 2 = 2;
-  let opAccount: string | undefined;
   let opVault: string | undefined;
   let anthropicItem: string | undefined;
   let ghTokenItem: string | undefined;
@@ -79,8 +82,6 @@ function parseInitArgs(argv: readonly string[]): InitOptions {
       allowDirty = true;
     } else if (arg === "--force") {
       force = true;
-    } else if (arg.startsWith("--op-account=")) {
-      opAccount = arg.slice("--op-account=".length);
     } else if (arg.startsWith("--op-vault=")) {
       opVault = arg.slice("--op-vault=".length);
     } else if (arg.startsWith("--anthropic-item=")) {
@@ -94,7 +95,6 @@ function parseInitArgs(argv: readonly string[]): InitOptions {
 
   if (tier === 2) {
     const missing: string[] = [];
-    if (!opAccount) missing.push("--op-account");
     if (!opVault) missing.push("--op-vault");
     if (!anthropicItem) missing.push("--anthropic-item");
     if (!ghTokenItem) missing.push("--gh-token-item");
@@ -107,7 +107,6 @@ function parseInitArgs(argv: readonly string[]): InitOptions {
 
   return {
     tier,
-    opAccount,
     opVault,
     anthropicItem,
     ghTokenItem,
@@ -278,13 +277,12 @@ async function applyVarlockLayer(
     "utf8",
   );
   const rendered = schemaTemplate
-    .replaceAll("{{OP_ACCOUNT}}", opts.opAccount!)
     .replaceAll("{{OP_VAULT}}", opts.opVault!)
     .replaceAll("{{ANTHROPIC_ITEM}}", opts.anthropicItem!)
     .replaceAll("{{GH_TOKEN_ITEM}}", opts.ghTokenItem!);
   writeFileSync(schemaPath, rendered);
   console.log(
-    `  ✓ wrote .env.schema (op://${opts.opAccount}/${opts.opVault}/...)`,
+    `  ✓ wrote .env.schema (op://${opts.opVault}/...)`,
   );
 
   // 2. Patch Dockerfile.
