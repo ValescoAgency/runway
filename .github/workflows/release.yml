@@ -41,9 +41,8 @@ jobs:
         env:
           GITHUB_REF_TAG: ${{ github.ref }}
         run: |
-          # jq because the package has "type": "module"; `node -p require(...)`
-          # would need an explicit --input-type=commonjs flag, and jq is
-          # preinstalled on ubuntu-latest anyway.
+          # jq is preinstalled on ubuntu-latest and works regardless of the
+          # package's "type" (module vs commonjs).
           PKG_VERSION=$(jq -r .version package.json)
           TAG_VERSION="${GITHUB_REF_TAG#refs/tags/v}"
           if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
