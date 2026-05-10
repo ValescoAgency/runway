@@ -1,5 +1,7 @@
 # runway
 
+[![npm version](https://img.shields.io/npm/v/@valescoagency/runway?logo=npm)](https://www.npmjs.com/package/@valescoagency/runway) [![License](https://img.shields.io/npm/l/@valescoagency/runway)](https://github.com/ValescoAgency/runway/blob/master/LICENSE) [![CI status](https://img.shields.io/github/actions/workflow/status/ValescoAgency/runway/release.yml?label=release)](https://github.com/ValescoAgency/runway/actions/workflows/release.yml) [![Provenance](https://img.shields.io/badge/provenance-signed-blue?logo=sigstore)](https://www.npmjs.com/package/@valescoagency/runway)
+
 A small CLI for two jobs: **scaffold** a target repo for autonomous
 coding-agent runs, then **drain** a Linear queue against it. Wraps
 [Sandcastle](https://github.com/mattpocock/sandcastle) (Claude Code
