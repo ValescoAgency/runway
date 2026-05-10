@@ -50,10 +50,16 @@ jobs:
             exit 1
           fi
 
+      # Authenticates via npm Trusted Publishing (OIDC) — no NPM_TOKEN
+      # needed. Requires `permissions.id-token: write` (declared above)
+      # and a Trusted Publisher entry on npmjs.com for the
+      # @valescoagency/runway package pointing at this repo + workflow.
+      # `--provenance` attaches a signed attestation to the published
+      # tarball; visible on npmjs.com as "built and signed on a
+      # cloud-hosted runner" and verifiable via
+      # `npm audit signatures @valescoagency/runway`.
       - name: Publish to npm
-        run: pnpm publish --access public --no-git-checks
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: pnpm publish --access public --no-git-checks --provenance
 
       # Use the preinstalled `gh` CLI instead of softprops/action-gh-release —
       # avoids needing a third-party action in the repo's Actions allowlist
