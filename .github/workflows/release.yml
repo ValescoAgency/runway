@@ -50,16 +50,22 @@ jobs:
             exit 1
           fi
 
-      # Authenticates via npm Trusted Publishing (OIDC) — no NPM_TOKEN
-      # needed. Requires `permissions.id-token: write` (declared above)
-      # and a Trusted Publisher entry on npmjs.com for the
-      # @valescoagency/runway package pointing at this repo + workflow.
-      # `--provenance` attaches a signed attestation to the published
-      # tarball; visible on npmjs.com as "built and signed on a
-      # cloud-hosted runner" and verifiable via
-      # `npm audit signatures @valescoagency/runway`.
+      # Hybrid auth: NODE_AUTH_TOKEN authenticates the PUT, --provenance
+      # still attaches a sigstore-signed attestation via OIDC
+      # (`id-token: write` permission). Provenance is independent of
+      # the auth mechanism — it just needs the OIDC token, which the
+      # runner always has.
+      #
+      # We use NODE_AUTH_TOKEN instead of npm Trusted Publishing
+      # because of a still-unresolved policy-mismatch on the npm side:
+      # OIDC publishes from this repo signed correctly but PUT 404'd
+      # even with all claims matching the configured Trusted Publisher
+      # entry. Revisit once npm support sorts it; once OIDC publishes
+      # work, drop NODE_AUTH_TOKEN and delete the NPM_TOKEN secret.
       - name: Publish to npm
         run: pnpm publish --access public --no-git-checks --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       # Use the preinstalled `gh` CLI instead of softprops/action-gh-release —
       # avoids needing a third-party action in the repo's Actions allowlist
