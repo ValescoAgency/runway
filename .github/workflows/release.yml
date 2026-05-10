@@ -9,7 +9,8 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # `gh release create` writes the GitHub Release; needs contents: write.
+      contents: write
       id-token: write
     steps:
       - name: Checkout
@@ -40,7 +41,9 @@ jobs:
         env:
           GITHUB_REF_TAG: ${{ github.ref }}
         run: |
-          PKG_VERSION=$(node -p "require('./package.json').version")
+          # jq is preinstalled on ubuntu-latest and works regardless of the
+          # package's "type" (module vs commonjs).
+          PKG_VERSION=$(jq -r .version package.json)
           TAG_VERSION="${GITHUB_REF_TAG#refs/tags/v}"
           if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
             echo "::error::package.json version ($PKG_VERSION) does not match tag ($TAG_VERSION)"
@@ -52,8 +55,15 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+      # Use the preinstalled `gh` CLI instead of softprops/action-gh-release —
+      # avoids needing a third-party action in the repo's Actions allowlist
+      # (Settings > Actions > General > Allow specified actions).
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          body_path: CHANGELOG.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG_NAME" \
+            --title "$TAG_NAME" \
+            --notes-file CHANGELOG.md \
+            --verify-tag
