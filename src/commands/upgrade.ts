@@ -96,6 +96,27 @@ function readVersion(root: string): string {
 export async function upgradeCommand(argv: readonly string[]): Promise<void> {
   const opts = parseUpgradeArgs(argv);
   const root = resolveRunwayRoot();
+
+  // Detect npm-installed vs git-clone. An npm install has no .git/ at
+  // the package root; a git clone does. The two flavors have completely
+  // different upgrade paths.
+  const isGitClone = existsSync(join(root, ".git"));
+  if (!isGitClone) {
+    const current = readVersion(root);
+    console.log(`[runway upgrade] running from an npm install at ${root}`);
+    console.log(`[runway upgrade] current: ${current}`);
+    console.log(
+      "[runway upgrade] self-update via the same package manager you used to install:",
+    );
+    console.log("    pnpm install -g @valescoagency/runway@latest");
+    console.log("    npm install -g @valescoagency/runway@latest");
+    console.log("    yarn global add @valescoagency/runway@latest");
+    console.log(
+      "[runway upgrade] (runway can't reliably self-replace its own binary; pick one and run it manually)",
+    );
+    return;
+  }
+
   console.log(`[runway upgrade] runway clone: ${root}`);
 
   // --check: fetch and diff HEAD vs origin/master, then exit.

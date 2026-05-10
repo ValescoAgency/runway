@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import { doctorCommand, printDoctorUsage } from "./commands/doctor.js";
 import { initCommand, printInitUsage } from "./commands/init.js";
 import { runCommand, printRunUsage } from "./commands/run.js";

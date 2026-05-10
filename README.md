@@ -104,13 +104,10 @@ varlock run --schema /path/to/runway/.env.schema -- runway --max 3
 Without varlock, runway falls back to plain `process.env` and
 sandcastle reads `.sandcastle/.env` per its docs.
 
-## Setup runway itself
+## Install
 
 ```bash
-git clone git@github.com:ValescoAgency/runway.git
-cd runway
-pnpm install
-pnpm link --global   # so `runway` is on your $PATH
+pnpm install -g @valescoagency/runway       # or npm i -g, yarn global add
 ```
 
 Export runway's own env (in your shell rc, or wherever you keep API keys):
@@ -125,6 +122,18 @@ export LINEAR_API_KEY=lin_api_...
 # export RUNWAY_HITL_LABEL="needs-human"
 # export RUNWAY_MAX_ITERATIONS=5
 ```
+
+### From source (development)
+
+```bash
+git clone git@github.com:ValescoAgency/runway.git
+cd runway
+pnpm install
+pnpm build              # compiles src/ → dist/
+pnpm link --global      # so `runway` is on your $PATH
+```
+
+`pnpm dev -- <args>` runs the TypeScript source via `tsx` without building, useful while iterating on runway itself.
 
 ## Usage
 
