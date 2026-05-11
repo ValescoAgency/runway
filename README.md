@@ -44,14 +44,23 @@ Linear (Todo, team=VA)
 runway (this CLI, on your Mac, run from inside the target repo)
   ↓ for each issue
   │   sandcastle.run({ agent: claudeCode, sandbox: docker, cwd: process.cwd(), ... })
+  │     iter 1 → IMPL: DONE | IMPL: BLOCKED — <reason> | IMPL: CONTINUE
+  │     iter 2 → same, with previous iteration's summary injected
+  │     …
   │   → branch agent/<issue-id>, commits, tests
   │
-  │   sandcastle.run({ ..., prompt: review template })
-  │   → REVIEW: APPROVED  | REVIEW: REJECTED — <reason>
+  │   if BLOCKED → HITL (skip review)
+  │   else:
+  │     sandcastle.run({ ..., prompt: review template })
+  │     → REVIEW: APPROVED  | REVIEW: REJECTED — <reason>
   │
   ├── approved  → git push → gh pr create → Linear "In Review"
-  └── rejected  → Linear label "ready-for-human", comment with reason
+  └── rejected  → Linear comment with reason, then `ready-for-human` label
   ↓ next issue
+
+[runway] per-issue outcomes:
+  VA-312  APPROVED → PR opened  https://github.com/.../pull/42
+  VA-313  HITL                  Sub-agent review rejected: TOCTOU race in …
 ```
 
 ## Prerequisites
@@ -237,8 +246,11 @@ invocation — re-run runway after fixing the underlying config to retry
 it.
 
 The CLI exits with 0 even if some issues hit HITL or errored — those
-are normal outcomes. Check Linear for the `ready-for-human` label and the
-per-issue comments for what happened.
+are normal outcomes. Every run prints a per-issue verdict trail on
+exit (`APPROVED → PR opened <url>` / `HITL <reason>` /
+`REVERTED → Todo <reason>` / `INFRA_ERROR <reason>`) so you can scan
+results without opening Linear; the same content also lives on the
+issue as a Linear comment.
 
 ## Linear conventions
 
@@ -262,6 +274,48 @@ These names are configurable per env var; the queries match by name so
 your Linear workspace's actual state names need to line up with what
 you set.
 
+## Write-path policy
+
+Runway tells the impl agent which paths it must **not** write to. By
+default the denylist is:
+
+```
+.github/workflows/**   .env*   *.pem   *.key   pnpm-lock.yaml   .sandcastle/**
+```
+
+When an issue's acceptance criteria require modifying a forbidden path,
+the agent is instructed to emit `IMPL: BLOCKED — issue requires
+modifying <path>, which working-style policy forbids` rather than
+silently skipping the work. Runway routes those to HITL with the
+reason attached.
+
+Two layers of override:
+
+**Per repo** — drop a `.runway/policy.yml` in the target repo root:
+
+```yaml
+# Grants write access to specific paths from the default denylist.
+allowedPaths:
+  - .github/workflows/**
+
+# Or replace the denylist entirely (use with care).
+# forbiddenPaths:
+#   - .env*
+#   - "*.pem"
+```
+
+**Per invocation** — comma-separated globs, removed from the effective
+denylist for one `runway run`:
+
+```bash
+runway run --allow-paths='.github/workflows/**'
+runway run --allow-paths='.github/workflows/**,scripts/ci/*.sh'
+```
+
+`runway doctor` surfaces the active policy under Environment so you
+can see what an agent run can and can't touch (e.g. `impl policy:
+.runway/policy.yml + --allow-paths (5 forbidden paths)`).
+
 ## Base branch
 
 Runway auto-detects the repo's default branch at the start of every
@@ -276,6 +330,30 @@ when `origin/HEAD` isn't set and you don't want to run
 `git remote set-head origin --auto`. `runway doctor` surfaces the
 resolved base branch (detected or overridden) in its Environment
 section.
+
+## Implementation pass
+
+The impl agent runs in a Sandcastle container with
+[`prompts/implement.md`](prompts/implement.md). It iterates up to
+`RUNWAY_MAX_ITERATIONS` times (default 5) and must end every iteration
+with one of:
+
+```
+IMPL: DONE
+IMPL: BLOCKED — <one-line reason>
+IMPL: CONTINUE
+```
+
+- `DONE` → runway stops the loop and runs the sub-agent reviewer.
+- `BLOCKED — <reason>` → runway routes the issue to HITL with the
+  reason attached; the reviewer pass does **not** run.
+- `CONTINUE` → runway runs another iteration (up to `maxIterations`).
+
+Between iterations, runway prepends a `## Previous iterations` block
+to the next prompt — running commit log + tail of the last iteration's
+final message — so the agent doesn't re-explore the repository from
+scratch every time. Converged issues typically exit after 1–2
+iterations.
 
 ## Sub-agent review
 
@@ -306,4 +384,7 @@ These are tractable, just not v1.
 
 ## Status
 
-v0.1 — scaffold complete, untested against a live queue.
+0.4.0 — production-shaped and dogfooded against live Linear queues.
+The end-to-end pipeline (init → run → review → PR) is stable; surface
+may still shift as the orchestrator's policy and iteration mechanics
+mature. See [CHANGELOG.md](./CHANGELOG.md) for per-release detail.
