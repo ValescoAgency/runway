@@ -31,8 +31,7 @@ fresh branch named `agent/{{ISSUE_IDENTIFIER}}`. Branch off `main`.
 - If the issue is ambiguous and you can't make a reasonable judgment
   call, stop and explain what's missing in your final message — runway
   will route to a human.
-- Never modify `.github/workflows/**`, `.env*`, `*.pem`, `*.key`,
-  `pnpm-lock.yaml` (unless the task is a dep bump), or `.sandcastle/**`.
+{{POLICY_FORBIDDEN_BULLET}}
 
 # Stop conditions
 
