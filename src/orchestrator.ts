@@ -36,7 +36,16 @@ export interface OrchestratorResult {
   readonly errored: number;
 }
 
-const REVIEW_VERDICT_RE = /^REVIEW:\s*(APPROVED|REJECTED)(?:\s+—\s+(.*))?$/m;
+// VA-353: review verdict marker. Global flag because sandcastle
+// appends wrapper output ("Agent stopped", "Capturing session",
+// "Reached max iterations (1).", "Run complete: …") AFTER the agent's
+// final message — so the marker is rarely the last line. We scan
+// every line-start match and keep the LAST one, which is the most
+// recent agent verdict. Standalone-line: ^…$ with /m anchors prevent
+// mid-prose matches like "the reviewer should output REVIEW: APPROVED
+// when…".
+const REVIEW_VERDICT_RE =
+  /^REVIEW:\s*(APPROVED|REJECTED)(?:\s+—\s+(.*))?$/gm;
 
 // VA-350: impl-pass termination contract. Last `IMPL:` marker line in
 // the agent's output wins (most recent iteration's verdict). DONE →
@@ -351,19 +360,29 @@ export function parseImplVerdict(result: unknown): ImplVerdict {
  * the last assistant message text. We only need to match the
  * `REVIEW: APPROVED` / `REVIEW: REJECTED — …` line at the tail.
  */
-function parseReviewVerdict(result: unknown): ParsedVerdict {
+/**
+ * VA-353: parse the reviewer's final `REVIEW: APPROVED` /
+ * `REVIEW: REJECTED — <reason>` marker. Scans the agent's combined
+ * stdout for *all* matches and returns the LAST one, since sandcastle
+ * appends its own wrapper output ("Agent stopped", "Capturing
+ * session", "Reached max iterations (N).", "Run complete: …") after
+ * the agent's final message. A missing marker is itself a rejection —
+ * a reviewer pass that didn't terminate cleanly is not trustworthy.
+ */
+export function parseReviewVerdict(result: unknown): ParsedVerdict {
   const text = stringifyResult(result);
-  const match = text.match(REVIEW_VERDICT_RE);
-  if (!match) {
+  const matches = [...text.matchAll(REVIEW_VERDICT_RE)];
+  const last = matches[matches.length - 1];
+  if (!last) {
     return {
       kind: "rejected",
       reason: "review output did not contain a REVIEW: verdict line",
     };
   }
-  if (match[1] === "APPROVED") return { kind: "approved", reason: "" };
+  if (last[1] === "APPROVED") return { kind: "approved", reason: "" };
   return {
     kind: "rejected",
-    reason: match[2]?.trim() || "no reason given",
+    reason: last[2]?.trim() || "no reason given",
   };
 }
 
@@ -375,9 +394,13 @@ function stringifyResult(result: unknown): string {
       iterations?: Array<{ output?: string; text?: string }>;
       output?: string;
     };
-    // Sandcastle's RunResult carries the combined agent output on
-    // `stdout`. Prefer it; the iterations/output fallbacks are kept
-    // for back-compat with older shapes and inline test fixtures.
+    // VA-353: sandcastle's RunResult carries the combined agent output
+    // on `stdout`. Prefer it — falling through to JSON.stringify (the
+    // old behavior) replaces real newlines with `\n` escapes and
+    // breaks `^…$/m` line anchoring, which is the exact reason the
+    // reviewer's verdict was being silently dropped for issues like
+    // VA-312 tonight. The iterations/output fallbacks remain for
+    // back-compat with older shapes and inline test fixtures.
     if (typeof r.stdout === "string" && r.stdout.length > 0) return r.stdout;
     if (r.iterations?.length) {
       return r.iterations
