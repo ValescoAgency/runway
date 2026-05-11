@@ -177,6 +177,23 @@ pnpm link --global      # so `runway` is on your $PATH
 
 `pnpm dev -- <args>` runs the TypeScript source via `tsx` without building, useful while iterating on runway itself.
 
+#### Tests
+
+```bash
+pnpm test          # one-shot run, used by CI
+pnpm test:watch    # watch mode for local iteration
+```
+
+Vitest is the harness; tests live colocated with the source as
+`*.test.ts` files (e.g. `src/git.test.ts` next to `src/git.ts`). CI
+runs `pnpm typecheck && pnpm test` on every PR via
+`.github/workflows/ci.yml`.
+
+When adding logic that has a sharp pass/fail signal, add a test next
+to it. The seed suite covers `parseRunArgs`, `detectBaseBranch`, the
+`parseOpRefs` regex extraction, and the `drainQueue` error-handler
+branches — copy any of those as a shape for new tests.
+
 ## Usage
 
 ```bash

@@ -1,0 +1,59 @@
+import { describe, expect, it } from "vitest";
+import { parseRunArgs } from "./run.js";
+
+describe("parseRunArgs", () => {
+  it("returns an empty options object for no args (drain the whole queue)", () => {
+    expect(parseRunArgs([])).toEqual({});
+  });
+
+  it("parses --max with a separate value", () => {
+    expect(parseRunArgs(["--max", "3"])).toEqual({ max: 3 });
+  });
+
+  it("parses -n as a short alias for --max", () => {
+    expect(parseRunArgs(["-n", "5"])).toEqual({ max: 5 });
+  });
+
+  it("rejects a non-numeric --max value", () => {
+    expect(() => parseRunArgs(["--max", "lots"])).toThrow(
+      /--max must be a positive integer/,
+    );
+  });
+
+  it("rejects a zero or negative --max value", () => {
+    expect(() => parseRunArgs(["--max", "0"])).toThrow(
+      /--max must be a positive integer/,
+    );
+  });
+
+  it("rejects --max with no value", () => {
+    expect(() => parseRunArgs(["--max"])).toThrow(/--max requires a number/);
+  });
+
+  it("parses --project=value (inline form)", () => {
+    expect(parseRunArgs(["--project=bedrock"])).toEqual({ project: "bedrock" });
+  });
+
+  it("parses --project value (separate form)", () => {
+    expect(parseRunArgs(["--project", "bedrock"])).toEqual({
+      project: "bedrock",
+    });
+  });
+
+  it("rejects --project with no value", () => {
+    expect(() => parseRunArgs(["--project"])).toThrow(
+      /--project requires a value/,
+    );
+  });
+
+  it("combines --max and --project", () => {
+    expect(parseRunArgs(["--max", "2", "--project=bedrock"])).toEqual({
+      max: 2,
+      project: "bedrock",
+    });
+  });
+
+  it("rejects unknown arguments", () => {
+    expect(() => parseRunArgs(["--lol"])).toThrow(/unknown argument: --lol/);
+  });
+});

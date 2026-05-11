@@ -39,9 +39,11 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc && chmod +x dist/cli.js",
+    "build": "tsc -p tsconfig.build.json && chmod +x dist/cli.js",
     "typecheck": "tsc --noEmit",
     "dev": "tsx src/cli.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "prepublishOnly": "pnpm typecheck && pnpm build",
     "lint": "echo 'lint not configured yet'"
   },
@@ -54,7 +56,8 @@
   "devDependencies": {
     "@types/node": "^22.10.0",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.5"
   },
   "engines": {
     "node": ">=22"
