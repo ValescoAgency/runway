@@ -26,6 +26,14 @@ const ConfigSchema = z.object({
    */
   opServiceAccountToken: z.string().optional(),
   linearTeam: z.string().default("VA"),
+  /**
+   * Optional. Scopes the `runway run` queue to a single project under
+   * `linearTeam`. Resolved by Linear project ID, slug, or name. When
+   * unset, runway drains every `Todo` issue on the team (legacy
+   * behavior). Source: `RUNWAY_LINEAR_PROJECT` env var or
+   * `--project` CLI flag on `runway run`.
+   */
+  linearProject: z.string().optional(),
   readyStatus: z.string().default("Todo"),
   inProgressStatus: z.string().default("In Progress"),
   inReviewStatus: z.string().default("In Review"),
@@ -40,6 +48,7 @@ export function loadConfig(): Config {
     linearApiKey: process.env.LINEAR_API_KEY,
     opServiceAccountToken: process.env.OP_SERVICE_ACCOUNT_TOKEN,
     linearTeam: process.env.RUNWAY_LINEAR_TEAM,
+    linearProject: process.env.RUNWAY_LINEAR_PROJECT,
     readyStatus: process.env.RUNWAY_READY_STATUS,
     inProgressStatus: process.env.RUNWAY_IN_PROGRESS_STATUS,
     inReviewStatus: process.env.RUNWAY_IN_REVIEW_STATUS,
