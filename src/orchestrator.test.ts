@@ -98,6 +98,8 @@ function routeExeca(opts: { revListCount: string }): void {
       return Promise.resolve({ exitCode: 0, stdout: opts.revListCount });
     }
     if (args[0] === "diff" || args[0] === "log") {
+      // The orchestrator captures the diff + commit log to render the
+      // review prompt; tests don't care about the actual contents.
       return Promise.resolve({ exitCode: 0, stdout: "" });
     }
     return Promise.reject(new Error(`unexpected git args: ${args.join(" ")}`));
@@ -125,7 +127,15 @@ describe("drainQueue error handling (VA-342)", () => {
       cwd: "/tmp/repo",
     });
 
-    expect(result).toEqual({ attempts: 1, opened: 0, hitl: 0, errored: 1 });
+    expect(result).toMatchObject({
+      attempts: 1,
+      opened: 0,
+      hitl: 0,
+      errored: 1,
+    });
+    expect(result.outcomes).toEqual([
+      { identifier: "VA-312", kind: "reverted", detail: "missing image" },
+    ]);
 
     // First transition is to In Progress (processIssue's early call); the
     // recovery path adds a second transition back to Todo.
@@ -156,7 +166,15 @@ describe("drainQueue error handling (VA-342)", () => {
       cwd: "/tmp/repo",
     });
 
-    expect(result).toEqual({ attempts: 1, opened: 0, hitl: 0, errored: 1 });
+    expect(result).toMatchObject({
+      attempts: 1,
+      opened: 0,
+      hitl: 0,
+      errored: 1,
+    });
+    expect(result.outcomes).toEqual([
+      { identifier: "VA-312", kind: "errored", detail: "review pass crashed" },
+    ]);
 
     // Only the original In Progress transition — no revert.
     const transitions = linear.transition.mock.calls.map((c) => c[1]);
@@ -194,7 +212,12 @@ describe("drainQueue --max semantics (VA-344)", () => {
       { max: 3 },
     );
 
-    expect(result).toEqual({ attempts: 3, opened: 0, hitl: 0, errored: 3 });
+    expect(result).toMatchObject({
+      attempts: 3,
+      opened: 0,
+      hitl: 0,
+      errored: 3,
+    });
 
     // Each issue was attempted exactly once — confirmed by the
     // distinct In-Progress transitions.
@@ -216,7 +239,12 @@ describe("drainQueue --max semantics (VA-344)", () => {
       { max: 1 },
     );
 
-    expect(result).toEqual({ attempts: 1, opened: 0, hitl: 0, errored: 1 });
+    expect(result).toMatchObject({
+      attempts: 1,
+      opened: 0,
+      hitl: 0,
+      errored: 1,
+    });
 
     // One pickup, one revert. No second attempt despite `fetchReady`
     // still surfacing the issue.
@@ -297,7 +325,12 @@ describe("drainQueue impl marker behaviour (VA-350)", () => {
       cwd: "/tmp/repo",
     });
 
-    expect(result).toEqual({ attempts: 1, opened: 0, hitl: 1, errored: 0 });
+    expect(result).toMatchObject({
+      attempts: 1,
+      opened: 0,
+      hitl: 1,
+      errored: 0,
+    });
     // sandcastle.run was called once (impl) — not twice (impl + review).
     expect(sandcastleRunMock).toHaveBeenCalledTimes(1);
     expect(linear.applyLabel).toHaveBeenCalledWith("issue-123", "needs-human");
@@ -330,7 +363,12 @@ describe("drainQueue impl marker behaviour (VA-350)", () => {
       cwd: "/tmp/repo",
     });
 
-    expect(result).toEqual({ attempts: 1, opened: 1, hitl: 0, errored: 0 });
+    expect(result).toMatchObject({
+      attempts: 1,
+      opened: 1,
+      hitl: 0,
+      errored: 0,
+    });
     expect(sandcastleRunMock).toHaveBeenCalledTimes(2);
     // First call (impl) wires IMPL: completion signals.
     expect(sandcastleRunMock.mock.calls[0]?.[0]).toMatchObject({
@@ -363,8 +401,139 @@ describe("drainQueue impl marker behaviour (VA-350)", () => {
       cwd: "/tmp/repo",
     });
 
-    expect(result).toEqual({ attempts: 1, opened: 1, hitl: 0, errored: 0 });
+    expect(result).toMatchObject({
+      attempts: 1,
+      opened: 1,
+      hitl: 0,
+      errored: 0,
+    });
     expect(sandcastleRunMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests — VA-355 HITL ordering + per-issue verdict trail
+// ---------------------------------------------------------------------------
+
+describe("drainQueue HITL ordering (VA-355)", () => {
+  it("posts the rejection reason as a comment BEFORE applying the label, so a missing label doesn't swallow the reason", async () => {
+    routeExeca({ revListCount: "3" });
+    sandcastleRunMock
+      .mockResolvedValueOnce({
+        stdout: "implementation done\nIMPL: DONE",
+        commits: [{ sha: "abc" }],
+      })
+      .mockResolvedValueOnce({
+        stdout:
+          "REVIEW: REJECTED — TOCTOU race in provisionHousehold, three substantive bugs",
+        commits: [],
+      });
+
+    const linear = makeLinear();
+    linear.applyLabel.mockRejectedValueOnce(
+      new Error('Linear label "needs-human" not found on team xyz'),
+    );
+    linear.fetchReady
+      .mockResolvedValueOnce([issue])
+      .mockResolvedValueOnce([]);
+
+    await drainQueue({
+      config,
+      linear: asLinear(linear),
+      github: makeGithub(),
+      cwd: "/tmp/repo",
+    });
+
+    const commentBodies = linear.comment.mock.calls.map((c) => String(c[1]));
+    const hitlComment = commentBodies.find((b) =>
+      /TOCTOU race in provisionHousehold/.test(b),
+    );
+    expect(hitlComment).toBeDefined();
+    expect(hitlComment).toMatch(/Runway flagged for human review/);
+
+    expect(
+      commentBodies.some((b) =>
+        /could not apply .* label — please apply it manually/.test(b),
+      ),
+    ).toBe(true);
+  });
+
+  it("dumps the rejection reason to stderr when even the Linear comment fails", async () => {
+    routeExeca({ revListCount: "3" });
+    sandcastleRunMock
+      .mockResolvedValueOnce({
+        stdout: "implementation done\nIMPL: DONE",
+        commits: [{ sha: "abc" }],
+      })
+      .mockResolvedValueOnce({
+        stdout: "REVIEW: REJECTED — three bugs found",
+        commits: [],
+      });
+
+    const linear = makeLinear();
+    linear.comment.mockImplementation(async (_id: string, body: string) => {
+      if (/flagged for human review/.test(body)) {
+        throw new Error("Linear unreachable");
+      }
+    });
+    linear.applyLabel.mockRejectedValueOnce(new Error("also unreachable"));
+    linear.fetchReady
+      .mockResolvedValueOnce([issue])
+      .mockResolvedValueOnce([]);
+
+    const writes: string[] = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+      writes.push(typeof chunk === "string" ? chunk : chunk.toString());
+      return true;
+    }) as typeof process.stderr.write;
+
+    try {
+      await drainQueue({
+        config,
+        linear: asLinear(linear),
+        github: makeGithub(),
+        cwd: "/tmp/repo",
+      });
+    } finally {
+      process.stderr.write = origWrite;
+    }
+
+    const combined = writes.join("");
+    expect(combined).toMatch(/REJECTION REASON FOLLOWS \(VA-312\)/);
+    expect(combined).toMatch(/three bugs found/);
+  });
+
+  it("includes a per-issue verdict trail in the exit summary", async () => {
+    routeExeca({ revListCount: "3" });
+    sandcastleRunMock
+      .mockResolvedValueOnce({
+        stdout: "implementation done\nIMPL: DONE",
+        commits: [{ sha: "abc" }],
+      })
+      .mockResolvedValueOnce({
+        stdout: "REVIEW: APPROVED",
+        commits: [],
+      });
+
+    const linear = makeLinear();
+    linear.fetchReady
+      .mockResolvedValueOnce([issue])
+      .mockResolvedValueOnce([]);
+
+    const result = await drainQueue({
+      config,
+      linear: asLinear(linear),
+      github: makeGithub(),
+      cwd: "/tmp/repo",
+    });
+
+    expect(result.outcomes).toHaveLength(1);
+    expect(result.outcomes[0]).toMatchObject({
+      identifier: "VA-312",
+      kind: "opened",
+    });
+    expect(result.outcomes[0]?.detail).toMatch(/^https:\/\//);
   });
 });
 
@@ -477,7 +646,12 @@ describe("drainQueue iteration memory (VA-349)", () => {
       {},
     );
 
-    expect(result).toEqual({ attempts: 1, opened: 1, hitl: 0, errored: 0 });
+    expect(result).toMatchObject({
+      attempts: 1,
+      opened: 1,
+      hitl: 0,
+      errored: 0,
+    });
     // Two impl iterations + one review = 3 sandcastle calls. Iteration 3
     // must NOT run because iter2 emitted IMPL: DONE.
     expect(sandcastleRunMock).toHaveBeenCalledTimes(3);

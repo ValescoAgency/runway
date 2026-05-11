@@ -37,6 +37,18 @@ export interface OrchestratorResult {
   readonly opened: number;
   readonly hitl: number;
   readonly errored: number;
+  /**
+   * VA-355: per-issue verdict trail so the operator can scan
+   * `runway run`'s exit summary without opening Linear. Order matches
+   * the order in which issues were picked up.
+   */
+  readonly outcomes: readonly IssueOutcome[];
+}
+
+export interface IssueOutcome {
+  readonly identifier: string;
+  readonly kind: "opened" | "hitl" | "reverted" | "errored";
+  readonly detail: string;
 }
 
 // VA-353: review verdict marker. Global flag because sandcastle
@@ -101,6 +113,7 @@ export async function drainQueue(
   // startup failure (broken .env.schema, missing image, expired token)
   // would loop on the same issue until --max was exhausted.
   const seen = new Set<string>();
+  const outcomes: IssueOutcome[] = [];
 
   while (attempts < max) {
     const queue = await linear.fetchReady();
@@ -110,9 +123,14 @@ export async function drainQueue(
     attempts += 1;
 
     try {
-      const verdict = await processIssue(issue, runDeps);
-      if (verdict === "opened") opened += 1;
-      if (verdict === "hitl") hitl += 1;
+      const result = await processIssue(issue, runDeps);
+      if (result.kind === "opened") opened += 1;
+      if (result.kind === "hitl") hitl += 1;
+      outcomes.push({
+        identifier: issue.identifier,
+        kind: result.kind,
+        detail: result.detail,
+      });
     } catch (err) {
       errored += 1;
       console.error(`[runway] error on ${issue.identifier}:`, err);
@@ -120,11 +138,12 @@ export async function drainQueue(
       // If the agent crashed before producing any commits (missing
       // image, varlock validation, container failed to boot, etc.),
       // it's an infrastructure failure — not a HITL. Revert the issue
-      // to `Todo` and skip the `needs-human` label so the next run
-      // can pick it up cleanly. `In Progress` is reserved for "agent
-      // has committed to the branch".
+      // to the ready state and skip the HITL label so the next run can
+      // pick it up cleanly. `In Progress` is reserved for "agent has
+      // committed to the branch".
       const branch = `agent/${issue.identifier.toLowerCase()}`;
       const startedRealWork = await hasCommits(deps.cwd, baseBranch, branch);
+      const errDetail = err instanceof Error ? err.message : String(err);
 
       if (!startedRealWork) {
         await linear
@@ -133,31 +152,46 @@ export async function drainQueue(
         await linear
           .comment(
             issue.id,
-            `Runway hit a startup failure before the agent produced any commits — reverting to \`${config.readyStatus}\` for retry:\n\n\`\`\`\n${
-              err instanceof Error ? err.message : String(err)
-            }\n\`\`\``,
+            `Runway hit a startup failure before the agent produced any commits — reverting to \`${config.readyStatus}\` for retry:\n\n\`\`\`\n${errDetail}\n\`\`\``,
           )
           .catch(() => undefined);
+        outcomes.push({
+          identifier: issue.identifier,
+          kind: "reverted",
+          detail: errDetail,
+        });
       } else {
-        await linear
-          .applyLabel(issue.id, config.hitlLabel)
-          .catch(() => undefined);
-        await linear
-          .comment(
-            issue.id,
-            `Runway hit an unrecoverable error and flagged for human review:\n\n\`\`\`\n${
-              err instanceof Error ? err.message : String(err)
-            }\n\`\`\``,
-          )
-          .catch(() => undefined);
+        // VA-355: comment first with the substantive reason, label
+        // second (best-effort). If we labeled first and the label
+        // didn't exist (Flightplan workspaces hitting the
+        // `needs-human` default — see VA-354), the orchestrator's
+        // catch would never get to the reason and the operator would
+        // see an infrastructure error in Linear with no clue what
+        // the agent actually found.
+        await flagHitl(
+          issue,
+          runDeps,
+          `Runway hit an unrecoverable error and flagged for human review: ${errDetail}`,
+        );
+        outcomes.push({
+          identifier: issue.identifier,
+          kind: "errored",
+          detail: errDetail,
+        });
       }
     }
   }
 
-  return { attempts, opened, hitl, errored };
+  printExitSummary(outcomes);
+
+  return { attempts, opened, hitl, errored, outcomes };
 }
 
-type Verdict = "opened" | "hitl";
+interface ProcessOutcome {
+  readonly kind: "opened" | "hitl";
+  /** PR URL for "opened", or the rejection/HITL reason for "hitl". */
+  readonly detail: string;
+}
 
 interface ResolvedDeps extends OrchestratorDeps {
   /** Default branch of the cwd repo. Resolved once in drainQueue. */
@@ -169,7 +203,7 @@ interface ResolvedDeps extends OrchestratorDeps {
 async function processIssue(
   issue: RunwayIssue,
   deps: ResolvedDeps,
-): Promise<Verdict> {
+): Promise<ProcessOutcome> {
   const { config, linear, github, cwd, baseBranch } = deps;
   const branch = `agent/${issue.identifier.toLowerCase()}`;
 
@@ -236,12 +270,9 @@ async function processIssue(
   // VA-350: BLOCKED short-circuits straight to HITL — no reviewer pass
   // for a self-declared blocker.
   if (implVerdict.kind === "blocked") {
-    await flagHitl(
-      issue,
-      deps,
-      `Implementation pass blocked: ${implVerdict.reason}`,
-    );
-    return "hitl";
+    const reason = `Implementation pass blocked: ${implVerdict.reason}`;
+    await flagHitl(issue, deps, reason);
+    return { kind: "hitl", detail: reason };
   }
   if (implVerdict.kind === "missing") {
     console.warn(
@@ -250,12 +281,10 @@ async function processIssue(
   }
 
   if (finalResult.commits.length === 0) {
-    await flagHitl(
-      issue,
-      deps,
-      "Agent produced no commits — the issue may need clarification or human input.",
-    );
-    return "hitl";
+    const reason =
+      "Agent produced no commits — the issue may need clarification or human input.";
+    await flagHitl(issue, deps, reason);
+    return { kind: "hitl", detail: reason };
   }
 
   // 2. Review pass — read-only-ish, just looking at the diff.
@@ -279,12 +308,9 @@ async function processIssue(
 
   const verdict = parseReviewVerdict(reviewResult);
   if (verdict.kind === "rejected") {
-    await flagHitl(
-      issue,
-      deps,
-      `Sub-agent review rejected: ${verdict.reason}`,
-    );
-    return "hitl";
+    const reason = `Sub-agent review rejected: ${verdict.reason}`;
+    await flagHitl(issue, deps, reason);
+    return { kind: "hitl", detail: reason };
   }
 
   // 3. Push + PR.
@@ -302,17 +328,96 @@ async function processIssue(
     issue.id,
     `Runway opened a PR for review: ${prUrl}`,
   );
-  return "opened";
+  return { kind: "opened", detail: prUrl };
 }
 
+/**
+ * VA-355: comment is the load-bearing artifact, label is metadata.
+ * Post the comment FIRST so the substantive reason lands on the issue
+ * even if the label apply later fails (Flightplan workspaces hitting
+ * the `needs-human` default, transient Linear errors, etc.). On full
+ * failure (comment didn't even post), dump the reason to stderr with
+ * a clear banner so the operator sees it terminal-side.
+ */
 async function flagHitl(
   issue: RunwayIssue,
   deps: ResolvedDeps,
   reason: string,
 ): Promise<void> {
   const { config, linear } = deps;
-  await linear.applyLabel(issue.id, config.hitlLabel);
-  await linear.comment(issue.id, `Runway flagged for human review: ${reason}`);
+  const body = `Runway flagged for human review: ${reason}`;
+
+  let commentPosted = false;
+  try {
+    await linear.comment(issue.id, body);
+    commentPosted = true;
+  } catch (err) {
+    console.error(
+      `[runway] ${issue.identifier}: failed to post HITL comment:`,
+      errMsg(err),
+    );
+  }
+
+  try {
+    await linear.applyLabel(issue.id, config.hitlLabel);
+  } catch (err) {
+    const detail = errMsg(err);
+    console.error(
+      `[runway] ${issue.identifier}: failed to apply HITL label "${config.hitlLabel}":`,
+      detail,
+    );
+    if (commentPosted) {
+      // Best-effort follow-up note; the real reason is already on the
+      // issue from the first comment.
+      await linear
+        .comment(
+          issue.id,
+          `Note: could not apply \`${config.hitlLabel}\` label — please apply it manually. (${detail})`,
+        )
+        .catch(() => undefined);
+    }
+  }
+
+  if (!commentPosted) {
+    // Last resort: the operator at least sees the reason in their
+    // terminal, even with Linear entirely unreachable.
+    process.stderr.write(
+      [
+        "",
+        `===== REJECTION REASON FOLLOWS (${issue.identifier}) =====`,
+        reason,
+        "===== END REJECTION REASON =====",
+        "",
+        "",
+      ].join("\n"),
+    );
+  }
+}
+
+function errMsg(err: unknown): string {
+  if (err instanceof Error) return err.message.split("\n")[0] ?? err.message;
+  return String(err);
+}
+
+/**
+ * VA-355: render a per-issue verdict trail at the end of the drain so
+ * the operator can scan results without opening Linear. Skipped when
+ * no issues were attempted.
+ */
+function printExitSummary(outcomes: readonly IssueOutcome[]): void {
+  if (outcomes.length === 0) return;
+  console.log("\n[runway] per-issue outcomes:");
+  for (const o of outcomes) {
+    const tag =
+      o.kind === "opened"
+        ? "APPROVED → PR opened"
+        : o.kind === "hitl"
+          ? "HITL"
+          : o.kind === "reverted"
+            ? "REVERTED → Todo"
+            : "INFRA_ERROR";
+    console.log(`  ${o.identifier}  ${tag}  ${o.detail}`);
+  }
 }
 
 /**
