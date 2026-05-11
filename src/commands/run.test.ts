@@ -56,4 +56,33 @@ describe("parseRunArgs", () => {
   it("rejects unknown arguments", () => {
     expect(() => parseRunArgs(["--lol"])).toThrow(/unknown argument: --lol/);
   });
+
+  describe("--allow-paths (VA-352)", () => {
+    it("parses a single inline glob", () => {
+      expect(parseRunArgs(["--allow-paths=.github/workflows/**"])).toEqual({
+        allowPaths: [".github/workflows/**"],
+      });
+    });
+
+    it("parses a comma-separated list and trims whitespace", () => {
+      expect(
+        parseRunArgs(["--allow-paths", ".github/workflows/**, foo/bar"]),
+      ).toEqual({ allowPaths: [".github/workflows/**", "foo/bar"] });
+    });
+
+    it("merges repeated flags", () => {
+      expect(
+        parseRunArgs([
+          "--allow-paths=a",
+          "--allow-paths=b,c",
+        ]),
+      ).toEqual({ allowPaths: ["a", "b", "c"] });
+    });
+
+    it("rejects an empty value", () => {
+      expect(() => parseRunArgs(["--allow-paths="])).toThrow(
+        /--allow-paths requires at least one glob/,
+      );
+    });
+  });
 });

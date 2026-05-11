@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import type { RunwayIssue } from "./linear.js";
+import { renderForbiddenPathsBullet, type Policy } from "./policy.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // Prompts ship with the runway package, NOT in the target repo's
@@ -35,7 +36,7 @@ export function renderPrompt(
 
 export function implementVars(
   issue: RunwayIssue,
-  opts: { previousIterations?: string } = {},
+  opts: { previousIterations?: string; policy?: Policy } = {},
 ): Record<string, string> {
   return {
     ISSUE_IDENTIFIER: issue.identifier,
@@ -43,6 +44,12 @@ export function implementVars(
     ISSUE_DESCRIPTION: issue.description || "(no description)",
     // VA-349: empty for iteration 1, a structured summary for 2+.
     PREVIOUS_ITERATIONS: opts.previousIterations ?? "",
+    // VA-352: render the working-style denylist from the active policy
+    // so the agent never sees a hardcoded list that diverges from what
+    // runway actually enforces.
+    POLICY_FORBIDDEN_BULLET: opts.policy
+      ? renderForbiddenPathsBullet(opts.policy)
+      : "",
   };
 }
 
