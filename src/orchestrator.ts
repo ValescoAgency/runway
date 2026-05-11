@@ -38,6 +38,14 @@ export interface OrchestratorResult {
 
 const REVIEW_VERDICT_RE = /^REVIEW:\s*(APPROVED|REJECTED)(?:\s+—\s+(.*))?$/m;
 
+// VA-350: impl-pass termination contract. Last `IMPL:` marker line in
+// the agent's output wins (most recent iteration's verdict). DONE →
+// proceed to review; BLOCKED → HITL with reason; CONTINUE or missing →
+// fall through (back-compat). The trailing reason after `—` is
+// captured for BLOCKED.
+const IMPL_VERDICT_RE = /^IMPL:\s*(DONE|BLOCKED|CONTINUE)(?:\s+—\s+(.*))?$/gm;
+const IMPL_COMPLETION_SIGNALS = ["IMPL: DONE", "IMPL: BLOCKED"] as const;
+
 /**
  * Confirms the cwd looks like a sandcastle-initialised repo. If not,
  * we error early with a clear message rather than letting Sandcastle
@@ -169,8 +177,26 @@ async function processIssue(
     prompt: implementPrompt,
     branchStrategy: { type: "branch", branch },
     maxIterations: config.maxIterations,
+    completionSignal: [...IMPL_COMPLETION_SIGNALS],
     name: `impl-${issue.identifier}`,
   });
+
+  // VA-350: parse the terminating IMPL: marker. BLOCKED short-circuits
+  // straight to HITL — no reviewer pass for a self-declared blocker.
+  const implVerdict = parseImplVerdict(implementResult);
+  if (implVerdict.kind === "blocked") {
+    await flagHitl(
+      issue,
+      deps,
+      `Implementation pass blocked: ${implVerdict.reason}`,
+    );
+    return "hitl";
+  }
+  if (implVerdict.kind === "missing") {
+    console.warn(
+      `[runway] ${issue.identifier}: impl agent ended without an IMPL: marker; treating as CONTINUE for back-compat.`,
+    );
+  }
 
   if (implementResult.commits.length === 0) {
     await flagHitl(
@@ -292,6 +318,34 @@ interface ParsedVerdict {
   readonly reason: string;
 }
 
+type ImplVerdict =
+  | { readonly kind: "done" }
+  | { readonly kind: "continue" }
+  | { readonly kind: "blocked"; readonly reason: string }
+  | { readonly kind: "missing" };
+
+/**
+ * Pulls the last `IMPL:` marker line out of the agent's output. The
+ * orchestrator uses this to distinguish a clean completion (DONE) from
+ * a self-declared block (BLOCKED — reason) from a multi-iteration
+ * in-progress signal (CONTINUE). A missing marker is treated as
+ * CONTINUE-with-warning for back-compat.
+ */
+export function parseImplVerdict(result: unknown): ImplVerdict {
+  const text = stringifyResult(result);
+  // Take the LAST match — later iterations override earlier ones if
+  // the agent emitted multiple markers across an iteration loop.
+  const matches = [...text.matchAll(IMPL_VERDICT_RE)];
+  const last = matches[matches.length - 1];
+  if (!last) return { kind: "missing" };
+  if (last[1] === "DONE") return { kind: "done" };
+  if (last[1] === "CONTINUE") return { kind: "continue" };
+  return {
+    kind: "blocked",
+    reason: last[2]?.trim() || "no reason given",
+  };
+}
+
 /**
  * Sandcastle's `RunResult` shape varies by version; defensively dig out
  * the last assistant message text. We only need to match the
@@ -317,9 +371,14 @@ function stringifyResult(result: unknown): string {
   if (typeof result === "string") return result;
   if (result && typeof result === "object") {
     const r = result as {
+      stdout?: string;
       iterations?: Array<{ output?: string; text?: string }>;
       output?: string;
     };
+    // Sandcastle's RunResult carries the combined agent output on
+    // `stdout`. Prefer it; the iterations/output fallbacks are kept
+    // for back-compat with older shapes and inline test fixtures.
+    if (typeof r.stdout === "string" && r.stdout.length > 0) return r.stdout;
     if (r.iterations?.length) {
       return r.iterations
         .map((i) => i.output ?? i.text ?? "")
