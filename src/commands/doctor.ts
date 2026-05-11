@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { execa } from "execa";
+import { detectBaseBranch } from "../git.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -126,7 +127,7 @@ export async function doctorCommand(argv: readonly string[]): Promise<void> {
   sections.push(await checkHostTooling(tierForToolingChecks));
 
   if (initialised || opts.tierOverride !== undefined) {
-    sections.push(checkEnvironment(tierForToolingChecks));
+    sections.push(await checkEnvironment(tierForToolingChecks, cwd));
     sections.push(await checkRepoState(cwd, repo));
     sections.push(await checkDockerImage(cwd));
   } else {
@@ -288,7 +289,10 @@ async function checkGhAuth(): Promise<CheckResult> {
 // Section: Environment
 // ---------------------------------------------------------------------------
 
-function checkEnvironment(tier: Tier): SectionResult {
+async function checkEnvironment(
+  tier: Tier,
+  cwd: string,
+): Promise<SectionResult> {
   const checks = new Map<string, CheckResult>();
 
   checks.set("LINEAR_API_KEY", envSet("LINEAR_API_KEY", "fail"));
@@ -303,6 +307,33 @@ function checkEnvironment(tier: Tier): SectionResult {
       ? `team ${team} / project ${project}`
       : `team ${team} (team-wide — RUNWAY_LINEAR_PROJECT unset)`,
   });
+
+  // Informational: which base branch a `runway run` would diff against
+  // and target with PRs. Detection failure here is a real problem —
+  // surface it as a fail so the user knows up front.
+  const override = process.env.RUNWAY_BASE_BRANCH?.trim();
+  if (override) {
+    checks.set("base_branch", {
+      status: "ok",
+      label: "base branch",
+      detail: `${override} (RUNWAY_BASE_BRANCH override)`,
+    });
+  } else {
+    try {
+      const detected = await detectBaseBranch(cwd);
+      checks.set("base_branch", {
+        status: "ok",
+        label: "base branch",
+        detail: `${detected} (detected from origin/HEAD)`,
+      });
+    } catch (err) {
+      checks.set("base_branch", {
+        status: "fail",
+        label: "base branch",
+        detail: errMsg(err),
+      });
+    }
+  }
 
   if (tier === 2) {
     // Tier 2: needed by varlock to resolve op:// refs in the container.

@@ -4,10 +4,11 @@ import type { RunwayIssue } from "./linear.js";
 export interface GithubGateway {
   /** Push a branch to origin. Returns nothing on success, throws on failure. */
   pushBranch(repoPath: string, branch: string): Promise<void>;
-  /** Open a PR against `main` for the given branch. Returns the PR URL. */
+  /** Open a PR against `base` for the given branch. Returns the PR URL. */
   openPullRequest(args: {
     repoPath: string;
     branch: string;
+    base: string;
     issue: RunwayIssue;
     body: string;
   }): Promise<string>;
@@ -27,7 +28,7 @@ export function createGithubGateway(): GithubGateway {
       });
     },
 
-    async openPullRequest({ repoPath, branch, issue, body }) {
+    async openPullRequest({ repoPath, branch, base, issue, body }) {
       const title = `${issue.identifier}: ${issue.title}`;
       const { stdout } = await execa(
         "gh",
@@ -35,7 +36,7 @@ export function createGithubGateway(): GithubGateway {
           "pr",
           "create",
           "--base",
-          "main",
+          base,
           "--head",
           branch,
           "--title",
