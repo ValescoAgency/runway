@@ -7,11 +7,13 @@ import type { Config } from "./config.js";
 import type { LinearGateway, RunwayIssue } from "./linear.js";
 import type { GithubGateway } from "./github.js";
 import {
+  buildIterationSummary,
   implementVars,
   loadImplementPrompt,
   loadReviewPrompt,
   renderPrompt,
   reviewVars,
+  tailOfMessage,
 } from "./prompts.js";
 import { detectBaseBranch } from "./git.js";
 
@@ -173,26 +175,58 @@ async function processIssue(
   );
 
   // 1. Implementation pass.
-  const implementPrompt = renderPrompt(
-    await loadImplementPrompt(),
-    implementVars(issue),
-  );
-  const implementResult = await run({
-    agent: claudeCode("claude-opus-4-6"),
-    sandbox: docker({
-      env: dockerEnv(config),
-    }),
-    cwd,
-    prompt: implementPrompt,
-    branchStrategy: { type: "branch", branch },
-    maxIterations: config.maxIterations,
-    completionSignal: [...IMPL_COMPLETION_SIGNALS],
-    name: `impl-${issue.identifier}`,
-  });
+  //
+  // VA-349 + VA-350: run iterations one at a time so we can (a) inject
+  // a summary of the previous iteration into the next prompt — no more
+  // "I'll start by understanding the current state of the repository"
+  // 5x per issue — and (b) break early on IMPL: DONE/BLOCKED parsed
+  // from our own code rather than relying on sandcastle's substring
+  // completionSignal.
+  const implementTemplate = await loadImplementPrompt();
+  const maxIters = Math.max(1, config.maxIterations);
+  let prevSummary = "";
+  let implementResult: Awaited<ReturnType<typeof run>> | undefined;
+  let implVerdict: ReturnType<typeof parseImplVerdict> = { kind: "missing" };
 
-  // VA-350: parse the terminating IMPL: marker. BLOCKED short-circuits
-  // straight to HITL — no reviewer pass for a self-declared blocker.
-  const implVerdict = parseImplVerdict(implementResult);
+  for (let iter = 1; iter <= maxIters; iter += 1) {
+    const implementPrompt = renderPrompt(
+      implementTemplate,
+      implementVars(issue, { previousIterations: prevSummary }),
+    );
+    implementResult = await run({
+      agent: claudeCode("claude-opus-4-6"),
+      sandbox: docker({
+        env: dockerEnv(config),
+      }),
+      cwd,
+      prompt: implementPrompt,
+      branchStrategy: { type: "branch", branch },
+      maxIterations: 1,
+      completionSignal: [...IMPL_COMPLETION_SIGNALS],
+      name: `impl-${issue.identifier}-iter-${iter}`,
+    });
+
+    implVerdict = parseImplVerdict(implementResult);
+    if (implVerdict.kind === "done" || implVerdict.kind === "blocked") break;
+
+    // CONTINUE / missing — build the summary that the NEXT iteration
+    // will see at the top of its prompt.
+    const commits = await captureCommitLog(cwd, baseBranch, branch).catch(
+      () => "",
+    );
+    prevSummary = buildIterationSummary({
+      iterationsRun: iter,
+      commits,
+      finalMessageTail: tailOfMessage(implementResult.stdout ?? ""),
+    });
+  }
+
+  // implementResult is set after the first iteration. The `!` is safe
+  // because maxIters >= 1.
+  const finalResult = implementResult!;
+
+  // VA-350: BLOCKED short-circuits straight to HITL — no reviewer pass
+  // for a self-declared blocker.
   if (implVerdict.kind === "blocked") {
     await flagHitl(
       issue,
@@ -203,11 +237,11 @@ async function processIssue(
   }
   if (implVerdict.kind === "missing") {
     console.warn(
-      `[runway] ${issue.identifier}: impl agent ended without an IMPL: marker; treating as CONTINUE for back-compat.`,
+      `[runway] ${issue.identifier}: impl agent ended without an IMPL: marker after ${maxIters} iteration(s); proceeding to review for back-compat.`,
     );
   }
 
-  if (implementResult.commits.length === 0) {
+  if (finalResult.commits.length === 0) {
     await flagHitl(
       issue,
       deps,
