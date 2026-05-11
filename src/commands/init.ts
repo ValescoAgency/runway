@@ -54,8 +54,10 @@ NOTE
   No --op-account flag — runway uses 1Password service-account auth
   exclusively (OP_SERVICE_ACCOUNT_TOKEN). The token already encodes
   which 1Password tenant to talk to, so the op:// URI omits the
-  account segment: \`op://<vault>/<item>\` rather than
-  \`op://<account>/<vault>/<item>\`.
+  account segment: \`op://<vault>/<item>/<field>\` rather than
+  \`op://<account>/<vault>/<item>/<field>\`. Runway hard-codes the
+  \`credential\` field, which is the canonical field name on
+  1Password API_CREDENTIAL items.
 
 WHAT THIS COMMAND DOES
   1. Preflight: docker, gh, node, (tier 2) varlock + op CLI, git state.

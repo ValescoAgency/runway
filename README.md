@@ -77,7 +77,9 @@ runway init \
 (No `--op-account` — runway uses 1Password service-account auth
 (`OP_SERVICE_ACCOUNT_TOKEN`) exclusively, and the token already
 encodes the tenant. `op://` URIs runway writes are
-`op://<vault>/<item>`, not `op://<account>/<vault>/<item>`.)
+`op://<vault>/<item>/credential`, not `op://<account>/<vault>/<item>`.
+The `/credential` field selector is required for `API_CREDENTIAL`
+items, which is the canonical 1Password category for API keys.)
 
 This runs `npx sandcastle init`, patches the generated `.sandcastle/Dockerfile`
 to bake in `varlock` + the 1Password CLI + a `claude` shim, scaffolds
