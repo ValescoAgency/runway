@@ -6,6 +6,8 @@ You are an autonomous coding agent working on a single Linear issue.
 
 {{ISSUE_DESCRIPTION}}
 
+{{PREVIOUS_ITERATIONS}}
+
 # Repository context
 
 You are operating inside a clean checkout of the target repository on a
