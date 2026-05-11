@@ -33,12 +33,56 @@ export function renderPrompt(
   );
 }
 
-export function implementVars(issue: RunwayIssue): Record<string, string> {
+export function implementVars(
+  issue: RunwayIssue,
+  opts: { previousIterations?: string } = {},
+): Record<string, string> {
   return {
     ISSUE_IDENTIFIER: issue.identifier,
     ISSUE_TITLE: issue.title,
     ISSUE_DESCRIPTION: issue.description || "(no description)",
+    // VA-349: empty for iteration 1, a structured summary for 2+.
+    PREVIOUS_ITERATIONS: opts.previousIterations ?? "",
   };
+}
+
+/**
+ * VA-349: build the "## Previous iterations" block that gets prepended
+ * to iteration N+1's prompt. Carries the agent's commit log and the
+ * tail of its final message so the next iteration doesn't re-explore
+ * the repo from scratch.
+ */
+export function buildIterationSummary(args: {
+  iterationsRun: number;
+  commits: string;
+  finalMessageTail: string;
+}): string {
+  const { iterationsRun, commits, finalMessageTail } = args;
+  return [
+    "## Previous iterations",
+    "",
+    `You have already completed ${iterationsRun} iteration(s) on this issue.`,
+    "Do **not** re-explore the repository — pick up where the last iteration left off.",
+    "",
+    "### Commits so far on this branch",
+    "",
+    "```",
+    commits.trim() || "(no commits yet)",
+    "```",
+    "",
+    "### Tail of the last iteration's final message",
+    "",
+    "```",
+    finalMessageTail.trim() || "(no output captured)",
+    "```",
+    "",
+  ].join("\n");
+}
+
+/** Keep the tail of an iteration's stdout small enough to fit alongside the prompt. */
+export function tailOfMessage(stdout: string, maxChars = 2000): string {
+  if (stdout.length <= maxChars) return stdout;
+  return `…(earlier output truncated)\n${stdout.slice(-maxChars)}`;
 }
 
 export function reviewVars(args: {
