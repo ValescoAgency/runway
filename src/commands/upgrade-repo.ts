@@ -26,6 +26,14 @@ interface ResolvedOpRefs {
   readonly opVault: string;
   readonly anthropicItem: string;
   readonly ghTokenItem: string;
+  /**
+   * Which env var the existing schema uses for Claude Code auth.
+   * Detected from the schema body so upgrade-repo round-trips
+   * whichever mode the user originally chose with `runway init
+   * --auth-mode=...`. Defaults to "api-key" for back-compat with
+   * pre-VA-347 schemas that always wrote ANTHROPIC_API_KEY.
+   */
+  readonly authMode: import("./init.js").AuthMode;
 }
 
 interface FileChange {
@@ -59,7 +67,9 @@ OPTIONS
                       lines outside the runway templates (manual edits).
   --op-vault=NAME     Override the 1Password vault. By default, upgrade-repo
                       extracts this from the existing .env.schema.
-  --anthropic-item=N  Override the ANTHROPIC_API_KEY item name.
+  --anthropic-item=N  Override the Claude Code credential item name
+                      (i.e. the ANTHROPIC_API_KEY or
+                      CLAUDE_CODE_OAUTH_TOKEN 1Password item).
   --gh-token-item=N   Override the GH_TOKEN item name.
   --help, -h          Show this help.
 
@@ -151,6 +161,7 @@ export async function upgradeRepoCommand(
     opVault: "placeholder",
     anthropicItem: "placeholder",
     ghTokenItem: "placeholder",
+    authMode: "api-key",
   };
   await preflight(cwd, preflightOpts);
 
@@ -212,6 +223,7 @@ export async function upgradeRepoCommand(
     opVault: resolved?.opVault ?? "placeholder",
     anthropicItem: resolved?.anthropicItem ?? "placeholder",
     ghTokenItem: resolved?.ghTokenItem ?? "placeholder",
+    authMode: resolved?.authMode ?? "api-key",
   };
   await verify(cwd, verifyOpts);
 
@@ -234,8 +246,12 @@ function detectTier(cwd: string): 1 | 2 {
 
   if (existsSync(schemaPath)) {
     const schema = readFileSync(schemaPath, "utf8");
-    // Tier-2 marker: ANTHROPIC_API_KEY uses the varlock shell-call form.
-    const tier2Marker = new RegExp(`ANTHROPIC_API_KEY\\s*=\\s*${execName()}\\(`);
+    // Tier-2 marker: the Claude Code credential (whichever env var
+    // name the user picked at init time) uses the varlock shell-call
+    // form.
+    const tier2Marker = new RegExp(
+      `(ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN)\\s*=\\s*${execName()}\\(`,
+    );
     if (tier2Marker.test(schema)) {
       return 2;
     }
@@ -254,8 +270,10 @@ function execName(): string {
 // op:// extraction
 // ---------------------------------------------------------------------------
 
+// Either ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN — capture which
+// it is so upgrade-repo can re-render in the same auth mode.
 const ANTHROPIC_RE = new RegExp(
-  `^\\s*ANTHROPIC_API_KEY\\s*=\\s*${execName()}\\(\\s*['"]op read "op://([^/"]+)/([^"]+)"['"]\\s*\\)\\s*$`,
+  `^\\s*(ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN)\\s*=\\s*${execName()}\\(\\s*['"]op read "op://([^/"]+)/([^"]+)"['"]\\s*\\)\\s*$`,
   "m",
 );
 const GH_TOKEN_RE = new RegExp(
@@ -275,9 +293,11 @@ function resolveOpRefs(
 
   // Per-field override > extracted > error.
   const opVault =
-    opts.opVault ?? anthropicMatch?.[1] ?? ghTokenMatch?.[1] ?? null;
-  const anthropicItem = opts.anthropicItem ?? anthropicMatch?.[2] ?? null;
+    opts.opVault ?? anthropicMatch?.[2] ?? ghTokenMatch?.[1] ?? null;
+  const anthropicItem = opts.anthropicItem ?? anthropicMatch?.[3] ?? null;
   const ghTokenItem = opts.ghTokenItem ?? ghTokenMatch?.[2] ?? null;
+  const authMode: import("./init.js").AuthMode =
+    anthropicMatch?.[1] === "CLAUDE_CODE_OAUTH_TOKEN" ? "oauth" : "api-key";
 
   if (!opVault || !anthropicItem || !ghTokenItem) {
     throw new Error(
@@ -292,14 +312,14 @@ function resolveOpRefs(
     !opts.opVault &&
     anthropicMatch &&
     ghTokenMatch &&
-    anthropicMatch[1] !== ghTokenMatch[1]
+    anthropicMatch[2] !== ghTokenMatch[1]
   ) {
     throw new Error(
-      `vault mismatch in .env.schema: ANTHROPIC_API_KEY uses "${anthropicMatch[1]}", GH_TOKEN uses "${ghTokenMatch[1]}". Pass --op-vault to disambiguate.`,
+      `vault mismatch in .env.schema: ${anthropicMatch[1]} uses "${anthropicMatch[2]}", GH_TOKEN uses "${ghTokenMatch[1]}". Pass --op-vault to disambiguate.`,
     );
   }
 
-  return { opVault, anthropicItem, ghTokenItem };
+  return { opVault, anthropicItem, ghTokenItem, authMode };
 }
 
 // ---------------------------------------------------------------------------
@@ -384,19 +404,30 @@ function renderEnvSchema(cwd: string, resolved: ResolvedOpRefs): FileChange {
     join(TEMPLATES_DIR, ".env.schema.target-repo"),
     "utf8",
   );
+  const anthropicEnvVar =
+    resolved.authMode === "oauth" ? "CLAUDE_CODE_OAUTH_TOKEN" : "ANTHROPIC_API_KEY";
   let body = tmpl
     .replaceAll("{{OP_VAULT}}", resolved.opVault)
     .replaceAll("{{ANTHROPIC_ITEM}}", resolved.anthropicItem)
-    .replaceAll("{{GH_TOKEN_ITEM}}", resolved.ghTokenItem);
+    .replaceAll("{{GH_TOKEN_ITEM}}", resolved.ghTokenItem)
+    .replaceAll("{{ANTHROPIC_ENV_VAR}}", anthropicEnvVar);
 
-  // Preserve user-added `KEY=<call>(...)` lines for keys other than the two
-  // we own. Match any `KEY = <execName>(` line in the existing schema and
-  // append the whole line if its key isn't ANTHROPIC_API_KEY or GH_TOKEN.
+  // Preserve user-added `KEY=<call>(...)` lines for keys other than the
+  // ones we own. Match any `KEY = <execName>(` line in the existing
+  // schema and append the whole line if its key isn't the active
+  // Claude Code auth var or GH_TOKEN.
   const userExecRe = new RegExp(
     `^([A-Z_][A-Z0-9_]*)\\s*=\\s*${execName()}\\(`,
     "gm",
   );
-  const ownedKeys = new Set(["ANTHROPIC_API_KEY", "GH_TOKEN"]);
+  // Both possible auth-mode vars are reserved so a user who switches
+  // modes doesn't end up with the dead one duplicated as a "preserved"
+  // line.
+  const ownedKeys = new Set([
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "GH_TOKEN",
+  ]);
   const preservedLines: string[] = [];
   for (const match of before.matchAll(userExecRe)) {
     const key = match[1];
