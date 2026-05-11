@@ -1,0 +1,20 @@
+# Git hooks for runway. Installed via `lefthook install`, which the
+# `prepare` script in package.json runs automatically on `pnpm install`.
+# Skip a single invocation with `LEFTHOOK=0 git ...` if you need to.
+
+pre-commit:
+  parallel: true
+  commands:
+    typecheck:
+      run: pnpm typecheck
+
+commit-msg:
+  commands:
+    commitlint:
+      # {1} is the path to the commit-message file lefthook passes in.
+      run: pnpm exec commitlint --edit {1}
+
+pre-push:
+  commands:
+    test:
+      run: pnpm test

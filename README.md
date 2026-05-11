@@ -194,6 +194,21 @@ to it. The seed suite covers `parseRunArgs`, `detectBaseBranch`, the
 `parseOpRefs` regex extraction, and the `drainQueue` error-handler
 branches — copy any of those as a shape for new tests.
 
+#### Git hooks (lefthook + commitlint)
+
+Hooks install automatically on `pnpm install` via the `prepare`
+script. What runs and when:
+
+| Hook | Runs | Why |
+|---|---|---|
+| `pre-commit` | `pnpm typecheck` | Catch TS errors before they land on a branch. |
+| `commit-msg` | `pnpm exec commitlint --edit` | Reject non-conventional commit messages (CLAUDE.md convention). |
+| `pre-push` | `pnpm test` | Block pushing red. |
+
+Skip a single hook invocation with `LEFTHOOK=0 git commit …` (or
+`… git push …`). To re-install after editing `lefthook.yml`, run
+`pnpm exec lefthook install -f`.
+
 ## Usage
 
 ```bash
