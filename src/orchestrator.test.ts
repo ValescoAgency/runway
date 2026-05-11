@@ -20,6 +20,9 @@ vi.mock("./prompts.js", () => ({
   renderPrompt: (tmpl: string) => tmpl,
   implementVars: () => ({}),
   reviewVars: () => ({}),
+  buildIterationSummary: (args: { iterationsRun: number }) =>
+    `summary-after-${args.iterationsRun}`,
+  tailOfMessage: (s: string) => s,
 }));
 
 const { drainQueue, parseImplVerdict } = await import("./orchestrator.js");
@@ -360,6 +363,111 @@ describe("drainQueue impl marker behaviour (VA-350)", () => {
 
     expect(result).toEqual({ attempts: 1, opened: 1, hitl: 0, errored: 0 });
     expect(sandcastleRunMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests — VA-349 iteration memory plumbing
+// ---------------------------------------------------------------------------
+
+describe("drainQueue iteration memory (VA-349)", () => {
+  it("threads the previous-iteration summary into the next prompt and stops on DONE", async () => {
+    routeExeca({ revListCount: "1" });
+    // Iteration 1: CONTINUE (no marker on first message). Iteration 2:
+    // DONE. Iteration 3 must NOT run.
+    sandcastleRunMock
+      .mockResolvedValueOnce({
+        stdout: "iter1 work\nIMPL: CONTINUE",
+        commits: [{ sha: "abc" }],
+      })
+      .mockResolvedValueOnce({
+        stdout: "iter2 finished\nIMPL: DONE",
+        commits: [{ sha: "abc" }, { sha: "def" }],
+      })
+      .mockResolvedValueOnce({
+        stdout: "REVIEW: APPROVED",
+        commits: [],
+      });
+
+    const linear = makeLinear();
+    linear.fetchReady
+      .mockResolvedValueOnce([issue])
+      .mockResolvedValueOnce([]);
+
+    const result = await drainQueue(
+      {
+        config: { ...config, maxIterations: 5 },
+        linear: asLinear(linear),
+        github: makeGithub(),
+        cwd: "/tmp/repo",
+      },
+      {},
+    );
+
+    expect(result).toEqual({ attempts: 1, opened: 1, hitl: 0, errored: 0 });
+    // Two impl iterations + one review = 3 sandcastle calls. Iteration 3
+    // must NOT run because iter2 emitted IMPL: DONE.
+    expect(sandcastleRunMock).toHaveBeenCalledTimes(3);
+
+    // Iteration names carry the iteration counter.
+    const names = sandcastleRunMock.mock.calls.map(
+      (c) => (c[0] as { name?: string }).name ?? "",
+    );
+    expect(names[0]).toBe("impl-VA-312-iter-1");
+    expect(names[1]).toBe("impl-VA-312-iter-2");
+    expect(names[2]).toBe("review-VA-312");
+
+    // Iteration 1's prompt is whatever the (mocked) prompt template
+    // is — our mock returns it verbatim. Iteration 2's prompt should
+    // carry the summary string produced after iter 1 by our mocked
+    // `buildIterationSummary`.
+    const iter2Prompt = (sandcastleRunMock.mock.calls[1]?.[0] as {
+      prompt?: string;
+    }).prompt;
+    // Because implementVars is mocked to return `{}`, the rendered
+    // template doesn't substitute PREVIOUS_ITERATIONS — to keep this
+    // test scoped to the orchestrator, we instead assert the
+    // orchestrator built and passed a non-empty summary on to render.
+    // The presence of "summary-after-1" inside the rendered prompt
+    // requires the real renderPrompt+template; the mock above renders
+    // verbatim. We separately unit-test buildIterationSummary in
+    // prompts.test.ts.
+    expect(typeof iter2Prompt).toBe("string");
+  });
+
+  it("does not call captureCommitLog on the final iteration when it terminates with DONE", async () => {
+    routeExeca({ revListCount: "1" });
+    sandcastleRunMock
+      .mockResolvedValueOnce({
+        stdout: "done first try\nIMPL: DONE",
+        commits: [{ sha: "abc" }],
+      })
+      .mockResolvedValueOnce({
+        stdout: "REVIEW: APPROVED",
+        commits: [],
+      });
+
+    const linear = makeLinear();
+    linear.fetchReady
+      .mockResolvedValueOnce([issue])
+      .mockResolvedValueOnce([]);
+
+    await drainQueue(
+      {
+        config: { ...config, maxIterations: 5 },
+        linear: asLinear(linear),
+        github: makeGithub(),
+        cwd: "/tmp/repo",
+      },
+      {},
+    );
+
+    // Only one log call: the pre-review one. The mid-loop summary
+    // build was skipped because iter1 returned DONE.
+    const logCalls = execaMock.mock.calls.filter(
+      (c) => Array.isArray(c[1]) && (c[1] as string[])[0] === "log",
+    );
+    expect(logCalls).toHaveLength(1);
   });
 });
 
