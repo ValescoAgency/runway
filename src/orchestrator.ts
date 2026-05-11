@@ -16,6 +16,7 @@ import {
   tailOfMessage,
 } from "./prompts.js";
 import { detectBaseBranch } from "./git.js";
+import { loadPolicy, type Policy } from "./policy.js";
 
 export interface OrchestratorDeps {
   readonly config: Config;
@@ -77,7 +78,7 @@ export function assertSandcastleInitialised(cwd: string): void {
  */
 export async function drainQueue(
   deps: OrchestratorDeps,
-  opts: { max?: number } = {},
+  opts: { max?: number; allowPaths?: readonly string[] } = {},
 ): Promise<OrchestratorResult> {
   const { config, linear } = deps;
   const max = opts.max ?? Number.POSITIVE_INFINITY;
@@ -91,7 +92,9 @@ export async function drainQueue(
   // fast, before we touch any Linear state).
   const baseBranch = config.baseBranch ?? (await detectBaseBranch(deps.cwd));
   console.log(`[runway] base branch resolved to "${baseBranch}"`);
-  const runDeps = { ...deps, baseBranch };
+  const policy = loadPolicy(deps.cwd, { allowPathsOverride: opts.allowPaths });
+  console.log(`[runway] policy: ${policy.source}`);
+  const runDeps = { ...deps, baseBranch, policy };
 
   // VA-344: never re-pick an issue in the same invocation, even if
   // VA-342 reverted it to `Todo`. Without this, a deterministic
@@ -159,6 +162,8 @@ type Verdict = "opened" | "hitl";
 interface ResolvedDeps extends OrchestratorDeps {
   /** Default branch of the cwd repo. Resolved once in drainQueue. */
   readonly baseBranch: string;
+  /** Effective write-path policy (VA-352). Resolved once in drainQueue. */
+  readonly policy: Policy;
 }
 
 async function processIssue(
@@ -191,7 +196,10 @@ async function processIssue(
   for (let iter = 1; iter <= maxIters; iter += 1) {
     const implementPrompt = renderPrompt(
       implementTemplate,
-      implementVars(issue, { previousIterations: prevSummary }),
+      implementVars(issue, {
+        previousIterations: prevSummary,
+        policy: deps.policy,
+      }),
     );
     implementResult = await run({
       agent: claudeCode("claude-opus-4-6"),

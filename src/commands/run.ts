@@ -9,10 +9,25 @@ import {
 export interface RunOptions {
   readonly max?: number;
   readonly project?: string;
+  readonly allowPaths?: readonly string[];
 }
 
 export function parseRunArgs(argv: readonly string[]): RunOptions {
-  const opts: { max?: number; project?: string } = {};
+  const opts: {
+    max?: number;
+    project?: string;
+    allowPaths?: string[];
+  } = {};
+  const collectAllow = (raw: string): void => {
+    const paths = raw
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (paths.length === 0) {
+      throw new Error("--allow-paths requires at least one glob");
+    }
+    opts.allowPaths = [...(opts.allowPaths ?? []), ...paths];
+  };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === "--max" || a === "-n") {
@@ -31,6 +46,13 @@ export function parseRunArgs(argv: readonly string[]): RunOptions {
       i += 1;
     } else if (a?.startsWith("--project=")) {
       opts.project = a.slice("--project=".length);
+    } else if (a === "--allow-paths") {
+      const v = argv[i + 1];
+      if (!v) throw new Error("--allow-paths requires a value");
+      collectAllow(v);
+      i += 1;
+    } else if (a?.startsWith("--allow-paths=")) {
+      collectAllow(a.slice("--allow-paths=".length));
     } else if (a === "--help" || a === "-h") {
       printRunUsage();
       process.exit(0);
@@ -55,6 +77,12 @@ OPTIONS
   --project ID    Scope the queue to a single Linear project under the
                   team. Accepts project UUID, slug, or name. Overrides
                   RUNWAY_LINEAR_PROJECT. Default: team-wide.
+  --allow-paths GLOBS
+                  Comma-separated globs removed from the impl policy's
+                  forbidden-paths list for this invocation only.
+                  Example: --allow-paths='.github/workflows/**' lets
+                  the agent touch CI for issues whose AC require it.
+                  Repeatable; pairs with .runway/policy.yml.
   --help, -h      Show this help.
 
 ENVIRONMENT
@@ -93,7 +121,7 @@ export async function runCommand(argv: readonly string[]): Promise<void> {
   );
   const result = await drainQueue(
     { config, linear, github, cwd },
-    { max: opts.max },
+    { max: opts.max, allowPaths: opts.allowPaths },
   );
   console.log(
     `[runway] done — attempts=${result.attempts} opened=${result.opened} hitl=${result.hitl} errored=${result.errored}`,

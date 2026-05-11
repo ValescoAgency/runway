@@ -52,6 +52,7 @@
     "@ai-hero/sandcastle": "^0.5.10",
     "@linear/sdk": "^41.0.0",
     "execa": "^9.5.2",
+    "yaml": "^2.9.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
