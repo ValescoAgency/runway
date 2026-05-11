@@ -13,6 +13,7 @@ import {
   renderPrompt,
   reviewVars,
 } from "./prompts.js";
+import { detectBaseBranch } from "./git.js";
 
 export interface OrchestratorDeps {
   readonly config: Config;
@@ -60,13 +61,20 @@ export async function drainQueue(
   let hitl = 0;
   let errored = 0;
 
+  // Resolve the base branch once at startup so every issue in the
+  // drain sees the same answer (and so a misconfigured repo fails
+  // fast, before we touch any Linear state).
+  const baseBranch = config.baseBranch ?? (await detectBaseBranch(deps.cwd));
+  console.log(`[runway] base branch resolved to "${baseBranch}"`);
+  const runDeps = { ...deps, baseBranch };
+
   while (processed < max) {
     const queue = await linear.fetchReady();
     if (queue.length === 0) break;
     const issue = queue[0]!;
 
     try {
-      const verdict = await processIssue(issue, deps);
+      const verdict = await processIssue(issue, runDeps);
       processed += 1;
       if (verdict === "opened") opened += 1;
       if (verdict === "hitl") hitl += 1;
@@ -81,7 +89,7 @@ export async function drainQueue(
       // can pick it up cleanly. `In Progress` is reserved for "agent
       // has committed to the branch".
       const branch = `agent/${issue.identifier.toLowerCase()}`;
-      const startedRealWork = await hasCommits(deps.cwd, branch);
+      const startedRealWork = await hasCommits(deps.cwd, baseBranch, branch);
 
       if (!startedRealWork) {
         await linear
@@ -116,11 +124,16 @@ export async function drainQueue(
 
 type Verdict = "opened" | "hitl";
 
+interface ResolvedDeps extends OrchestratorDeps {
+  /** Default branch of the cwd repo. Resolved once in drainQueue. */
+  readonly baseBranch: string;
+}
+
 async function processIssue(
   issue: RunwayIssue,
-  deps: OrchestratorDeps,
+  deps: ResolvedDeps,
 ): Promise<Verdict> {
-  const { config, linear, github, cwd } = deps;
+  const { config, linear, github, cwd, baseBranch } = deps;
   const branch = `agent/${issue.identifier.toLowerCase()}`;
 
   await linear.transition(issue.id, config.inProgressStatus);
@@ -156,8 +169,8 @@ async function processIssue(
   }
 
   // 2. Review pass — read-only-ish, just looking at the diff.
-  const diff = await captureDiff(cwd, branch);
-  const commitLog = await captureCommitLog(cwd, branch);
+  const diff = await captureDiff(cwd, baseBranch, branch);
+  const commitLog = await captureCommitLog(cwd, baseBranch, branch);
   const reviewPrompt = renderPrompt(
     await loadReviewPrompt(),
     reviewVars({ issue, diff, commits: commitLog }),
@@ -190,6 +203,7 @@ async function processIssue(
   const prUrl = await github.openPullRequest({
     repoPath: cwd,
     branch,
+    base: baseBranch,
     issue,
     body: prBody,
   });
@@ -203,7 +217,7 @@ async function processIssue(
 
 async function flagHitl(
   issue: RunwayIssue,
-  deps: OrchestratorDeps,
+  deps: ResolvedDeps,
   reason: string,
 ): Promise<void> {
   const { config, linear } = deps;
@@ -212,17 +226,21 @@ async function flagHitl(
 }
 
 /**
- * Whether the agent branch has any commits beyond `main`. Used by the
+ * Whether the agent branch has any commits beyond `base`. Used by the
  * drain loop to distinguish "agent crashed mid-run, after producing
  * real work" (→ HITL) from "agent crashed during startup, no work
  * done" (→ revert to Todo). If the branch doesn't exist or git fails,
  * treat as "no commits" so we revert rather than strand the issue.
  */
-async function hasCommits(repoPath: string, branch: string): Promise<boolean> {
+async function hasCommits(
+  repoPath: string,
+  base: string,
+  branch: string,
+): Promise<boolean> {
   try {
     const { stdout } = await execa(
       "git",
-      ["rev-list", "--count", `main..${branch}`],
+      ["rev-list", "--count", `${base}..${branch}`],
       { cwd: repoPath, reject: false },
     );
     return Number.parseInt(stdout.trim(), 10) > 0;
@@ -231,8 +249,12 @@ async function hasCommits(repoPath: string, branch: string): Promise<boolean> {
   }
 }
 
-async function captureDiff(repoPath: string, branch: string): Promise<string> {
-  const { stdout } = await execa("git", ["diff", `main...${branch}`], {
+async function captureDiff(
+  repoPath: string,
+  base: string,
+  branch: string,
+): Promise<string> {
+  const { stdout } = await execa("git", ["diff", `${base}...${branch}`], {
     cwd: repoPath,
   });
   // Truncate to keep the review prompt under the model's context budget.
@@ -241,11 +263,12 @@ async function captureDiff(repoPath: string, branch: string): Promise<string> {
 
 async function captureCommitLog(
   repoPath: string,
+  base: string,
   branch: string,
 ): Promise<string> {
   const { stdout } = await execa(
     "git",
-    ["log", "--oneline", `main..${branch}`],
+    ["log", "--oneline", `${base}..${branch}`],
     { cwd: repoPath },
   );
   return stdout;

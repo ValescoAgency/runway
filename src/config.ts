@@ -34,6 +34,16 @@ const ConfigSchema = z.object({
    * `--project` CLI flag on `runway run`.
    */
   linearProject: z.string().optional(),
+  /**
+   * Optional. Override the auto-detected base branch — the branch
+   * runway diffs against, opens PRs against, and uses to count
+   * agent-branch commits. Source: `RUNWAY_BASE_BRANCH` env var. When
+   * unset, runway resolves the default branch from `origin/HEAD` at
+   * orchestrator startup. Set this when the repo's default branch is
+   * not on the origin (rare) or when you want to target a release
+   * branch instead.
+   */
+  baseBranch: z.string().optional(),
   readyStatus: z.string().default("Todo"),
   inProgressStatus: z.string().default("In Progress"),
   inReviewStatus: z.string().default("In Review"),
@@ -49,6 +59,7 @@ export function loadConfig(): Config {
     opServiceAccountToken: process.env.OP_SERVICE_ACCOUNT_TOKEN,
     linearTeam: process.env.RUNWAY_LINEAR_TEAM,
     linearProject: process.env.RUNWAY_LINEAR_PROJECT,
+    baseBranch: process.env.RUNWAY_BASE_BRANCH,
     readyStatus: process.env.RUNWAY_READY_STATUS,
     inProgressStatus: process.env.RUNWAY_IN_PROGRESS_STATUS,
     inReviewStatus: process.env.RUNWAY_IN_REVIEW_STATUS,

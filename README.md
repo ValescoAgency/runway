@@ -121,6 +121,7 @@ export LINEAR_API_KEY=lin_api_...
 # Optional overrides:
 # export RUNWAY_LINEAR_TEAM=VA
 # export RUNWAY_LINEAR_PROJECT=<project-id-or-slug>   # optional, scopes queue to one project
+# export RUNWAY_BASE_BRANCH=master                    # optional, overrides auto-detected default branch
 # export RUNWAY_READY_STATUS="Todo"
 # export RUNWAY_IN_PROGRESS_STATUS="In Progress"
 # export RUNWAY_IN_REVIEW_STATUS="In Review"
@@ -176,6 +177,21 @@ It transitions them through:
 These names are configurable per env var; the queries match by name so
 your Linear workspace's actual state names need to line up with what
 you set.
+
+## Base branch
+
+Runway auto-detects the repo's default branch at the start of every
+`runway run` by reading `origin/HEAD` (with `git remote show origin`
+as a fallback for fresh clones). That branch is used for diffing the
+agent's work, counting commits when deciding whether a startup
+failure should revert to `Todo`, and as the `--base` for the PR.
+
+Set `RUNWAY_BASE_BRANCH=<name>` to override detection — useful when
+you want runway to target a release branch instead of the default, or
+when `origin/HEAD` isn't set and you don't want to run
+`git remote set-head origin --auto`. `runway doctor` surfaces the
+resolved base branch (detected or overridden) in its Environment
+section.
 
 ## Sub-agent review
 

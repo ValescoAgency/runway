@@ -59,6 +59,10 @@ ENVIRONMENT
   LINEAR_API_KEY              required
   RUNWAY_LINEAR_TEAM          default "VA"
   RUNWAY_LINEAR_PROJECT       optional — scope to one project
+  RUNWAY_BASE_BRANCH          optional — override the auto-detected base
+                              branch (the branch runway diffs against
+                              and targets with PRs). Detected from
+                              origin/HEAD when unset.
   RUNWAY_READY_STATUS         default "Todo"
   RUNWAY_IN_PROGRESS_STATUS   default "In Progress"
   RUNWAY_IN_REVIEW_STATUS     default "In Review"
