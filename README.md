@@ -120,6 +120,7 @@ Export runway's own env (in your shell rc, or wherever you keep API keys):
 export LINEAR_API_KEY=lin_api_...
 # Optional overrides:
 # export RUNWAY_LINEAR_TEAM=VA
+# export RUNWAY_LINEAR_PROJECT=<project-id-or-slug>   # optional, scopes queue to one project
 # export RUNWAY_READY_STATUS="Todo"
 # export RUNWAY_IN_PROGRESS_STATUS="In Progress"
 # export RUNWAY_IN_REVIEW_STATUS="In Review"
@@ -159,6 +160,8 @@ per-issue comments for what happened.
 Runway picks up issues that are:
 
 - in team `RUNWAY_LINEAR_TEAM` (default `VA`)
+- (optionally) in project `RUNWAY_LINEAR_PROJECT` (override per-run
+  with `runway run --project=<id-or-slug-or-name>`; unset = team-wide)
 - in workflow state `RUNWAY_READY_STATUS` (default `Todo`)
 
 It transitions them through:

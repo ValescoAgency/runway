@@ -8,10 +8,11 @@ import {
 
 interface RunOptions {
   readonly max?: number;
+  readonly project?: string;
 }
 
 function parseRunArgs(argv: readonly string[]): RunOptions {
-  const opts: { max?: number } = {};
+  const opts: { max?: number; project?: string } = {};
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === "--max" || a === "-n") {
@@ -23,6 +24,13 @@ function parseRunArgs(argv: readonly string[]): RunOptions {
       }
       opts.max = n;
       i += 1;
+    } else if (a === "--project") {
+      const v = argv[i + 1];
+      if (!v) throw new Error("--project requires a value");
+      opts.project = v;
+      i += 1;
+    } else if (a?.startsWith("--project=")) {
+      opts.project = a.slice("--project=".length);
     } else if (a === "--help" || a === "-h") {
       printRunUsage();
       process.exit(0);
@@ -42,11 +50,15 @@ USAGE
 
 OPTIONS
   --max, -n N     Process at most N issues then exit. Default: drain queue.
+  --project ID    Scope the queue to a single Linear project under the
+                  team. Accepts project UUID, slug, or name. Overrides
+                  RUNWAY_LINEAR_PROJECT. Default: team-wide.
   --help, -h      Show this help.
 
 ENVIRONMENT
   LINEAR_API_KEY              required
   RUNWAY_LINEAR_TEAM          default "VA"
+  RUNWAY_LINEAR_PROJECT       optional — scope to one project
   RUNWAY_READY_STATUS         default "Todo"
   RUNWAY_IN_PROGRESS_STATUS   default "In Progress"
   RUNWAY_IN_REVIEW_STATUS     default "In Review"
@@ -60,12 +72,18 @@ export async function runCommand(argv: readonly string[]): Promise<void> {
   const cwd = process.cwd();
   assertSandcastleInitialised(cwd);
 
-  const config = loadConfig();
+  const baseConfig = loadConfig();
+  const config = opts.project
+    ? { ...baseConfig, linearProject: opts.project }
+    : baseConfig;
   const linear = createLinearGateway(config);
   const github = createGithubGateway();
 
+  const scope = config.linearProject
+    ? `team ${config.linearTeam} / project ${config.linearProject}`
+    : `team ${config.linearTeam}`;
   console.log(
-    `[runway] draining queue from team ${config.linearTeam} (status="${config.readyStatus}") against ${cwd}`,
+    `[runway] draining queue from ${scope} (status="${config.readyStatus}") against ${cwd}`,
   );
   const result = await drainQueue(
     { config, linear, github, cwd },

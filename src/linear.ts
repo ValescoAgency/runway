@@ -51,14 +51,40 @@ export function createLinearGateway(config: Config): LinearGateway {
     return team.id;
   }
 
+  /**
+   * Resolve a project identifier (UUID, slug, or name) to its Linear
+   * project ID. Tries each shape in order so user-facing flags like
+   * `--project=bedrock` work without forcing users to copy the UUID.
+   */
+  async function findProjectId(identifier: string): Promise<string> {
+    const projects = await client.projects({
+      filter: {
+        or: [
+          { id: { eq: identifier } },
+          { slugId: { eq: identifier } },
+          { name: { eq: identifier } },
+        ],
+      },
+    });
+    const project = projects.nodes[0];
+    if (!project) {
+      throw new Error(`Linear project "${identifier}" not found`);
+    }
+    return project.id;
+  }
+
   return {
     async fetchReady() {
       const teamId = await findTeamId();
       const readyStateId = await findStateId(teamId, config.readyStatus);
+      const projectId = config.linearProject
+        ? await findProjectId(config.linearProject)
+        : null;
       const issues = await client.issues({
         filter: {
           team: { id: { eq: teamId } },
           state: { id: { eq: readyStateId } },
+          ...(projectId ? { project: { id: { eq: projectId } } } : {}),
         },
         // Stable order: oldest first so the queue drains FIFO.
         orderBy: "createdAt" as never,

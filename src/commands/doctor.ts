@@ -292,6 +292,18 @@ function checkEnvironment(tier: Tier): SectionResult {
   const checks = new Map<string, CheckResult>();
 
   checks.set("LINEAR_API_KEY", envSet("LINEAR_API_KEY", "fail"));
+
+  // Informational: which Linear scope a `runway run` would use.
+  const team = process.env.RUNWAY_LINEAR_TEAM?.trim() || "VA";
+  const project = process.env.RUNWAY_LINEAR_PROJECT?.trim();
+  checks.set("linear_scope", {
+    status: "ok",
+    label: "linear scope",
+    detail: project
+      ? `team ${team} / project ${project}`
+      : `team ${team} (team-wide — RUNWAY_LINEAR_PROJECT unset)`,
+  });
+
   if (tier === 2) {
     // Tier 2: needed by varlock to resolve op:// refs in the container.
     checks.set(
