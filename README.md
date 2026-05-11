@@ -214,11 +214,18 @@ Skip a single hook invocation with `LEFTHOOK=0 git commit …` (or
 ```bash
 cd /path/to/the/repo/you/want/agents/working/on
 runway run             # drain the entire ready queue
-runway run --max 3     # process at most 3 issues then exit
+runway run --max 3     # attempt at most 3 issues then exit
 runway --help
 ```
 
 `runway` (no subcommand) is an alias for `runway run` for back-compat.
+
+`--max N` bounds **attempts**, not successes. Every issue picked up
+counts as one attempt, whether it ends in a PR, a `needs-human` label,
+or a revert-to-`Todo` after an infrastructure failure. An issue
+reverted in this invocation will not be re-picked in the same
+invocation — re-run runway after fixing the underlying config to retry
+it.
 
 The CLI exits with 0 even if some issues hit HITL or errored — those
 are normal outcomes. Check Linear for the `needs-human` label and the
