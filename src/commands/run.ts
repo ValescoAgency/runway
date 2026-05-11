@@ -6,12 +6,12 @@ import {
   drainQueue,
 } from "../orchestrator.js";
 
-interface RunOptions {
+export interface RunOptions {
   readonly max?: number;
   readonly project?: string;
 }
 
-function parseRunArgs(argv: readonly string[]): RunOptions {
+export function parseRunArgs(argv: readonly string[]): RunOptions {
   const opts: { max?: number; project?: string } = {};
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];

@@ -287,7 +287,19 @@ function resolveOpRefs(
 ): ResolvedOpRefs {
   const schemaPath = join(cwd, ".env.schema");
   const schema = readFileSync(schemaPath, "utf8");
+  return parseOpRefs(schema, opts);
+}
 
+/**
+ * Pure schema-string → ResolvedOpRefs parser. Split out from
+ * `resolveOpRefs` so it can be unit-tested without touching the
+ * filesystem. The regex captures + override / vault-mismatch logic
+ * live here; the disk read lives in `resolveOpRefs`.
+ */
+export function parseOpRefs(
+  schema: string,
+  opts: Pick<UpgradeRepoOptions, "opVault" | "anthropicItem" | "ghTokenItem">,
+): ResolvedOpRefs {
   const anthropicMatch = schema.match(ANTHROPIC_RE);
   const ghTokenMatch = schema.match(GH_TOKEN_RE);
 
