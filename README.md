@@ -14,7 +14,7 @@ zero-secrets-at-rest, and the `gh` CLI for PR creation.
 |---|---|
 | `runway doctor` | Read-only preflight diagnostic: host tooling, env vars, repo state, and the agent docker image. Use when something stopped working and you want a sanity report. `--json` for CI / scripted health checks. |
 | `runway init` | Scaffold the cwd repo for runway: write `.sandcastle/Dockerfile` + (tier 2) `.env.schema` with op:// references. Run **once per target repo**. |
-| `runway run` | Drain a Linear queue. For each `Todo` issue: branch, agent works, sub-agent reviews, PR opens (or `needs-human` label). Run **whenever you want a batch of work done**. |
+| `runway run` | Drain a Linear queue. For each `Todo` issue: branch, agent works, sub-agent reviews, PR opens (or `ready-for-human` label). Run **whenever you want a batch of work done**. |
 | `runway upgrade` | Update the runway CLI itself: `git pull` the local clone, `pnpm install`, typecheck. `--check` for a dry-run, `--force` to override dirty/branch refusals. |
 | `runway upgrade-repo` | Re-render the cwd repo's runway scaffold against the current vendored templates. Use after a runway version bump that changed the Dockerfile or template shape — `init` writes them, `upgrade-repo` keeps them current without re-prompting for op:// values. |
 
@@ -50,7 +50,7 @@ runway (this CLI, on your Mac, run from inside the target repo)
   │   → REVIEW: APPROVED  | REVIEW: REJECTED — <reason>
   │
   ├── approved  → git push → gh pr create → Linear "In Review"
-  └── rejected  → Linear label "needs-human", comment with reason
+  └── rejected  → Linear label "ready-for-human", comment with reason
   ↓ next issue
 ```
 
@@ -161,9 +161,18 @@ export LINEAR_API_KEY=lin_api_...
 # export RUNWAY_READY_STATUS="Todo"
 # export RUNWAY_IN_PROGRESS_STATUS="In Progress"
 # export RUNWAY_IN_REVIEW_STATUS="In Review"
-# export RUNWAY_HITL_LABEL="needs-human"
+# export RUNWAY_HITL_LABEL="ready-for-human"
 # export RUNWAY_MAX_ITERATIONS=5
 ```
+
+`RUNWAY_HITL_LABEL` defaults to `ready-for-human`, matching the
+[Flightplan](https://github.com/valescoagency/flightplan) canonical
+state-label vocabulary (`needs-triage`, `needs-info`,
+`ready-for-agent`, `ready-for-human`, `wontfix`) that Bedrock and
+other Valesco repos use. Override the env var if your workspace uses
+a different label. `runway doctor` validates that the configured
+team, workflow states, and HITL label all exist before any agent run
+— misconfiguration surfaces immediately instead of mid-drain.
 
 ### From source (development)
 
@@ -228,7 +237,7 @@ invocation — re-run runway after fixing the underlying config to retry
 it.
 
 The CLI exits with 0 even if some issues hit HITL or errored — those
-are normal outcomes. Check Linear for the `needs-human` label and the
+are normal outcomes. Check Linear for the `ready-for-human` label and the
 per-issue comments for what happened.
 
 ## Linear conventions
@@ -246,7 +255,7 @@ It transitions them through:
   agent has committed to its branch — startup failures before any
   commits revert the issue back to `Todo` rather than stranding it)
 - `In Review` when the PR opens
-- (label `needs-human`) if the agent or reviewer can't finish *after*
+- (label `ready-for-human`) if the agent or reviewer can't finish *after*
   the agent has committed real work
 
 These names are configurable per env var; the queries match by name so

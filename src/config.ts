@@ -47,7 +47,13 @@ const ConfigSchema = z.object({
   readyStatus: z.string().default("Todo"),
   inProgressStatus: z.string().default("In Progress"),
   inReviewStatus: z.string().default("In Review"),
-  hitlLabel: z.string().default("needs-human"),
+  // VA-354: default to the Flightplan canonical state label
+  // `ready-for-human`. The previous default (`needs-human`) doesn't
+  // exist on Flightplan-aligned Linear workspaces (the common case
+  // for Valesco repos), and `linear.applyLabel` failures cascaded
+  // into the substantive rejection reason being lost. Workspaces that
+  // use a different label override via `RUNWAY_HITL_LABEL`.
+  hitlLabel: z.string().default("ready-for-human"),
   maxIterations: z.coerce.number().int().positive().default(5),
 });
 
