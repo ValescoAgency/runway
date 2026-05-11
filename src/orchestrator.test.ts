@@ -22,7 +22,9 @@ vi.mock("./prompts.js", () => ({
   reviewVars: () => ({}),
 }));
 
-const { drainQueue, parseImplVerdict } = await import("./orchestrator.js");
+const { drainQueue, parseImplVerdict, parseReviewVerdict } = await import(
+  "./orchestrator.js"
+);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -360,6 +362,77 @@ describe("drainQueue impl marker behaviour (VA-350)", () => {
 
     expect(result).toEqual({ attempts: 1, opened: 1, hitl: 0, errored: 0 });
     expect(sandcastleRunMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests — VA-353 review marker parsing
+// ---------------------------------------------------------------------------
+
+describe("parseReviewVerdict (VA-353)", () => {
+  // Exact reproducer from .sandcastle/logs/master-review-va-312.log
+  // (truncated). Sandcastle's wrapper output ("Agent stopped",
+  // "Capturing session", "Run complete: …") trails the marker.
+  const va312Tail = [
+    "REVIEW: REJECTED — provisionHousehold has a TOCTOU race that creates duplicate households with no DB-level guard (missing unique index on owner role), and withAudit error path can swallow original errors",
+    "Agent stopped",
+    "Capturing session",
+    "Collecting commits",
+    "Collecting commits done (0.0s)",
+    "Reached max iterations (1).",
+    "Run complete: reached 1 iteration(s) without completion signal.",
+    "Context window: 58k",
+  ].join("\n");
+
+  it("recovers REVIEW: REJECTED with reason when sandcastle wrapper output trails the marker", () => {
+    expect(parseReviewVerdict({ stdout: va312Tail })).toEqual({
+      kind: "rejected",
+      reason:
+        "provisionHousehold has a TOCTOU race that creates duplicate households with no DB-level guard (missing unique index on owner role), and withAudit error path can swallow original errors",
+    });
+  });
+
+  it("recovers REVIEW: APPROVED when sandcastle wrapper output trails the marker", () => {
+    const stdout = [
+      "Looks good, all tests pass.",
+      "REVIEW: APPROVED",
+      "Agent stopped",
+      "Run complete: reached 1 iteration(s) without completion signal.",
+    ].join("\n");
+    expect(parseReviewVerdict({ stdout })).toEqual({
+      kind: "approved",
+      reason: "",
+    });
+  });
+
+  it("rejects (with a 'no marker' reason) when the agent never emitted a verdict", () => {
+    expect(parseReviewVerdict({ stdout: "i forgot to emit anything useful" }))
+      .toEqual({
+        kind: "rejected",
+        reason: "review output did not contain a REVIEW: verdict line",
+      });
+  });
+
+  it("does not match a marker in mid-prose (not at line start)", () => {
+    // The reviewer is discussing the contract, not emitting it.
+    const stdout =
+      "I should remind the agent: the reviewer should output REVIEW: APPROVED when…";
+    expect(parseReviewVerdict({ stdout })).toMatchObject({
+      kind: "rejected",
+      reason: "review output did not contain a REVIEW: verdict line",
+    });
+  });
+
+  it("when multiple markers appear, the LAST one wins", () => {
+    const stdout = [
+      "Initial pass: REVIEW: APPROVED",
+      "On second look I see a bug.",
+      "REVIEW: REJECTED — withAudit swallows errors",
+    ].join("\n");
+    expect(parseReviewVerdict({ stdout })).toEqual({
+      kind: "rejected",
+      reason: "withAudit swallows errors",
+    });
   });
 });
 
