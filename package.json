@@ -51,6 +51,7 @@
   "dependencies": {
     "@ai-hero/sandcastle": "^0.5.10",
     "@linear/sdk": "^41.0.0",
+    "effect": "^3.21.2",
     "execa": "^9.5.2",
     "yaml": "^2.9.0",
     "zod": "^3.23.8"
