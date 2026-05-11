@@ -2,6 +2,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { execa } from "execa";
 import { detectBaseBranch } from "../git.js";
+import { loadConfig } from "../config.js";
+import { validateLinearConfig } from "../linear.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -140,11 +142,13 @@ export async function doctorCommand(argv: readonly string[]): Promise<void> {
     sections.push(await checkEnvironment(tierForToolingChecks, cwd, repo));
     sections.push(await checkRepoState(cwd, repo));
     sections.push(await checkDockerImage(cwd));
+    sections.push(await checkLinearConfig());
   } else {
     // Push placeholder skipped sections so JSON output stays well-shaped.
     sections.push(skippedSection("Environment"));
     sections.push(skippedSection("Repo state"));
     sections.push(skippedSection("Docker image"));
+    sections.push(skippedSection("Linear configuration"));
   }
 
   // Render
@@ -155,8 +159,14 @@ export async function doctorCommand(argv: readonly string[]): Promise<void> {
   }
 
   // Exit code: required-check failures = 1.
-  // Sections 1, 2, 4 are "required"; section 3 (repo state) is informational.
-  const requiredSections = [sections[0], sections[1], sections[3]] as const;
+  // Required: 0 host tooling, 1 environment, 3 docker image, 4 Linear
+  // config. Section 2 (repo state) is informational.
+  const requiredSections = [
+    sections[0],
+    sections[1],
+    sections[3],
+    sections[4],
+  ] as const;
   const failed = requiredSections.some(
     (s) => s?.ran && [...s.checks.values()].some((c) => c.status === "fail"),
   );
@@ -595,6 +605,137 @@ async function checkDockerImage(cwd: string): Promise<SectionResult> {
   }
 
   return { title: "Docker image", checks, ran: true };
+}
+
+// ---------------------------------------------------------------------------
+// Section: Linear configuration (VA-354)
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate that the team, workflow states, and HITL label `runway run`
+ * would use actually exist on the Linear workspace. Without this,
+ * misconfiguration only surfaces deep inside a long agent run — too
+ * late to fix without losing the work.
+ */
+async function checkLinearConfig(): Promise<SectionResult> {
+  const checks = new Map<string, CheckResult>();
+
+  // The config loader's only hard requirement is LINEAR_API_KEY; the
+  // rest defaults. If the key is missing, the Environment section
+  // already fails — surface a skip here rather than re-failing.
+  if (!process.env.LINEAR_API_KEY) {
+    checks.set("linear_config", {
+      status: "skip",
+      label: "Linear config",
+      detail: "LINEAR_API_KEY unset — skipped",
+    });
+    return { title: "Linear configuration", checks, ran: true };
+  }
+
+  let config;
+  try {
+    config = loadConfig();
+  } catch (err) {
+    checks.set("linear_config", {
+      status: "fail",
+      label: "Linear config",
+      detail: `failed to load runway config: ${errMsg(err)}`,
+    });
+    return { title: "Linear configuration", checks, ran: true };
+  }
+
+  let result;
+  try {
+    result = await validateLinearConfig(config);
+  } catch (err) {
+    checks.set("linear_api", {
+      status: "fail",
+      label: "Linear API",
+      detail: `validation request failed: ${errMsg(err)}`,
+    });
+    return { title: "Linear configuration", checks, ran: true };
+  }
+
+  if (result.team.kind === "missing") {
+    checks.set("team", {
+      status: "fail",
+      label: `team ${config.linearTeam}`,
+      detail: `Linear team key "${result.team.key}" not found — set RUNWAY_LINEAR_TEAM`,
+    });
+    // States/labels are skipped when the team missing; surface
+    // explicitly so the user knows they weren't checked.
+    checks.set("states", {
+      status: "skip",
+      label: "workflow states",
+      detail: "skipped (team missing)",
+    });
+    checks.set("hitl_label", {
+      status: "skip",
+      label: "HITL label",
+      detail: "skipped (team missing)",
+    });
+    return { title: "Linear configuration", checks, ran: true };
+  }
+
+  checks.set("team", {
+    status: "ok",
+    label: `team ${config.linearTeam}`,
+    detail: `id=${result.team.id}`,
+  });
+
+  for (const [key, configured, state] of [
+    ["ready_state", config.readyStatus, result.readyStatus],
+    ["in_progress_state", config.inProgressStatus, result.inProgressStatus],
+    ["in_review_state", config.inReviewStatus, result.inReviewStatus],
+  ] as const) {
+    if (state.kind === "ok") {
+      checks.set(key, {
+        status: "ok",
+        label: `workflow state "${configured}"`,
+        detail: "present",
+      });
+    } else if (state.kind === "skipped") {
+      checks.set(key, {
+        status: "skip",
+        label: `workflow state "${configured}"`,
+        detail: state.reason,
+      });
+    } else {
+      checks.set(key, {
+        status: "fail",
+        label: `workflow state "${configured}"`,
+        detail: `not found on team; available: ${formatList(state.available)}`,
+      });
+    }
+  }
+
+  if (result.hitlLabel.kind === "ok") {
+    checks.set("hitl_label", {
+      status: "ok",
+      label: `HITL label "${config.hitlLabel}"`,
+      detail: "present",
+    });
+  } else if (result.hitlLabel.kind === "skipped") {
+    checks.set("hitl_label", {
+      status: "skip",
+      label: `HITL label "${config.hitlLabel}"`,
+      detail: result.hitlLabel.reason,
+    });
+  } else {
+    checks.set("hitl_label", {
+      status: "fail",
+      label: `HITL label "${config.hitlLabel}"`,
+      detail: `not found on team — set RUNWAY_HITL_LABEL or create the label. Available: ${formatList(result.hitlLabel.available)}`,
+    });
+  }
+
+  return { title: "Linear configuration", checks, ran: true };
+}
+
+function formatList(items: readonly string[]): string {
+  if (items.length === 0) return "(none)";
+  if (items.length <= 8) return items.join(", ");
+  return `${items.slice(0, 8).join(", ")}, …(+${items.length - 8} more)`;
 }
 
 /**

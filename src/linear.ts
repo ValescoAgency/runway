@@ -134,3 +134,77 @@ export function createLinearGateway(config: Config): LinearGateway {
     },
   };
 }
+
+/**
+ * VA-354: read-only preflight that surfaces every Linear-side
+ * misconfiguration `runway run` would hit. Returns a structured
+ * result; the caller (currently `runway doctor`) decides how to
+ * render. The returned `availableLabels` are sampled (max 50) so a
+ * red ✗ on a missing label can show the operator what IS there.
+ */
+export interface LinearValidationResult {
+  readonly team:
+    | { kind: "ok"; id: string }
+    | { kind: "missing"; key: string };
+  readonly readyStatus: StateValidation;
+  readonly inProgressStatus: StateValidation;
+  readonly inReviewStatus: StateValidation;
+  readonly hitlLabel:
+    | { kind: "ok"; name: string }
+    | { kind: "missing"; name: string; available: readonly string[] }
+    | { kind: "skipped"; reason: string };
+}
+
+type StateValidation =
+  | { kind: "ok"; name: string }
+  | { kind: "missing"; name: string; available: readonly string[] }
+  | { kind: "skipped"; reason: string };
+
+export async function validateLinearConfig(
+  config: Config,
+): Promise<LinearValidationResult> {
+  const client = new LinearClient({ apiKey: config.linearApiKey });
+
+  const teams = await client.teams({
+    filter: { key: { eq: config.linearTeam } },
+  });
+  const team = teams.nodes[0];
+  if (!team) {
+    return {
+      team: { kind: "missing", key: config.linearTeam },
+      readyStatus: { kind: "skipped", reason: "team missing" },
+      inProgressStatus: { kind: "skipped", reason: "team missing" },
+      inReviewStatus: { kind: "skipped", reason: "team missing" },
+      hitlLabel: { kind: "skipped", reason: "team missing" },
+    };
+  }
+
+  const states = await client.workflowStates({
+    filter: { team: { id: { eq: team.id } } },
+  });
+  const stateNames = states.nodes.map((s) => s.name);
+  const checkState = (want: string): StateValidation =>
+    stateNames.includes(want)
+      ? { kind: "ok", name: want }
+      : { kind: "missing", name: want, available: stateNames };
+
+  const labels = await client.issueLabels({
+    filter: { team: { id: { eq: team.id } } },
+  });
+  const labelNames = labels.nodes.map((l) => l.name);
+  const hitlLabel = labelNames.includes(config.hitlLabel)
+    ? { kind: "ok" as const, name: config.hitlLabel }
+    : {
+        kind: "missing" as const,
+        name: config.hitlLabel,
+        available: labelNames.slice(0, 50),
+      };
+
+  return {
+    team: { kind: "ok", id: team.id },
+    readyStatus: checkState(config.readyStatus),
+    inProgressStatus: checkState(config.inProgressStatus),
+    inReviewStatus: checkState(config.inReviewStatus),
+    hitlLabel,
+  };
+}

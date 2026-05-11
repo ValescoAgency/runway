@@ -68,7 +68,7 @@ ENVIRONMENT
   RUNWAY_READY_STATUS         default "Todo"
   RUNWAY_IN_PROGRESS_STATUS   default "In Progress"
   RUNWAY_IN_REVIEW_STATUS     default "In Review"
-  RUNWAY_HITL_LABEL           default "needs-human"
+  RUNWAY_HITL_LABEL           default "ready-for-human"
   RUNWAY_MAX_ITERATIONS       default 5
 `);
 }
