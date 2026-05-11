@@ -62,10 +62,58 @@ jobs:
       # even with all claims matching the configured Trusted Publisher
       # entry. Revisit once npm support sorts it; once OIDC publishes
       # work, drop NODE_AUTH_TOKEN and delete the NPM_TOKEN secret.
+      #
+      # Retry wrapper: the npm CLI's --provenance flow has an
+      # intermittent bug where a transient network glitch causes it
+      # to re-submit an identical DSSE envelope to Sigstore's Rekor
+      # transparency log. The first submit actually succeeds; the
+      # retry hits a 409 ("equivalent entry already exists") which
+      # the CLI surfaces as TLOG_CREATE_ENTRY_ERROR and exits non-zero.
+      # A fresh attempt regenerates the envelope with a new timestamp
+      # → new Rekor hash → publish goes through. Seen on v0.2.0 (run
+      # 25648310858); a manual `gh run rerun --failed` recovered it.
+      # This wrapper does that automatically.
       - name: Publish to npm
-        run: pnpm publish --access public --no-git-checks --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -o pipefail
+          MAX_ATTEMPTS=3
+          PKG_NAME=$(jq -r .name package.json)
+          PKG_VERSION=$(jq -r .version package.json)
+          LOG=$(mktemp)
+
+          for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
+            echo "::group::Publish attempt $attempt of $MAX_ATTEMPTS"
+            if pnpm publish --access public --no-git-checks --provenance 2>&1 | tee "$LOG"; then
+              echo "::endgroup::"
+              echo "Publish succeeded on attempt $attempt."
+              exit 0
+            fi
+            echo "::endgroup::"
+
+            # CLI errored — but did the registry accept the PUT anyway?
+            # (Possible if a post-publish step fails after the upload
+            # succeeded.) If so, treat as success; a retry would E403.
+            if npm view "$PKG_NAME@$PKG_VERSION" version >/dev/null 2>&1; then
+              echo "Publish CLI errored but $PKG_NAME@$PKG_VERSION is on npm. Treating as success."
+              exit 0
+            fi
+
+            # Known retry-safe failure: Rekor 409 from a duplicate tlog write.
+            if grep -q "TLOG_CREATE_ENTRY_ERROR" "$LOG"; then
+              if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+                echo "Hit TLOG_CREATE_ENTRY_ERROR; sleeping 30s before retry."
+                sleep 30
+                continue
+              fi
+              echo "::error::TLOG_CREATE_ENTRY_ERROR persisted across $MAX_ATTEMPTS attempts."
+              exit 1
+            fi
+
+            echo "::error::Publish failed with a non-retryable error."
+            exit 1
+          done
 
       # Use the preinstalled `gh` CLI instead of softprops/action-gh-release —
       # avoids needing a third-party action in the repo's Actions allowlist
