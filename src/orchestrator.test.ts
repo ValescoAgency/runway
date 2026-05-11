@@ -22,7 +22,7 @@ vi.mock("./prompts.js", () => ({
   reviewVars: () => ({}),
 }));
 
-const { drainQueue } = await import("./orchestrator.js");
+const { drainQueue, parseImplVerdict } = await import("./orchestrator.js");
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -78,7 +78,9 @@ beforeEach(() => {
 });
 
 // Default `execa` mock router. detectBaseBranch's symbolic-ref call
-// returns `origin/main`; rev-list returns whatever the test sets.
+// returns `origin/main`; rev-list returns whatever the test sets;
+// diff/log return empty (review path doesn't inspect their contents
+// beyond rendering them into a prompt template).
 function routeExeca(opts: { revListCount: string }): void {
   execaMock.mockImplementation((bin: string, args: readonly string[]) => {
     if (bin !== "git") {
@@ -89,6 +91,9 @@ function routeExeca(opts: { revListCount: string }): void {
     }
     if (args[0] === "rev-list") {
       return Promise.resolve({ exitCode: 0, stdout: opts.revListCount });
+    }
+    if (args[0] === "diff" || args[0] === "log") {
+      return Promise.resolve({ exitCode: 0, stdout: "" });
     }
     return Promise.reject(new Error(`unexpected git args: ${args.join(" ")}`));
   });
@@ -214,6 +219,147 @@ describe("drainQueue --max semantics (VA-344)", () => {
       (c) => c[1] === "In Progress",
     );
     expect(inProgress).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests — VA-350 IMPL: marker contract
+// ---------------------------------------------------------------------------
+
+describe("parseImplVerdict (VA-350)", () => {
+  it("returns DONE on a trailing IMPL: DONE marker", () => {
+    expect(
+      parseImplVerdict({ stdout: "all green\n\nIMPL: DONE\n" }),
+    ).toEqual({ kind: "done" });
+  });
+
+  it("returns BLOCKED with the trailing reason after `—`", () => {
+    expect(
+      parseImplVerdict({
+        stdout:
+          "I can't modify .github/workflows under policy.\n\nIMPL: BLOCKED — issue requires CI workflow changes that policy forbids\n",
+      }),
+    ).toEqual({
+      kind: "blocked",
+      reason: "issue requires CI workflow changes that policy forbids",
+    });
+  });
+
+  it("returns BLOCKED with a fallback reason when none is given", () => {
+    expect(parseImplVerdict({ stdout: "IMPL: BLOCKED\n" })).toEqual({
+      kind: "blocked",
+      reason: "no reason given",
+    });
+  });
+
+  it("returns CONTINUE on a trailing CONTINUE marker", () => {
+    expect(parseImplVerdict({ stdout: "still working\nIMPL: CONTINUE\n" }))
+      .toEqual({ kind: "continue" });
+  });
+
+  it("treats output with no IMPL: marker as missing", () => {
+    expect(parseImplVerdict({ stdout: "no marker here" })).toEqual({
+      kind: "missing",
+    });
+  });
+
+  it("uses the LAST marker when several appear across iterations", () => {
+    expect(
+      parseImplVerdict({
+        stdout: "IMPL: CONTINUE\n...next iteration...\nIMPL: DONE\n",
+      }),
+    ).toEqual({ kind: "done" });
+  });
+});
+
+describe("drainQueue impl marker behaviour (VA-350)", () => {
+  it("BLOCKED short-circuits to HITL with the reason; reviewer pass does not run", async () => {
+    routeExeca({ revListCount: "1" });
+    sandcastleRunMock.mockResolvedValue({
+      stdout: "IMPL: BLOCKED — issue ambiguous, need product decision",
+      commits: [{ sha: "abc" }],
+    });
+
+    const linear = makeLinear();
+    linear.fetchReady
+      .mockResolvedValueOnce([issue])
+      .mockResolvedValueOnce([]);
+
+    const result = await drainQueue({
+      config,
+      linear: asLinear(linear),
+      github: makeGithub(),
+      cwd: "/tmp/repo",
+    });
+
+    expect(result).toEqual({ attempts: 1, opened: 0, hitl: 1, errored: 0 });
+    // sandcastle.run was called once (impl) — not twice (impl + review).
+    expect(sandcastleRunMock).toHaveBeenCalledTimes(1);
+    expect(linear.applyLabel).toHaveBeenCalledWith("issue-123", "needs-human");
+    const commentBodies = linear.comment.mock.calls.map((c) => String(c[1]));
+    expect(commentBodies.some((b) => /issue ambiguous/.test(b))).toBe(true);
+  });
+
+  it("DONE proceeds to the reviewer pass and passes completionSignal through", async () => {
+    routeExeca({ revListCount: "1" });
+    sandcastleRunMock
+      .mockResolvedValueOnce({
+        stdout: "all done\nIMPL: DONE",
+        commits: [{ sha: "abc" }],
+      })
+      .mockResolvedValueOnce({
+        stdout: "REVIEW: APPROVED",
+        commits: [],
+      });
+
+    const linear = makeLinear();
+    linear.fetchReady
+      .mockResolvedValueOnce([issue])
+      .mockResolvedValueOnce([]);
+
+    const github = makeGithub();
+    const result = await drainQueue({
+      config,
+      linear: asLinear(linear),
+      github,
+      cwd: "/tmp/repo",
+    });
+
+    expect(result).toEqual({ attempts: 1, opened: 1, hitl: 0, errored: 0 });
+    expect(sandcastleRunMock).toHaveBeenCalledTimes(2);
+    // First call (impl) wires IMPL: completion signals.
+    expect(sandcastleRunMock.mock.calls[0]?.[0]).toMatchObject({
+      completionSignal: ["IMPL: DONE", "IMPL: BLOCKED"],
+    });
+    expect(github.openPullRequest).toHaveBeenCalled();
+  });
+
+  it("missing marker with commits falls through to review (back-compat)", async () => {
+    routeExeca({ revListCount: "1" });
+    sandcastleRunMock
+      .mockResolvedValueOnce({
+        stdout: "did stuff, forgot the marker",
+        commits: [{ sha: "abc" }],
+      })
+      .mockResolvedValueOnce({
+        stdout: "REVIEW: APPROVED",
+        commits: [],
+      });
+
+    const linear = makeLinear();
+    linear.fetchReady
+      .mockResolvedValueOnce([issue])
+      .mockResolvedValueOnce([]);
+
+    const result = await drainQueue({
+      config,
+      linear: asLinear(linear),
+      github: makeGithub(),
+      cwd: "/tmp/repo",
+    });
+
+    expect(result).toEqual({ attempts: 1, opened: 1, hitl: 0, errored: 0 });
+    expect(sandcastleRunMock).toHaveBeenCalledTimes(2);
   });
 });
 
