@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { execa } from "execa";
 import { detectBaseBranch } from "../git.js";
+import { loadPolicy } from "../policy.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -396,6 +397,23 @@ async function checkEnvironment(
           ".env.schema declares neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN",
       });
     }
+  }
+
+  // VA-352: surface the active impl-pass write-path policy so the
+  // operator can see whether an agent run can touch CI workflows, etc.
+  try {
+    const policy = loadPolicy(cwd);
+    checks.set("policy", {
+      status: "ok",
+      label: "impl policy",
+      detail: `${policy.source} (${policy.forbiddenPaths.length} forbidden path${policy.forbiddenPaths.length === 1 ? "" : "s"})`,
+    });
+  } catch (err) {
+    checks.set("policy", {
+      status: "fail",
+      label: "impl policy",
+      detail: errMsg(err),
+    });
   }
 
   return { title: "Environment", checks, ran: true };
