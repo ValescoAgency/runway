@@ -24,7 +24,13 @@ export interface OrchestratorDeps {
 }
 
 export interface OrchestratorResult {
-  readonly processed: number;
+  /**
+   * Number of issues attempted in this invocation. VA-344: `--max`
+   * caps attempts, not successes — a deterministic startup failure
+   * still consumes one attempt so we don't loop on the same broken
+   * issue forever.
+   */
+  readonly attempts: number;
   readonly opened: number;
   readonly hitl: number;
   readonly errored: number;
@@ -56,7 +62,7 @@ export async function drainQueue(
 ): Promise<OrchestratorResult> {
   const { config, linear } = deps;
   const max = opts.max ?? Number.POSITIVE_INFINITY;
-  let processed = 0;
+  let attempts = 0;
   let opened = 0;
   let hitl = 0;
   let errored = 0;
@@ -68,14 +74,21 @@ export async function drainQueue(
   console.log(`[runway] base branch resolved to "${baseBranch}"`);
   const runDeps = { ...deps, baseBranch };
 
-  while (processed < max) {
+  // VA-344: never re-pick an issue in the same invocation, even if
+  // VA-342 reverted it to `Todo`. Without this, a deterministic
+  // startup failure (broken .env.schema, missing image, expired token)
+  // would loop on the same issue until --max was exhausted.
+  const seen = new Set<string>();
+
+  while (attempts < max) {
     const queue = await linear.fetchReady();
-    if (queue.length === 0) break;
-    const issue = queue[0]!;
+    const issue = queue.find((i) => !seen.has(i.id));
+    if (!issue) break;
+    seen.add(issue.id);
+    attempts += 1;
 
     try {
       const verdict = await processIssue(issue, runDeps);
-      processed += 1;
       if (verdict === "opened") opened += 1;
       if (verdict === "hitl") hitl += 1;
     } catch (err) {
@@ -119,7 +132,7 @@ export async function drainQueue(
     }
   }
 
-  return { processed, opened, hitl, errored };
+  return { attempts, opened, hitl, errored };
 }
 
 type Verdict = "opened" | "hitl";

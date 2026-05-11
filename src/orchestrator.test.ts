@@ -115,7 +115,7 @@ describe("drainQueue error handling (VA-342)", () => {
       cwd: "/tmp/repo",
     });
 
-    expect(result).toEqual({ processed: 0, opened: 0, hitl: 0, errored: 1 });
+    expect(result).toEqual({ attempts: 1, opened: 0, hitl: 0, errored: 1 });
 
     // First transition is to In Progress (processIssue's early call); the
     // recovery path adds a second transition back to Todo.
@@ -146,7 +146,7 @@ describe("drainQueue error handling (VA-342)", () => {
       cwd: "/tmp/repo",
     });
 
-    expect(result).toEqual({ processed: 0, opened: 0, hitl: 0, errored: 1 });
+    expect(result).toEqual({ attempts: 1, opened: 0, hitl: 0, errored: 1 });
 
     // Only the original In Progress transition — no revert.
     const transitions = linear.transition.mock.calls.map((c) => c[1]);
@@ -154,6 +154,66 @@ describe("drainQueue error handling (VA-342)", () => {
 
     // HITL label applied on a mid-run failure.
     expect(linear.applyLabel).toHaveBeenCalledWith("issue-123", "needs-human");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests — VA-344 attempt-count + seen-this-run loop guard
+// ---------------------------------------------------------------------------
+
+describe("drainQueue --max semantics (VA-344)", () => {
+  it("counts every attempt — including reverted ones — so --max bounds the loop", async () => {
+    // Three issues; the first deterministically fails on every attempt
+    // (sandcastle rejects) and produces zero commits, so VA-342 reverts
+    // it to Todo. Without VA-344 the loop would re-pick it forever.
+    routeExeca({ revListCount: "0" });
+
+    const a: RunwayIssue = { id: "a", identifier: "VA-1", title: "a", description: "" };
+    const b: RunwayIssue = { id: "b", identifier: "VA-2", title: "b", description: "" };
+    const c: RunwayIssue = { id: "c", identifier: "VA-3", title: "c", description: "" };
+
+    sandcastleRunMock.mockRejectedValue(new Error("kapow"));
+
+    const linear = makeLinear();
+    // Every fetchReady returns the full queue — `a` keeps coming back
+    // because VA-342 reverts it. The seen-set must filter it out.
+    linear.fetchReady.mockResolvedValue([a, b, c]);
+
+    const result = await drainQueue(
+      { config, linear: asLinear(linear), github: makeGithub(), cwd: "/tmp/repo" },
+      { max: 3 },
+    );
+
+    expect(result).toEqual({ attempts: 3, opened: 0, hitl: 0, errored: 3 });
+
+    // Each issue was attempted exactly once — confirmed by the
+    // distinct In-Progress transitions.
+    const inProgress = linear.transition.mock.calls
+      .filter((c) => c[1] === "In Progress")
+      .map((c) => c[0]);
+    expect(inProgress.sort()).toEqual(["a", "b", "c"]);
+  });
+
+  it("--max 1 against a single broken issue: one attempt then exit", async () => {
+    routeExeca({ revListCount: "0" });
+    sandcastleRunMock.mockRejectedValue(new Error("missing image"));
+
+    const linear = makeLinear();
+    linear.fetchReady.mockResolvedValue([issue]);
+
+    const result = await drainQueue(
+      { config, linear: asLinear(linear), github: makeGithub(), cwd: "/tmp/repo" },
+      { max: 1 },
+    );
+
+    expect(result).toEqual({ attempts: 1, opened: 0, hitl: 0, errored: 1 });
+
+    // One pickup, one revert. No second attempt despite `fetchReady`
+    // still surfacing the issue.
+    const inProgress = linear.transition.mock.calls.filter(
+      (c) => c[1] === "In Progress",
+    );
+    expect(inProgress).toHaveLength(1);
   });
 });
 

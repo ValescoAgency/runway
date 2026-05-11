@@ -49,7 +49,9 @@ USAGE
   runway run [--max N]
 
 OPTIONS
-  --max, -n N     Process at most N issues then exit. Default: drain queue.
+  --max, -n N     Attempt at most N issues then exit (counts every
+                  attempt — success, HITL, or revert-to-Todo).
+                  Default: drain queue.
   --project ID    Scope the queue to a single Linear project under the
                   team. Accepts project UUID, slug, or name. Overrides
                   RUNWAY_LINEAR_PROJECT. Default: team-wide.
@@ -94,6 +96,6 @@ export async function runCommand(argv: readonly string[]): Promise<void> {
     { max: opts.max },
   );
   console.log(
-    `[runway] done — processed=${result.processed} opened=${result.opened} hitl=${result.hitl} errored=${result.errored}`,
+    `[runway] done — attempts=${result.attempts} opened=${result.opened} hitl=${result.hitl} errored=${result.errored}`,
   );
 }
