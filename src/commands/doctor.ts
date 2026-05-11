@@ -540,6 +540,52 @@ async function checkDockerImage(cwd: string): Promise<SectionResult> {
         detail: imageUser ? `User=${imageUser}` : `User unset (root); host=${expected}`,
       });
     }
+
+    // VA-351: container readiness — pnpm on PATH + HOME/cache env
+    // baked in. Cheap one-shot run; fails fast if the image is stale.
+    try {
+      const probe = await execa(
+        "docker",
+        [
+          "run",
+          "--rm",
+          imageName,
+          "bash",
+          "-lc",
+          'set -e; which pnpm >/dev/null && printf "HOME=%s\\nXDG_CACHE_HOME=%s\\nTURBO_CACHE_DIR=%s\\n" "$HOME" "$XDG_CACHE_HOME" "$TURBO_CACHE_DIR"',
+        ],
+        { reject: false },
+      );
+      const out = probe.stdout ?? "";
+      const missing: string[] = [];
+      if (probe.exitCode !== 0) missing.push("pnpm");
+      if (!/^HOME=\/home\/agent\s*$/m.test(out)) missing.push("HOME");
+      if (!/^XDG_CACHE_HOME=\/home\/agent\/.cache\s*$/m.test(out)) {
+        missing.push("XDG_CACHE_HOME");
+      }
+      if (!/^TURBO_CACHE_DIR=\/tmp\/turbo-cache\s*$/m.test(out)) {
+        missing.push("TURBO_CACHE_DIR");
+      }
+      if (missing.length === 0) {
+        checks.set("container_ready", {
+          status: "ok",
+          label: "container readiness",
+          detail: "pnpm on PATH; HOME, XDG_CACHE_HOME, TURBO_CACHE_DIR set",
+        });
+      } else {
+        checks.set("container_ready", {
+          status: "warn",
+          label: "container readiness",
+          detail: `missing or wrong inside container: ${missing.join(", ")} — rebuild via \`runway upgrade-repo && docker build .sandcastle -t ${imageName}\``,
+        });
+      }
+    } catch (err) {
+      checks.set("container_ready", {
+        status: "warn",
+        label: "container readiness",
+        detail: `probe failed: ${errMsg(err)}`,
+      });
+    }
   } catch (err) {
     checks.set("image_present", {
       status: "fail",
