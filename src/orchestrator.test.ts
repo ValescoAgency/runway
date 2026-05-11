@@ -1,5 +1,11 @@
+import { Effect } from "effect";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { LinearGateway, RunwayIssue } from "./linear.js";
+import {
+  LinearNetworkError,
+  LinearNotFound,
+  type LinearGateway,
+  type RunwayIssue,
+} from "./linear.js";
 import type { GithubGateway } from "./github.js";
 import type { Config } from "./config.js";
 
@@ -41,11 +47,15 @@ type MockedLinear = {
 };
 
 function makeLinear(): MockedLinear {
+  // VA-356: mocks now return Effects (not Promises). Tests that set up
+  // their own behavior with `.mockReturnValueOnce(Effect.succeed(...))`
+  // / `.mockReturnValueOnce(Effect.fail(...))` follow the same pattern;
+  // tests with no explicit setup get a successful default.
   return {
     fetchReady: vi.fn(),
-    transition: vi.fn().mockResolvedValue(undefined),
-    applyLabel: vi.fn().mockResolvedValue(undefined),
-    comment: vi.fn().mockResolvedValue(undefined),
+    transition: vi.fn().mockReturnValue(Effect.succeed(undefined)),
+    applyLabel: vi.fn().mockReturnValue(Effect.succeed(undefined)),
+    comment: vi.fn().mockReturnValue(Effect.succeed(undefined)),
   };
 }
 
@@ -55,8 +65,10 @@ function asLinear(m: MockedLinear): LinearGateway {
 
 function makeGithub(): GithubGateway {
   return {
-    pushBranch: vi.fn().mockResolvedValue(undefined),
-    openPullRequest: vi.fn().mockResolvedValue("https://example/pr/1"),
+    pushBranch: vi.fn().mockReturnValue(Effect.succeed(undefined)),
+    openPullRequest: vi
+      .fn()
+      .mockReturnValue(Effect.succeed("https://example/pr/1")),
   };
 }
 
@@ -117,8 +129,8 @@ describe("drainQueue error handling (VA-342)", () => {
 
     const linear = makeLinear();
     linear.fetchReady
-      .mockResolvedValueOnce([issue])
-      .mockResolvedValueOnce([]); // queue drains after the failed attempt
+      .mockReturnValueOnce(Effect.succeed([issue]))
+      .mockReturnValueOnce(Effect.succeed([])); // queue drains after the failed attempt
 
     const result = await drainQueue({
       config,
@@ -156,8 +168,8 @@ describe("drainQueue error handling (VA-342)", () => {
 
     const linear = makeLinear();
     linear.fetchReady
-      .mockResolvedValueOnce([issue])
-      .mockResolvedValueOnce([]);
+      .mockReturnValueOnce(Effect.succeed([issue]))
+      .mockReturnValueOnce(Effect.succeed([]));
 
     const result = await drainQueue({
       config,
@@ -205,7 +217,7 @@ describe("drainQueue --max semantics (VA-344)", () => {
     const linear = makeLinear();
     // Every fetchReady returns the full queue — `a` keeps coming back
     // because VA-342 reverts it. The seen-set must filter it out.
-    linear.fetchReady.mockResolvedValue([a, b, c]);
+    linear.fetchReady.mockReturnValue(Effect.succeed([a, b, c]));
 
     const result = await drainQueue(
       { config, linear: asLinear(linear), github: makeGithub(), cwd: "/tmp/repo" },
@@ -232,7 +244,7 @@ describe("drainQueue --max semantics (VA-344)", () => {
     sandcastleRunMock.mockRejectedValue(new Error("missing image"));
 
     const linear = makeLinear();
-    linear.fetchReady.mockResolvedValue([issue]);
+    linear.fetchReady.mockReturnValue(Effect.succeed([issue]));
 
     const result = await drainQueue(
       { config, linear: asLinear(linear), github: makeGithub(), cwd: "/tmp/repo" },
@@ -315,8 +327,8 @@ describe("drainQueue impl marker behaviour (VA-350)", () => {
 
     const linear = makeLinear();
     linear.fetchReady
-      .mockResolvedValueOnce([issue])
-      .mockResolvedValueOnce([]);
+      .mockReturnValueOnce(Effect.succeed([issue]))
+      .mockReturnValueOnce(Effect.succeed([]));
 
     const result = await drainQueue({
       config,
@@ -352,8 +364,8 @@ describe("drainQueue impl marker behaviour (VA-350)", () => {
 
     const linear = makeLinear();
     linear.fetchReady
-      .mockResolvedValueOnce([issue])
-      .mockResolvedValueOnce([]);
+      .mockReturnValueOnce(Effect.succeed([issue]))
+      .mockReturnValueOnce(Effect.succeed([]));
 
     const github = makeGithub();
     const result = await drainQueue({
@@ -391,8 +403,8 @@ describe("drainQueue impl marker behaviour (VA-350)", () => {
 
     const linear = makeLinear();
     linear.fetchReady
-      .mockResolvedValueOnce([issue])
-      .mockResolvedValueOnce([]);
+      .mockReturnValueOnce(Effect.succeed([issue]))
+      .mockReturnValueOnce(Effect.succeed([]));
 
     const result = await drainQueue({
       config,
@@ -430,12 +442,18 @@ describe("drainQueue HITL ordering (VA-355)", () => {
       });
 
     const linear = makeLinear();
-    linear.applyLabel.mockRejectedValueOnce(
-      new Error('Linear label "needs-human" not found on team xyz'),
+    linear.applyLabel.mockReturnValueOnce(
+      Effect.fail(
+        new LinearNotFound({
+          resource: "label",
+          identifier: "needs-human",
+          message: 'Linear label "needs-human" not found on team xyz',
+        }),
+      ),
     );
     linear.fetchReady
-      .mockResolvedValueOnce([issue])
-      .mockResolvedValueOnce([]);
+      .mockReturnValueOnce(Effect.succeed([issue]))
+      .mockReturnValueOnce(Effect.succeed([]));
 
     await drainQueue({
       config,
@@ -471,15 +489,27 @@ describe("drainQueue HITL ordering (VA-355)", () => {
       });
 
     const linear = makeLinear();
-    linear.comment.mockImplementation(async (_id: string, body: string) => {
-      if (/flagged for human review/.test(body)) {
-        throw new Error("Linear unreachable");
-      }
-    });
-    linear.applyLabel.mockRejectedValueOnce(new Error("also unreachable"));
+    linear.comment.mockImplementation((_id: string, body: string) =>
+      /flagged for human review/.test(body)
+        ? Effect.fail(
+            new LinearNetworkError({
+              cause: null,
+              message: "Linear unreachable",
+            }),
+          )
+        : Effect.succeed(undefined),
+    );
+    linear.applyLabel.mockReturnValueOnce(
+      Effect.fail(
+        new LinearNetworkError({
+          cause: null,
+          message: "also unreachable",
+        }),
+      ),
+    );
     linear.fetchReady
-      .mockResolvedValueOnce([issue])
-      .mockResolvedValueOnce([]);
+      .mockReturnValueOnce(Effect.succeed([issue]))
+      .mockReturnValueOnce(Effect.succeed([]));
 
     const writes: string[] = [];
     const origWrite = process.stderr.write.bind(process.stderr);
@@ -518,8 +548,8 @@ describe("drainQueue HITL ordering (VA-355)", () => {
 
     const linear = makeLinear();
     linear.fetchReady
-      .mockResolvedValueOnce([issue])
-      .mockResolvedValueOnce([]);
+      .mockReturnValueOnce(Effect.succeed([issue]))
+      .mockReturnValueOnce(Effect.succeed([]));
 
     const result = await drainQueue({
       config,
@@ -633,8 +663,8 @@ describe("drainQueue iteration memory (VA-349)", () => {
 
     const linear = makeLinear();
     linear.fetchReady
-      .mockResolvedValueOnce([issue])
-      .mockResolvedValueOnce([]);
+      .mockReturnValueOnce(Effect.succeed([issue]))
+      .mockReturnValueOnce(Effect.succeed([]));
 
     const result = await drainQueue(
       {
@@ -696,8 +726,8 @@ describe("drainQueue iteration memory (VA-349)", () => {
 
     const linear = makeLinear();
     linear.fetchReady
-      .mockResolvedValueOnce([issue])
-      .mockResolvedValueOnce([]);
+      .mockReturnValueOnce(Effect.succeed([issue]))
+      .mockReturnValueOnce(Effect.succeed([]));
 
     await drainQueue(
       {
@@ -735,8 +765,8 @@ describe("drainQueue base-branch resolution (VA-346)", () => {
 
     const linear = makeLinear();
     linear.fetchReady
-      .mockResolvedValueOnce([issue])
-      .mockResolvedValueOnce([]);
+      .mockReturnValueOnce(Effect.succeed([issue]))
+      .mockReturnValueOnce(Effect.succeed([]));
 
     await drainQueue({
       config: { ...config, baseBranch: "develop" },

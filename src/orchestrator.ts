@@ -2,9 +2,10 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { run, claudeCode } from "@ai-hero/sandcastle";
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
+import { Effect } from "effect";
 import { execa } from "execa";
 import type { Config } from "./config.js";
-import type { LinearGateway, RunwayIssue } from "./linear.js";
+import type { LinearError, LinearGateway, RunwayIssue } from "./linear.js";
 import type { GithubGateway } from "./github.js";
 import {
   buildIterationSummary,
@@ -85,6 +86,31 @@ export function assertSandcastleInitialised(cwd: string): void {
 }
 
 /**
+ * VA-356: explicit-by-intent "swallow this failure" runner for
+ * best-effort Linear calls (revert paths, HITL follow-up notes). The
+ * pre-Effect code used `.catch(() => undefined)`, which made the
+ * decision-to-ignore invisible. Here we log a one-liner so a failed
+ * label apply or transition leaves a trail without aborting the drain.
+ */
+function runSwallow(
+  effect: Effect.Effect<unknown, LinearError>,
+  label: string,
+): Promise<void> {
+  return Effect.runPromise(
+    effect.pipe(
+      Effect.catchAll((err) =>
+        Effect.sync(() => {
+          console.warn(
+            `[runway] ${label}: best-effort call failed (${err._tag}): ${err.message}`,
+          );
+        }),
+      ),
+      Effect.asVoid,
+    ),
+  );
+}
+
+/**
  * Drains the Linear queue until empty (or until --max is hit). One
  * issue at a time in v1; parallel runs are a follow-up.
  */
@@ -116,7 +142,7 @@ export async function drainQueue(
   const outcomes: IssueOutcome[] = [];
 
   while (attempts < max) {
-    const queue = await linear.fetchReady();
+    const queue = await Effect.runPromise(linear.fetchReady());
     const issue = queue.find((i) => !seen.has(i.id));
     if (!issue) break;
     seen.add(issue.id);
@@ -146,15 +172,17 @@ export async function drainQueue(
       const errDetail = err instanceof Error ? err.message : String(err);
 
       if (!startedRealWork) {
-        await linear
-          .transition(issue.id, config.readyStatus)
-          .catch(() => undefined);
-        await linear
-          .comment(
+        await runSwallow(
+          linear.transition(issue.id, config.readyStatus),
+          `${issue.identifier}: revert transition to ${config.readyStatus}`,
+        );
+        await runSwallow(
+          linear.comment(
             issue.id,
             `Runway hit a startup failure before the agent produced any commits — reverting to \`${config.readyStatus}\` for retry:\n\n\`\`\`\n${errDetail}\n\`\`\``,
-          )
-          .catch(() => undefined);
+          ),
+          `${issue.identifier}: revert-comment`,
+        );
         outcomes.push({
           identifier: issue.identifier,
           kind: "reverted",
@@ -207,10 +235,12 @@ async function processIssue(
   const { config, linear, github, cwd, baseBranch } = deps;
   const branch = `agent/${issue.identifier.toLowerCase()}`;
 
-  await linear.transition(issue.id, config.inProgressStatus);
-  await linear.comment(
-    issue.id,
-    `Runway picked up this issue. Branch: \`${branch}\`.`,
+  await Effect.runPromise(linear.transition(issue.id, config.inProgressStatus));
+  await Effect.runPromise(
+    linear.comment(
+      issue.id,
+      `Runway picked up this issue. Branch: \`${branch}\`.`,
+    ),
   );
 
   // 1. Implementation pass.
@@ -314,19 +344,20 @@ async function processIssue(
   }
 
   // 3. Push + PR.
-  await github.pushBranch(cwd, branch);
+  await Effect.runPromise(github.pushBranch(cwd, branch));
   const prBody = buildPrBody(issue);
-  const prUrl = await github.openPullRequest({
-    repoPath: cwd,
-    branch,
-    base: baseBranch,
-    issue,
-    body: prBody,
-  });
-  await linear.transition(issue.id, config.inReviewStatus);
-  await linear.comment(
-    issue.id,
-    `Runway opened a PR for review: ${prUrl}`,
+  const prUrl = await Effect.runPromise(
+    github.openPullRequest({
+      repoPath: cwd,
+      branch,
+      base: baseBranch,
+      issue,
+      body: prBody,
+    }),
+  );
+  await Effect.runPromise(linear.transition(issue.id, config.inReviewStatus));
+  await Effect.runPromise(
+    linear.comment(issue.id, `Runway opened a PR for review: ${prUrl}`),
   );
   return { kind: "opened", detail: prUrl };
 }
@@ -349,7 +380,7 @@ async function flagHitl(
 
   let commentPosted = false;
   try {
-    await linear.comment(issue.id, body);
+    await Effect.runPromise(linear.comment(issue.id, body));
     commentPosted = true;
   } catch (err) {
     console.error(
@@ -359,7 +390,7 @@ async function flagHitl(
   }
 
   try {
-    await linear.applyLabel(issue.id, config.hitlLabel);
+    await Effect.runPromise(linear.applyLabel(issue.id, config.hitlLabel));
   } catch (err) {
     const detail = errMsg(err);
     console.error(
@@ -369,12 +400,13 @@ async function flagHitl(
     if (commentPosted) {
       // Best-effort follow-up note; the real reason is already on the
       // issue from the first comment.
-      await linear
-        .comment(
+      await runSwallow(
+        linear.comment(
           issue.id,
           `Note: could not apply \`${config.hitlLabel}\` label — please apply it manually. (${detail})`,
-        )
-        .catch(() => undefined);
+        ),
+        `${issue.identifier}: HITL follow-up note`,
+      );
     }
   }
 
