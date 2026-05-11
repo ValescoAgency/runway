@@ -32,10 +32,20 @@ interface DoctorOptions {
   readonly json: boolean;
 }
 
+type AuthMode = "api-key" | "oauth";
+
 interface RepoState {
   readonly tier: Tier | null;
   readonly hasDockerfile: boolean;
   readonly hasSchema: boolean;
+  /**
+   * For tier-2 scaffolds, which Claude Code auth env var the
+   * `.env.schema` declares. `null` for tier 1 or when both/neither
+   * shapes are present (misconfiguration — surfaced as a fail).
+   */
+  readonly authMode: AuthMode | null;
+  /** True when the schema declares both auth env vars at once. */
+  readonly hasConflictingAuthVars: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -127,7 +137,7 @@ export async function doctorCommand(argv: readonly string[]): Promise<void> {
   sections.push(await checkHostTooling(tierForToolingChecks));
 
   if (initialised || opts.tierOverride !== undefined) {
-    sections.push(await checkEnvironment(tierForToolingChecks, cwd));
+    sections.push(await checkEnvironment(tierForToolingChecks, cwd, repo));
     sections.push(await checkRepoState(cwd, repo));
     sections.push(await checkDockerImage(cwd));
   } else {
@@ -162,11 +172,22 @@ function detectRepoState(cwd: string): RepoState {
   const hasSchema = existsSync(join(cwd, ".env.schema"));
 
   let tier: Tier | null = null;
+  let authMode: AuthMode | null = null;
+  let hasConflictingAuthVars = false;
   if (hasSchema) {
     try {
       const schema = readFileSync(join(cwd, ".env.schema"), "utf8");
-      if (/ANTHROPIC_API_KEY\s*=\s*exec\(/.test(schema)) {
+      const hasApiKey = /ANTHROPIC_API_KEY\s*=\s*exec\(/.test(schema);
+      const hasOauth = /CLAUDE_CODE_OAUTH_TOKEN\s*=\s*exec\(/.test(schema);
+      if (hasApiKey && hasOauth) {
         tier = 2;
+        hasConflictingAuthVars = true;
+      } else if (hasApiKey) {
+        tier = 2;
+        authMode = "api-key";
+      } else if (hasOauth) {
+        tier = 2;
+        authMode = "oauth";
       } else if (hasDockerfile) {
         tier = 1;
       }
@@ -177,7 +198,7 @@ function detectRepoState(cwd: string): RepoState {
     tier = 1;
   }
 
-  return { tier, hasDockerfile, hasSchema };
+  return { tier, hasDockerfile, hasSchema, authMode, hasConflictingAuthVars };
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +313,7 @@ async function checkGhAuth(): Promise<CheckResult> {
 async function checkEnvironment(
   tier: Tier,
   cwd: string,
+  repo: RepoState,
 ): Promise<SectionResult> {
   const checks = new Map<string, CheckResult>();
 
@@ -341,6 +363,39 @@ async function checkEnvironment(
       "OP_SERVICE_ACCOUNT_TOKEN",
       envSet("OP_SERVICE_ACCOUNT_TOKEN", "fail"),
     );
+
+    // Surface which Claude Code auth env var the .env.schema declares.
+    // ANTHROPIC_API_KEY and CLAUDE_CODE_OAUTH_TOKEN aren't
+    // interchangeable; a mismatch between this and what's stored in
+    // 1Password yields a generic "Invalid API key" inside the
+    // container with no useful diagnostic.
+    if (repo.hasConflictingAuthVars) {
+      checks.set("auth_mode", {
+        status: "fail",
+        label: "claude auth mode",
+        detail:
+          ".env.schema declares both ANTHROPIC_API_KEY and CLAUDE_CODE_OAUTH_TOKEN — pick one (they are not interchangeable)",
+      });
+    } else if (repo.authMode === "oauth") {
+      checks.set("auth_mode", {
+        status: "ok",
+        label: "claude auth mode",
+        detail: "oauth (CLAUDE_CODE_OAUTH_TOKEN — Pro/Max subscription)",
+      });
+    } else if (repo.authMode === "api-key") {
+      checks.set("auth_mode", {
+        status: "ok",
+        label: "claude auth mode",
+        detail: "api-key (ANTHROPIC_API_KEY — pay-per-token)",
+      });
+    } else {
+      checks.set("auth_mode", {
+        status: "fail",
+        label: "claude auth mode",
+        detail:
+          ".env.schema declares neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN",
+      });
+    }
   }
 
   return { title: "Environment", checks, ran: true };

@@ -61,8 +61,12 @@ runway (this CLI, on your Mac, run from inside the target repo)
 - Node 22+
 - `gh` CLI authenticated against the org that hosts your target repo
 - Linear API key with read+write on the team you're targeting
-- Anthropic API key (set in the **target repo's** `.sandcastle/.env`,
-  not in runway's env — Sandcastle reads it)
+- A Claude Code credential — **either** an Anthropic API key
+  (`sk-ant-api03-…`, pay-per-token) **or** a Pro/Max OAuth token
+  (`sk-ant-oat01-…`, generated via `claude setup-token`). The two are
+  not interchangeable — see "Claude Code auth modes" below. Stored in
+  the **target repo's** `.sandcastle/.env` (tier 1) or 1Password
+  (tier 2); never in runway's own env.
 
 ## One-time setup per target repo
 
@@ -71,7 +75,8 @@ cd /path/to/your/repo
 runway init \
   --op-vault=runway \
   --anthropic-item=anthropic-api-key \
-  --gh-token-item=gh-token
+  --gh-token-item=gh-token \
+  --auth-mode=api-key   # or --auth-mode=oauth for Pro/Max tokens
 ```
 
 (No `--op-account` — runway uses 1Password service-account auth
@@ -91,6 +96,37 @@ Pass `--tier=1` if you want the plain Sandcastle setup with `.sandcastle/.env`
 and no varlock (faster but secrets land on disk).
 
 Architecture walkthrough: [`docs/secrets-with-varlock.md`](docs/secrets-with-varlock.md).
+
+## Claude Code auth modes
+
+Claude Code accepts two distinct credentials, and they are **not
+interchangeable** — passing one as the other yields a generic
+`Invalid API key` inside the container with no useful diagnostic.
+
+| Mode | Env var | Token shape | Source |
+|---|---|---|---|
+| `api-key` (default) | `ANTHROPIC_API_KEY` | `sk-ant-api03-…` | [Anthropic console](https://console.anthropic.com), pay-per-token |
+| `oauth` | `CLAUDE_CODE_OAUTH_TOKEN` | `sk-ant-oat01-…` | `claude setup-token` on your Pro/Max account |
+
+Pick whichever matches what's stored in your 1Password item:
+
+```bash
+runway init --tier=2 --op-vault=runway \
+  --anthropic-item=claude-pro-oauth-token \
+  --gh-token-item=gh-token \
+  --auth-mode=oauth
+```
+
+The `--anthropic-item` flag is the 1Password item name regardless of
+mode; only the env var written into `.env.schema` changes. `runway
+doctor` surfaces the resolved mode under Environment (`claude auth
+mode: oauth (…)`), and fails fast if `.env.schema` ends up with both
+env vars at once.
+
+If you switch modes later, run `runway upgrade-repo` — it extracts
+the existing op:// references, re-renders the template with the new
+mode (detected automatically from the schema), and writes back. You
+do not need to re-pass the op:// flags.
 
 ## Secrets — recommended: varlock + 1Password
 
