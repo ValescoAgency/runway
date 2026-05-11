@@ -161,9 +161,12 @@ Runway picks up issues that are:
 
 It transitions them through:
 
-- `In Progress` while the agent is running
+- `In Progress` while the agent is running (specifically: once the
+  agent has committed to its branch — startup failures before any
+  commits revert the issue back to `Todo` rather than stranding it)
 - `In Review` when the PR opens
-- (label `needs-human`) if the agent or reviewer can't finish
+- (label `needs-human`) if the agent or reviewer can't finish *after*
+  the agent has committed real work
 
 These names are configurable per env var; the queries match by name so
 your Linear workspace's actual state names need to line up with what

@@ -73,17 +73,41 @@ export async function drainQueue(
     } catch (err) {
       errored += 1;
       console.error(`[runway] error on ${issue.identifier}:`, err);
-      await linear
-        .applyLabel(issue.id, config.hitlLabel)
-        .catch(() => undefined);
-      await linear
-        .comment(
-          issue.id,
-          `Runway hit an unrecoverable error and flagged for human review:\n\n\`\`\`\n${
-            err instanceof Error ? err.message : String(err)
-          }\n\`\`\``,
-        )
-        .catch(() => undefined);
+
+      // If the agent crashed before producing any commits (missing
+      // image, varlock validation, container failed to boot, etc.),
+      // it's an infrastructure failure — not a HITL. Revert the issue
+      // to `Todo` and skip the `needs-human` label so the next run
+      // can pick it up cleanly. `In Progress` is reserved for "agent
+      // has committed to the branch".
+      const branch = `agent/${issue.identifier.toLowerCase()}`;
+      const startedRealWork = await hasCommits(deps.cwd, branch);
+
+      if (!startedRealWork) {
+        await linear
+          .transition(issue.id, config.readyStatus)
+          .catch(() => undefined);
+        await linear
+          .comment(
+            issue.id,
+            `Runway hit a startup failure before the agent produced any commits — reverting to \`${config.readyStatus}\` for retry:\n\n\`\`\`\n${
+              err instanceof Error ? err.message : String(err)
+            }\n\`\`\``,
+          )
+          .catch(() => undefined);
+      } else {
+        await linear
+          .applyLabel(issue.id, config.hitlLabel)
+          .catch(() => undefined);
+        await linear
+          .comment(
+            issue.id,
+            `Runway hit an unrecoverable error and flagged for human review:\n\n\`\`\`\n${
+              err instanceof Error ? err.message : String(err)
+            }\n\`\`\``,
+          )
+          .catch(() => undefined);
+      }
     }
   }
 
@@ -185,6 +209,26 @@ async function flagHitl(
   const { config, linear } = deps;
   await linear.applyLabel(issue.id, config.hitlLabel);
   await linear.comment(issue.id, `Runway flagged for human review: ${reason}`);
+}
+
+/**
+ * Whether the agent branch has any commits beyond `main`. Used by the
+ * drain loop to distinguish "agent crashed mid-run, after producing
+ * real work" (→ HITL) from "agent crashed during startup, no work
+ * done" (→ revert to Todo). If the branch doesn't exist or git fails,
+ * treat as "no commits" so we revert rather than strand the issue.
+ */
+async function hasCommits(repoPath: string, branch: string): Promise<boolean> {
+  try {
+    const { stdout } = await execa(
+      "git",
+      ["rev-list", "--count", `main..${branch}`],
+      { cwd: repoPath, reject: false },
+    );
+    return Number.parseInt(stdout.trim(), 10) > 0;
+  } catch {
+    return false;
+  }
 }
 
 async function captureDiff(repoPath: string, branch: string): Promise<string> {
