@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseOpRefs } from "./upgrade-repo.js";
+import { parseOpRefs } from "./repo-upgrade.js";
 
 // `varlock` invokes 1Password via a `<execName>("op read ...")` DSL.
 // Constructed at runtime so the literal substring doesn't trip
