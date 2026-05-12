@@ -34,8 +34,8 @@ describe("parseOpRefs", () => {
   it("extracts vault + item names from an api-key schema and reports authMode=api-key", () => {
     expect(parseOpRefs(apiKeySchema, {})).toEqual({
       opVault: "runway",
-      anthropicItem: "anthropic-api-key/credential",
-      ghTokenItem: "gh-token/credential",
+      anthropicItem: "anthropic-api-key",
+      ghTokenItem: "gh-token",
       authMode: "api-key",
     });
   });
@@ -52,7 +52,7 @@ describe("parseOpRefs", () => {
     expect(result.opVault).toBe("override-vault");
     expect(result.anthropicItem).toBe("override-item");
     // gh-token unaffected
-    expect(result.ghTokenItem).toBe("gh-token/credential");
+    expect(result.ghTokenItem).toBe("gh-token");
   });
 
   it("throws when the schema can't be parsed and no overrides are passed", () => {
