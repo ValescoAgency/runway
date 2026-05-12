@@ -1,4 +1,4 @@
-import { Effect } from "effect";
+import { Effect, Redacted } from "effect";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   LinearNetworkError,
@@ -83,7 +83,7 @@ function makeGithub(): GithubGateway {
 }
 
 const config: Config = {
-  linearApiKey: "test-key",
+  linearApiKey: Redacted.make("test-key"),
   linearTeam: "VA",
   readyStatus: "Todo",
   inProgressStatus: "In Progress",

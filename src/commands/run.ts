@@ -1,5 +1,5 @@
 import { Effect, Layer, Logger, RateLimiter } from "effect";
-import { loadConfig } from "../config.js";
+import { ConfigLive, ConfigTag } from "../config.js";
 import { createLinearGateway } from "../linear.js";
 import { createGithubGateway } from "../github.js";
 import {
@@ -108,43 +108,45 @@ export async function runCommand(argv: readonly string[]): Promise<void> {
   const cwd = process.cwd();
   assertSandcastleInitialised(cwd);
 
-  const baseConfig = loadConfig();
-  const config = opts.project
-    ? { ...baseConfig, linearProject: opts.project }
-    : baseConfig;
-  const github = createGithubGateway();
-
-  const scope = config.linearProject
-    ? `team ${config.linearTeam} / project ${config.linearProject}`
-    : `team ${config.linearTeam}`;
-  console.log(
-    `[runway] draining queue from ${scope} (status="${config.readyStatus}") against ${cwd}`,
-  );
-
-  // VA-358: a single `Effect.runPromise` at the CLI boundary.
+  // VA-358 / VA-359: a single `Effect.runPromise` at the CLI
+  // boundary. Composed layers:
   //
-  // - JSON logger is wired in when `RUNWAY_JSON_LOGS=1` so the
-  //   operator can pipe runway's output to a log aggregator;
-  //   otherwise the default pretty logger is preserved for terminal
-  //   use.
-  // - Tracing is env-conditional inside `TelemetryLive` (only wires
-  //   the OTLP exporter when `OTEL_EXPORTER_OTLP_ENDPOINT` is set).
+  // - `ConfigLive` (VA-359) resolves every env var via Effect's
+  //   `Config` module. Secrets (LINEAR_API_KEY,
+  //   OP_SERVICE_ACCOUNT_TOKEN) are `Redacted<string>` and won't
+  //   appear in `Effect.log` output or stringified errors.
+  // - `Logger.jsonLogger` is wired when `RUNWAY_JSON_LOGS=1` so the
+  //   operator can pipe runway's output to a log aggregator.
+  // - `TelemetryLive` (VA-358) is env-conditional — only wires the
+  //   OTLP exporter when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
   // - Linear `RateLimiter` (folded in from VA-357): conservative
-  //   30/minute, well under Linear's documented 1500/hr ceiling.
-  //   Built inside `Effect.scoped` so the limiter's internals are
+  //   30/minute, built inside `Effect.scoped` so its internals are
   //   torn down on program exit.
   const LoggerLive =
     process.env.RUNWAY_JSON_LOGS === "1"
       ? Logger.replace(Logger.defaultLogger, Logger.jsonLogger)
       : Layer.empty;
-  const MainLayer = Layer.mergeAll(TelemetryLive, LoggerLive);
+  const MainLayer = Layer.mergeAll(ConfigLive, TelemetryLive, LoggerLive);
 
   const program = Effect.gen(function* () {
+    const baseConfig = yield* ConfigTag;
+    const config = opts.project
+      ? { ...baseConfig, linearProject: opts.project }
+      : baseConfig;
+
+    const scope = config.linearProject
+      ? `team ${config.linearTeam} / project ${config.linearProject}`
+      : `team ${config.linearTeam}`;
+    yield* Effect.logInfo(
+      `draining queue from ${scope} (status="${config.readyStatus}") against ${cwd}`,
+    );
+
     const linearLimiter = yield* RateLimiter.make({
       limit: 30,
       interval: "1 minute",
     });
     const linear = createLinearGateway(config, linearLimiter);
+    const github = createGithubGateway();
     return yield* drainQueue(
       { config, linear, github, cwd },
       { max: opts.max, allowPaths: opts.allowPaths },
