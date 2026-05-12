@@ -1,12 +1,10 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-  buildAgentImage,
-  preflight,
-  verify,
-  type InitOptions,
-} from "./init.js";
+import { buildAgentImage } from "../scaffolder-image.js";
+import { preflight } from "../scaffolder-preflight.js";
+import { verify } from "../scaffolder-verify.js";
+import type { ScaffolderOptions } from "../scaffolder.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // runway/src/commands/upgrade-repo.ts → runway/templates/
@@ -33,7 +31,7 @@ interface ResolvedOpRefs {
    * --auth-mode=...`. Defaults to "api-key" for back-compat with
    * pre-VA-347 schemas that always wrote ANTHROPIC_API_KEY.
    */
-  readonly authMode: import("./init.js").AuthMode;
+  readonly authMode: import("../scaffolder.js").AuthMode;
 }
 
 interface FileChange {
@@ -152,8 +150,8 @@ export async function upgradeRepoCommand(
   // --check shouldn't refuse on a dirty tree — drift detection is read-only.
   const allowDirty = opts.check ? true : opts.allowDirty;
 
-  // Preflight uses init's helper; satisfy its InitOptions shape.
-  const preflightOpts: InitOptions = {
+  // Preflight uses init's helper; satisfy its ScaffolderOptions shape.
+  const preflightOpts: ScaffolderOptions = {
     tier,
     allowDirty,
     force: opts.force,
@@ -214,8 +212,8 @@ export async function upgradeRepoCommand(
     await buildAgentImage(cwd);
   }
 
-  // Verify uses init's helper; we need a complete InitOptions for tier 2.
-  const verifyOpts: InitOptions = {
+  // Verify uses init's helper; we need a complete ScaffolderOptions for tier 2.
+  const verifyOpts: ScaffolderOptions = {
     tier,
     allowDirty: true, // we already preflighted
     force: opts.force,
@@ -313,7 +311,7 @@ export function parseOpRefs(
     opts.opVault ?? anthropicMatch?.[2] ?? ghTokenMatch?.[1] ?? null;
   const anthropicItem = opts.anthropicItem ?? anthropicMatch?.[3] ?? null;
   const ghTokenItem = opts.ghTokenItem ?? ghTokenMatch?.[2] ?? null;
-  const authMode: import("./init.js").AuthMode =
+  const authMode: import("../scaffolder.js").AuthMode =
     anthropicMatch?.[1] === "CLAUDE_CODE_OAUTH_TOKEN" ? "oauth" : "api-key";
 
   if (!opVault || !anthropicItem || !ghTokenItem) {
