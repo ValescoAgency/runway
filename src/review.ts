@@ -102,7 +102,7 @@ export const runReviewPass = (
       renderReviewPrompt({ issue, diff, commits: commitLog }),
     );
     const reviewResult = yield* runSandcastle({
-      agent: claudeCode("claude-opus-4-6"),
+      agent: claudeCode("claude-opus-4-7"),
       sandbox: docker({ env: dockerEnv(config) }),
       cwd,
       prompt: reviewPrompt,
