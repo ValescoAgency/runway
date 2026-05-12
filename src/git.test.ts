@@ -1,3 +1,4 @@
+import { Effect } from "effect";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // Mock execa BEFORE importing the module under test, so `detectBaseBranch`
@@ -6,6 +7,12 @@ const execaMock = vi.fn();
 vi.mock("execa", () => ({ execa: execaMock }));
 
 const { detectBaseBranch } = await import("./git.js");
+
+// VA-358: detectBaseBranch is now an Effect. Tests run it via
+// `Effect.runPromise` so the assertion shape (resolves / rejects)
+// stays unchanged.
+const run = (path: string): Promise<string> =>
+  Effect.runPromise(detectBaseBranch(path));
 
 beforeEach(() => {
   execaMock.mockReset();
@@ -18,7 +25,7 @@ describe("detectBaseBranch", () => {
       stdout: "origin/main\n",
     });
 
-    await expect(detectBaseBranch("/tmp/repo")).resolves.toBe("main");
+    await expect(run("/tmp/repo")).resolves.toBe("main");
     expect(execaMock).toHaveBeenCalledTimes(1);
     expect(execaMock).toHaveBeenCalledWith(
       "git",
@@ -29,7 +36,7 @@ describe("detectBaseBranch", () => {
 
   it("strips the `origin/` prefix from a `master` default", async () => {
     execaMock.mockResolvedValueOnce({ exitCode: 0, stdout: "origin/master" });
-    await expect(detectBaseBranch("/tmp/repo")).resolves.toBe("master");
+    await expect(run("/tmp/repo")).resolves.toBe("master");
   });
 
   it("falls back to `git remote show origin` when symbolic-ref fails", async () => {
@@ -45,7 +52,7 @@ describe("detectBaseBranch", () => {
         ].join("\n"),
       });
 
-    await expect(detectBaseBranch("/tmp/repo")).resolves.toBe("develop");
+    await expect(run("/tmp/repo")).resolves.toBe("develop");
     expect(execaMock).toHaveBeenCalledTimes(2);
     expect(execaMock.mock.calls[1]?.[1]).toEqual(["remote", "show", "origin"]);
   });
@@ -55,7 +62,7 @@ describe("detectBaseBranch", () => {
       .mockResolvedValueOnce({ exitCode: 128, stdout: "" })
       .mockResolvedValueOnce({ exitCode: 0, stdout: "no head branch line" });
 
-    await expect(detectBaseBranch("/tmp/repo")).rejects.toThrow(
+    await expect(run("/tmp/repo")).rejects.toThrow(
       /Could not detect the default branch.*RUNWAY_BASE_BRANCH/s,
     );
   });
@@ -63,7 +70,7 @@ describe("detectBaseBranch", () => {
   it("propagates failure if both calls throw", async () => {
     execaMock.mockRejectedValue(new Error("git not installed"));
 
-    await expect(detectBaseBranch("/tmp/repo")).rejects.toThrow(
+    await expect(run("/tmp/repo")).rejects.toThrow(
       /Could not detect the default branch/,
     );
   });

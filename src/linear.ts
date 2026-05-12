@@ -1,5 +1,5 @@
 import { LinearClient } from "@linear/sdk";
-import { Data, Effect, Schedule } from "effect";
+import { Data, Effect, Schedule, type RateLimiter } from "effect";
 import type { Config } from "./config.js";
 
 /**
@@ -167,9 +167,21 @@ export interface LinearGateway {
  * `LinearNotFound` directly. Only the public `LinearGateway` methods
  * wrap into `Effect.tryPromise` — that's the boundary the orchestrator
  * sees.
+ *
+ * VA-358: optional `limiter` wraps every method's Effect so the queue
+ * drain respects Linear's API rate limit (~1500 req/hr). When `null`
+ * (the default — tests don't need it), calls go through unrestricted.
+ * Production: `commands/run.ts` builds a limiter inside `Effect.scoped`
+ * and passes it here.
  */
-export function createLinearGateway(config: Config): LinearGateway {
+export function createLinearGateway(
+  config: Config,
+  limiter: RateLimiter.RateLimiter | null = null,
+): LinearGateway {
   const client = new LinearClient({ apiKey: config.linearApiKey });
+  const gate = <A>(
+    eff: Effect.Effect<A, LinearError>,
+  ): Effect.Effect<A, LinearError> => (limiter ? limiter(eff) : eff);
 
   async function findStateId(teamId: string, name: string): Promise<string> {
     const states = await client.workflowStates({
@@ -229,7 +241,7 @@ export function createLinearGateway(config: Config): LinearGateway {
 
   return {
     fetchReady() {
-      return applyLinearPolicy(
+      return gate(applyLinearPolicy(
         Effect.tryPromise({
           try: async () => {
             const teamId = await findTeamId();
@@ -256,11 +268,11 @@ export function createLinearGateway(config: Config): LinearGateway {
           catch: (err) => classifyLinearError(err, "fetchReady"),
         }),
         { call: "fetchReady" },
-      );
+      ));
     },
 
     transition(issueId, statusName) {
-      return applyLinearPolicy(
+      return gate(applyLinearPolicy(
         Effect.tryPromise({
           try: async () => {
             const issue = await client.issue(issueId);
@@ -278,11 +290,11 @@ export function createLinearGateway(config: Config): LinearGateway {
           catch: (err) => classifyLinearError(err, `transition(${statusName})`),
         }),
         { call: `transition(${statusName})` },
-      );
+      ));
     },
 
     applyLabel(issueId, labelName) {
-      return applyLinearPolicy(
+      return gate(applyLinearPolicy(
         Effect.tryPromise({
           try: async () => {
             const issue = await client.issue(issueId);
@@ -318,11 +330,11 @@ export function createLinearGateway(config: Config): LinearGateway {
           catch: (err) => classifyLinearError(err, `applyLabel(${labelName})`),
         }),
         { call: `applyLabel(${labelName})` },
-      );
+      ));
     },
 
     comment(issueId, body) {
-      return applyLinearPolicy(
+      return gate(applyLinearPolicy(
         Effect.tryPromise({
           try: async () => {
             await client.createComment({ issueId, body });
@@ -330,7 +342,7 @@ export function createLinearGateway(config: Config): LinearGateway {
           catch: (err) => classifyLinearError(err, "comment"),
         }),
         { call: "comment" },
-      );
+      ));
     },
   };
 }
