@@ -128,3 +128,33 @@ export const captureCommitLog = (
       return typeof raw === "string" ? raw : "";
     }),
   );
+
+/**
+ * VA-358: Whether the agent branch has any commits beyond `base`.
+ * Used by failure-routing to distinguish "agent crashed mid-run,
+ * after producing real work" (→ HITL) from "agent crashed during
+ * startup, no work done" (→ revert to readyStatus). Runs with
+ * `reject: false` so a missing branch / non-zero exit comes back as
+ * an empty stdout (NaN > 0 → false) rather than an Effect failure;
+ * the Effect only fails if execa itself throws (e.g., git binary
+ * missing), and callers typically swallow that too.
+ */
+export const hasCommits = (
+  repoPath: string,
+  base: string,
+  branch: string,
+): Effect.Effect<boolean, { readonly message: string }, never> =>
+  runExecaScoped(
+    "git",
+    ["rev-list", "--count", `${base}..${branch}`],
+    { cwd: repoPath, reject: false },
+    (err) => ({
+      message: err instanceof Error ? err.message : String(err),
+    }),
+  ).pipe(
+    Effect.map((res) => {
+      const raw = res.stdout;
+      const out = typeof raw === "string" ? raw : "";
+      return Number.parseInt(out.trim(), 10) > 0;
+    }),
+  );

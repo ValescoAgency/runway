@@ -1,7 +1,7 @@
 import { Effect, Redacted } from "effect";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Config } from "./config.js";
-import type { HitlDeps } from "./hitl.js";
+import type { FailureRoutingDeps } from "./hitl.js";
 import {
   LinearNetworkError,
   LinearNotFound,
@@ -55,7 +55,9 @@ const issue: RunwayIssue = {
   description: "test",
 };
 
-function depsWith(linear: MockedLinear): HitlDeps {
+// FailureRoutingDeps is the wider shape — it structurally satisfies
+// HitlDeps too, so flagHitl tests can pass it without ceremony.
+function depsWith(linear: MockedLinear): FailureRoutingDeps {
   return {
     config,
     linear: asLinear(linear),

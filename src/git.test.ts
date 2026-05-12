@@ -6,7 +6,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const execaMock = vi.fn();
 vi.mock("execa", () => ({ execa: execaMock }));
 
-const { detectBaseBranch } = await import("./git.js");
+const { detectBaseBranch, hasCommits } = await import("./git.js");
 
 // VA-358: detectBaseBranch is now an Effect. Tests run it via
 // `Effect.runPromise` so the assertion shape (resolves / rejects)
@@ -73,5 +73,42 @@ describe("detectBaseBranch", () => {
     await expect(run("/tmp/repo")).rejects.toThrow(
       /Could not detect the default branch/,
     );
+  });
+});
+
+describe("hasCommits (VA-358)", () => {
+  // hasCommits runs `git rev-list --count base..branch` with
+  // reject:false — so the cases of interest are: positive count,
+  // zero count, non-numeric / empty stdout (missing branch), and
+  // execa throwing entirely (git binary missing).
+  const runHc = (base = "main", branch = "agent/va-1") =>
+    Effect.runPromise(hasCommits("/tmp/repo", base, branch));
+
+  it("returns true when the branch has commits ahead of base", async () => {
+    execaMock.mockResolvedValueOnce({ exitCode: 0, stdout: "3\n" });
+    await expect(runHc()).resolves.toBe(true);
+    expect(execaMock).toHaveBeenCalledWith(
+      "git",
+      ["rev-list", "--count", "main..agent/va-1"],
+      expect.objectContaining({ cwd: "/tmp/repo", reject: false }),
+    );
+  });
+
+  it("returns false when the branch is at base (zero commits)", async () => {
+    execaMock.mockResolvedValueOnce({ exitCode: 0, stdout: "0\n" });
+    await expect(runHc()).resolves.toBe(false);
+  });
+
+  it("returns false when rev-list exits non-zero with empty stdout (missing branch)", async () => {
+    // With reject:false, a missing branch comes back as a non-zero
+    // exitCode and empty stdout — NaN > 0 → false. Callers can route
+    // to revert without an Effect failure.
+    execaMock.mockResolvedValueOnce({ exitCode: 128, stdout: "" });
+    await expect(runHc()).resolves.toBe(false);
+  });
+
+  it("fails the Effect when execa itself throws (e.g., git binary missing)", async () => {
+    execaMock.mockRejectedValueOnce(new Error("git not installed"));
+    await expect(runHc()).rejects.toThrow(/git not installed/);
   });
 });

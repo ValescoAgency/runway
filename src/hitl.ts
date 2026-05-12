@@ -1,19 +1,25 @@
 import { Effect } from "effect";
 import type { Config } from "./config.js";
+import { hasCommits } from "./git.js";
 import type { LinearError, LinearGateway, RunwayIssue } from "./linear.js";
-import { runExecaScoped } from "./subprocess.js";
 
 /**
- * Narrow per-phase deps for the failure-routing module. flagHitl and
- * handleProcessFailure both need a LinearGateway + the hitlLabel /
- * readyStatus from config; handleProcessFailure also needs the
- * workspace + base branch to ask git "did the agent produce any
- * commits?" before deciding to revert vs flag-for-human-review. No
- * GitHub, no policy.
+ * Narrow deps for `flagHitl`. Just a LinearGateway (to comment /
+ * label / follow-up note) and the hitlLabel name from config. No
+ * filesystem state — flagHitl doesn't touch git.
  */
 export interface HitlDeps {
   readonly config: Config;
   readonly linear: LinearGateway;
+}
+
+/**
+ * Deps for `handleProcessFailure`. Extends HitlDeps because the
+ * routing decision ends in a flagHitl call on the "produced commits"
+ * branch; adds `cwd` + `baseBranch` for the `hasCommits` predicate
+ * that drives the revert-vs-HITL choice.
+ */
+export interface FailureRoutingDeps extends HitlDeps {
   readonly cwd: string;
   readonly baseBranch: string;
 }
@@ -122,7 +128,7 @@ export const flagHitl = (
 export const handleProcessFailure = (
   error: unknown,
   issue: RunwayIssue,
-  deps: HitlDeps,
+  deps: FailureRoutingDeps,
   branch: string,
 ): Effect.Effect<ProcessFailureOutcome, never, never> =>
   Effect.gen(function* () {
@@ -197,30 +203,3 @@ const errMsg = (err: unknown): string => {
   return String(err);
 };
 
-/**
- * VA-358: Whether the agent branch has any commits beyond `base`.
- * Used to distinguish "agent crashed mid-run, after producing real
- * work" (→ HITL) from "agent crashed during startup, no work done"
- * (→ revert to readyStatus). If the branch doesn't exist or git
- * fails, treat as "no commits" so we revert rather than strand the
- * issue.
- */
-const hasCommits = (
-  repoPath: string,
-  base: string,
-  branch: string,
-): Effect.Effect<boolean, { readonly message: string }, never> =>
-  runExecaScoped(
-    "git",
-    ["rev-list", "--count", `${base}..${branch}`],
-    { cwd: repoPath, reject: false },
-    (err) => ({
-      message: err instanceof Error ? err.message : String(err),
-    }),
-  ).pipe(
-    Effect.map((res) => {
-      const raw = res.stdout;
-      const out = typeof raw === "string" ? raw : "";
-      return Number.parseInt(out.trim(), 10) > 0;
-    }),
-  );
