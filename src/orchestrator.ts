@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { Effect } from "effect";
 import type { Config } from "./config.js";
-import { detectBaseBranch } from "./git.js";
+import { detectBaseBranch, pruneStaleAgentBranch } from "./git.js";
 import type { GithubError, GithubGateway } from "./github.js";
 import type { LinearError, LinearGateway, RunwayIssue } from "./linear.js";
 import { loadPolicy, type Policy } from "./policy.js";
@@ -236,6 +236,19 @@ const processIssue = (
     yield* linear.comment(
       issue.id,
       `Runway picked up this issue. Branch: \`${branch}\`.`,
+    );
+
+    // VA-366: if a prior attempt left an `agent/<id>` branch behind
+    // with zero commits ahead of base (typical of a startup-failure
+    // retry), delete it so sandcastle's worktree creation forks from
+    // current `baseBranch` HEAD. Preserves the branch when it carries
+    // real work. Best-effort — failures here don't abort the issue.
+    yield* pruneStaleAgentBranch(deps.cwd, deps.baseBranch, branch).pipe(
+      Effect.catchAll((err) =>
+        Effect.logWarning(
+          `${issue.identifier}: pruneStaleAgentBranch failed (continuing): ${err.message}`,
+        ),
+      ),
     );
 
     const impl = yield* runImplementLoop(issue, deps, branch);

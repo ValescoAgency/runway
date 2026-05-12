@@ -6,7 +6,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const execaMock = vi.fn();
 vi.mock("execa", () => ({ execa: execaMock }));
 
-const { detectBaseBranch, hasCommits } = await import("./git.js");
+const { detectBaseBranch, hasCommits, pruneStaleAgentBranch } = await import(
+  "./git.js"
+);
 
 // VA-358: detectBaseBranch is now an Effect. Tests run it via
 // `Effect.runPromise` so the assertion shape (resolves / rejects)
@@ -110,5 +112,56 @@ describe("hasCommits (VA-358)", () => {
   it("fails the Effect when execa itself throws (e.g., git binary missing)", async () => {
     execaMock.mockRejectedValueOnce(new Error("git not installed"));
     await expect(runHc()).rejects.toThrow(/git not installed/);
+  });
+});
+
+describe("pruneStaleAgentBranch (VA-366)", () => {
+  const runPrune = (base = "main", branch = "agent/va-1") =>
+    Effect.runPromise(pruneStaleAgentBranch("/tmp/repo", base, branch));
+
+  it("is a no-op when the branch doesn't exist (rev-parse exits non-zero)", async () => {
+    execaMock.mockResolvedValueOnce({ exitCode: 128, stdout: "" }); // rev-parse --verify
+    await runPrune();
+    expect(execaMock).toHaveBeenCalledTimes(1);
+    expect(execaMock.mock.calls[0]?.[1]).toEqual([
+      "rev-parse",
+      "--verify",
+      "refs/heads/agent/va-1",
+    ]);
+  });
+
+  it("preserves the branch when it has commits ahead of base", async () => {
+    execaMock
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "abc123\n" }) // rev-parse exists
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "3\n" }); // rev-list count
+    await runPrune();
+    expect(execaMock).toHaveBeenCalledTimes(2);
+    // No third call (no `git branch -D`).
+    expect(
+      execaMock.mock.calls.find((c) => c[1]?.[0] === "branch"),
+    ).toBeUndefined();
+  });
+
+  it("deletes the branch via `git branch -D` when it exists with zero commits ahead", async () => {
+    execaMock
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "abc123\n" }) // rev-parse exists
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "0\n" }) // rev-list count == 0
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "" }); // branch -D
+    await runPrune();
+    expect(execaMock).toHaveBeenCalledTimes(3);
+    expect(execaMock.mock.calls[2]?.[1]).toEqual(["branch", "-D", "agent/va-1"]);
+  });
+
+  it("preserves the branch (safe default) when hasCommits can't determine state", async () => {
+    // exists check succeeds, but hasCommits throws — we default to
+    // "keep" because losing partial work is worse than reusing a stale
+    // (but committed) branch.
+    execaMock
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "abc123\n" }) // rev-parse exists
+      .mockRejectedValueOnce(new Error("git not installed")); // rev-list throws
+    await runPrune();
+    expect(
+      execaMock.mock.calls.find((c) => c[1]?.[0] === "branch"),
+    ).toBeUndefined();
   });
 });
