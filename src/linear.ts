@@ -1,5 +1,5 @@
 import { LinearClient } from "@linear/sdk";
-import { Data, Effect, Schedule, type RateLimiter } from "effect";
+import { Data, Effect, Redacted, Schedule, type RateLimiter } from "effect";
 import type { Config } from "./config.js";
 
 /**
@@ -178,7 +178,7 @@ export function createLinearGateway(
   config: Config,
   limiter: RateLimiter.RateLimiter | null = null,
 ): LinearGateway {
-  const client = new LinearClient({ apiKey: config.linearApiKey });
+  const client = new LinearClient({ apiKey: Redacted.value(config.linearApiKey) });
   const gate = <A>(
     eff: Effect.Effect<A, LinearError>,
   ): Effect.Effect<A, LinearError> => (limiter ? limiter(eff) : eff);
@@ -375,7 +375,7 @@ type StateValidation =
 export async function validateLinearConfig(
   config: Config,
 ): Promise<LinearValidationResult> {
-  const client = new LinearClient({ apiKey: config.linearApiKey });
+  const client = new LinearClient({ apiKey: Redacted.value(config.linearApiKey) });
 
   const teams = await client.teams({
     filter: { key: { eq: config.linearTeam } },

@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { run, claudeCode } from "@ai-hero/sandcastle";
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
-import { Effect } from "effect";
+import { Effect, Redacted } from "effect";
 import type { Config } from "./config.js";
 import type { GithubError, GithubGateway } from "./github.js";
 import type { LinearError, LinearGateway, RunwayIssue } from "./linear.js";
@@ -738,7 +738,7 @@ function stringifyResult(result: unknown): string {
 function dockerEnv(config: Config): Record<string, string> {
   const env: Record<string, string> = {};
   if (config.opServiceAccountToken) {
-    env.OP_SERVICE_ACCOUNT_TOKEN = config.opServiceAccountToken;
+    env.OP_SERVICE_ACCOUNT_TOKEN = Redacted.value(config.opServiceAccountToken);
   }
   return env;
 }

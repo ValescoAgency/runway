@@ -1,3 +1,4 @@
+import { Redacted } from "effect";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Mock @linear/sdk so validateLinearConfig doesn't try to hit the
@@ -25,7 +26,7 @@ vi.mock("@linear/sdk", () => {
 const { validateLinearConfig } = await import("./linear.js");
 
 const config = {
-  linearApiKey: "k",
+  linearApiKey: Redacted.make("k"),
   linearTeam: "VA",
   readyStatus: "Todo",
   inProgressStatus: "In Progress",
