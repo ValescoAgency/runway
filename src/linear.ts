@@ -1,5 +1,5 @@
 import { LinearClient } from "@linear/sdk";
-import { Data, Effect } from "effect";
+import { Data, Effect, Schedule } from "effect";
 import type { Config } from "./config.js";
 
 /**
@@ -49,11 +49,70 @@ export class LinearNetworkError extends Data.TaggedError(
   readonly message: string;
 }> {}
 
+// VA-357: a stalled HTTP request becomes a typed timeout (rather than
+// a stuck process). Retryable just like NetworkError — the next attempt
+// may succeed.
+export class LinearTimeout extends Data.TaggedError("LinearTimeout")<{
+  readonly call: string;
+  readonly afterMs: number;
+  readonly message: string;
+}> {}
+
 export type LinearError =
   | LinearNotFound
   | LinearUnauthorized
   | LinearRateLimited
-  | LinearNetworkError;
+  | LinearNetworkError
+  | LinearTimeout;
+
+// VA-357: which typed errors a retry policy will re-attempt. Hard
+// failures (NotFound, Unauthorized) bypass the retry loop and surface
+// immediately — they are operator-fix problems, not transient blips.
+const RETRYABLE_LINEAR_TAGS = new Set<LinearError["_tag"]>([
+  "LinearNetworkError",
+  "LinearRateLimited",
+  "LinearTimeout",
+]);
+
+const isRetryableLinearError = (err: LinearError): boolean =>
+  RETRYABLE_LINEAR_TAGS.has(err._tag);
+
+/**
+ * VA-357: timeout + jittered-exponential retry policy for one Linear
+ * call. 5 retries from a 1s base ⇒ delays jittered around 1/2/4/8/16s
+ * ⇒ ~31s worst-case wall time before bubbling out. `while` gates the
+ * retry on the typed error tag so an `Unauthorized` or `NotFound` is
+ * not retried (no point: it's an operator/config problem).
+ *
+ * Exported so unit tests can apply it to a hand-built Effect and
+ * verify retry behavior under `TestClock`.
+ */
+export const linearRetrySchedule = Schedule.exponential("1 second").pipe(
+  Schedule.compose(Schedule.recurs(5)),
+  Schedule.jittered,
+);
+
+export const applyLinearPolicy = <A>(
+  effect: Effect.Effect<A, LinearError>,
+  opts: { call: string; timeoutMs?: number },
+): Effect.Effect<A, LinearError> => {
+  const timeoutMs = opts.timeoutMs ?? 30_000;
+  return effect.pipe(
+    Effect.timeoutFail({
+      duration: `${timeoutMs} millis`,
+      onTimeout: () =>
+        new LinearTimeout({
+          call: opts.call,
+          afterMs: timeoutMs,
+          message: `Linear ${opts.call} timed out after ${timeoutMs}ms`,
+        }),
+    }),
+    Effect.retry({
+      schedule: linearRetrySchedule,
+      while: isRetryableLinearError,
+    }),
+  );
+};
 
 /**
  * Best-effort classification of an unknown thrown value into the
@@ -69,7 +128,8 @@ function classifyLinearError(err: unknown, context: string): LinearError {
     err instanceof LinearNotFound ||
     err instanceof LinearUnauthorized ||
     err instanceof LinearRateLimited ||
-    err instanceof LinearNetworkError
+    err instanceof LinearNetworkError ||
+    err instanceof LinearTimeout
   ) {
     return err;
   }
@@ -169,96 +229,108 @@ export function createLinearGateway(config: Config): LinearGateway {
 
   return {
     fetchReady() {
-      return Effect.tryPromise({
-        try: async () => {
-          const teamId = await findTeamId();
-          const readyStateId = await findStateId(teamId, config.readyStatus);
-          const projectId = config.linearProject
-            ? await findProjectId(config.linearProject)
-            : null;
-          const issues = await client.issues({
-            filter: {
-              team: { id: { eq: teamId } },
-              state: { id: { eq: readyStateId } },
-              ...(projectId ? { project: { id: { eq: projectId } } } : {}),
-            },
-            // Stable order: oldest first so the queue drains FIFO.
-            orderBy: "createdAt" as never,
-          });
-          return issues.nodes.map((i) => ({
-            id: i.id,
-            identifier: i.identifier,
-            title: i.title,
-            description: i.description ?? "",
-          })) as readonly RunwayIssue[];
-        },
-        catch: (err) => classifyLinearError(err, "fetchReady"),
-      });
+      return applyLinearPolicy(
+        Effect.tryPromise({
+          try: async () => {
+            const teamId = await findTeamId();
+            const readyStateId = await findStateId(teamId, config.readyStatus);
+            const projectId = config.linearProject
+              ? await findProjectId(config.linearProject)
+              : null;
+            const issues = await client.issues({
+              filter: {
+                team: { id: { eq: teamId } },
+                state: { id: { eq: readyStateId } },
+                ...(projectId ? { project: { id: { eq: projectId } } } : {}),
+              },
+              // Stable order: oldest first so the queue drains FIFO.
+              orderBy: "createdAt" as never,
+            });
+            return issues.nodes.map((i) => ({
+              id: i.id,
+              identifier: i.identifier,
+              title: i.title,
+              description: i.description ?? "",
+            })) as readonly RunwayIssue[];
+          },
+          catch: (err) => classifyLinearError(err, "fetchReady"),
+        }),
+        { call: "fetchReady" },
+      );
     },
 
     transition(issueId, statusName) {
-      return Effect.tryPromise({
-        try: async () => {
-          const issue = await client.issue(issueId);
-          const team = await issue.team;
-          if (!team) {
-            throw new LinearNotFound({
-              resource: "issue",
-              identifier: issueId,
-              message: `Issue ${issueId} has no team`,
-            });
-          }
-          const stateId = await findStateId(team.id, statusName);
-          await client.updateIssue(issueId, { stateId });
-        },
-        catch: (err) => classifyLinearError(err, `transition(${statusName})`),
-      });
+      return applyLinearPolicy(
+        Effect.tryPromise({
+          try: async () => {
+            const issue = await client.issue(issueId);
+            const team = await issue.team;
+            if (!team) {
+              throw new LinearNotFound({
+                resource: "issue",
+                identifier: issueId,
+                message: `Issue ${issueId} has no team`,
+              });
+            }
+            const stateId = await findStateId(team.id, statusName);
+            await client.updateIssue(issueId, { stateId });
+          },
+          catch: (err) => classifyLinearError(err, `transition(${statusName})`),
+        }),
+        { call: `transition(${statusName})` },
+      );
     },
 
     applyLabel(issueId, labelName) {
-      return Effect.tryPromise({
-        try: async () => {
-          const issue = await client.issue(issueId);
-          const team = await issue.team;
-          if (!team) {
-            throw new LinearNotFound({
-              resource: "issue",
-              identifier: issueId,
-              message: `Issue ${issueId} has no team`,
+      return applyLinearPolicy(
+        Effect.tryPromise({
+          try: async () => {
+            const issue = await client.issue(issueId);
+            const team = await issue.team;
+            if (!team) {
+              throw new LinearNotFound({
+                resource: "issue",
+                identifier: issueId,
+                message: `Issue ${issueId} has no team`,
+              });
+            }
+            const labels = await client.issueLabels({
+              filter: {
+                team: { id: { eq: team.id } },
+                name: { eq: labelName },
+              },
             });
-          }
-          const labels = await client.issueLabels({
-            filter: {
-              team: { id: { eq: team.id } },
-              name: { eq: labelName },
-            },
-          });
-          const label = labels.nodes[0];
-          if (!label) {
-            throw new LinearNotFound({
-              resource: "label",
-              identifier: labelName,
-              message: `Linear label "${labelName}" not found on team ${team.id}`,
-            });
-          }
-          const existing = await issue.labels();
-          const labelIds = [
-            ...existing.nodes.map((l) => l.id),
-            label.id,
-          ];
-          await client.updateIssue(issueId, { labelIds });
-        },
-        catch: (err) => classifyLinearError(err, `applyLabel(${labelName})`),
-      });
+            const label = labels.nodes[0];
+            if (!label) {
+              throw new LinearNotFound({
+                resource: "label",
+                identifier: labelName,
+                message: `Linear label "${labelName}" not found on team ${team.id}`,
+              });
+            }
+            const existing = await issue.labels();
+            const labelIds = [
+              ...existing.nodes.map((l) => l.id),
+              label.id,
+            ];
+            await client.updateIssue(issueId, { labelIds });
+          },
+          catch: (err) => classifyLinearError(err, `applyLabel(${labelName})`),
+        }),
+        { call: `applyLabel(${labelName})` },
+      );
     },
 
     comment(issueId, body) {
-      return Effect.tryPromise({
-        try: async () => {
-          await client.createComment({ issueId, body });
-        },
-        catch: (err) => classifyLinearError(err, "comment"),
-      });
+      return applyLinearPolicy(
+        Effect.tryPromise({
+          try: async () => {
+            await client.createComment({ issueId, body });
+          },
+          catch: (err) => classifyLinearError(err, "comment"),
+        }),
+        { call: "comment" },
+      );
     },
   };
 }
