@@ -1,3 +1,4 @@
+import { Effect, Layer, Logger, RateLimiter } from "effect";
 import { loadConfig } from "../config.js";
 import { createLinearGateway } from "../linear.js";
 import { createGithubGateway } from "../github.js";
@@ -5,6 +6,7 @@ import {
   assertSandcastleInitialised,
   drainQueue,
 } from "../orchestrator.js";
+import { TelemetryLive } from "../telemetry.js";
 
 export interface RunOptions {
   readonly max?: number;
@@ -110,7 +112,6 @@ export async function runCommand(argv: readonly string[]): Promise<void> {
   const config = opts.project
     ? { ...baseConfig, linearProject: opts.project }
     : baseConfig;
-  const linear = createLinearGateway(config);
   const github = createGithubGateway();
 
   const scope = config.linearProject
@@ -119,10 +120,38 @@ export async function runCommand(argv: readonly string[]): Promise<void> {
   console.log(
     `[runway] draining queue from ${scope} (status="${config.readyStatus}") against ${cwd}`,
   );
-  const result = await drainQueue(
-    { config, linear, github, cwd },
-    { max: opts.max, allowPaths: opts.allowPaths },
-  );
+
+  // VA-358: a single `Effect.runPromise` at the CLI boundary.
+  //
+  // - JSON logger is wired in when `RUNWAY_JSON_LOGS=1` so the
+  //   operator can pipe runway's output to a log aggregator;
+  //   otherwise the default pretty logger is preserved for terminal
+  //   use.
+  // - Tracing is env-conditional inside `TelemetryLive` (only wires
+  //   the OTLP exporter when `OTEL_EXPORTER_OTLP_ENDPOINT` is set).
+  // - Linear `RateLimiter` (folded in from VA-357): conservative
+  //   30/minute, well under Linear's documented 1500/hr ceiling.
+  //   Built inside `Effect.scoped` so the limiter's internals are
+  //   torn down on program exit.
+  const LoggerLive =
+    process.env.RUNWAY_JSON_LOGS === "1"
+      ? Logger.replace(Logger.defaultLogger, Logger.jsonLogger)
+      : Layer.empty;
+  const MainLayer = Layer.mergeAll(TelemetryLive, LoggerLive);
+
+  const program = Effect.gen(function* () {
+    const linearLimiter = yield* RateLimiter.make({
+      limit: 30,
+      interval: "1 minute",
+    });
+    const linear = createLinearGateway(config, linearLimiter);
+    return yield* drainQueue(
+      { config, linear, github, cwd },
+      { max: opts.max, allowPaths: opts.allowPaths },
+    );
+  }).pipe(Effect.scoped, Effect.provide(MainLayer));
+
+  const result = await Effect.runPromise(program);
   console.log(
     `[runway] done — attempts=${result.attempts} opened=${result.opened} hitl=${result.hitl} errored=${result.errored}`,
   );

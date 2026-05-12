@@ -31,9 +31,19 @@ vi.mock("./prompts.js", () => ({
   tailOfMessage: (s: string) => s,
 }));
 
-const { drainQueue, parseImplVerdict, parseReviewVerdict } = await import(
-  "./orchestrator.js"
-);
+const {
+  drainQueue: drainQueueEffect,
+  parseImplVerdict,
+  parseReviewVerdict,
+} = await import("./orchestrator.js");
+
+// VA-358: drainQueue is now an Effect. Test bodies still want the
+// async-await shape; this adapter runs the program and yields the
+// `OrchestratorResult`, keeping the existing assertions intact.
+const drainQueue = (
+  deps: Parameters<typeof drainQueueEffect>[0],
+  opts?: Parameters<typeof drainQueueEffect>[1],
+) => Effect.runPromise(drainQueueEffect(deps, opts));
 
 // ---------------------------------------------------------------------------
 // Helpers
