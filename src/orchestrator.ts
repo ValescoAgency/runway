@@ -400,6 +400,16 @@ const processIssue = (
       yield* flagHitl(issue, deps, reason);
       return { kind: "hitl", detail: reason };
     }
+    if (verdict.kind === "missing") {
+      // VA-360: a review pass that didn't emit any marker is
+      // untrustworthy — usually a crash, OOM, or context-window
+      // truncation. Route to HITL with a reason that distinguishes
+      // this from a real rejection so the operator knows to look at
+      // the agent log instead of arguing with the verdict.
+      const reason = `Review pass ended without a REVIEW: marker (likely crashed or truncated): ${verdict.reason}`;
+      yield* flagHitl(issue, deps, reason);
+      return { kind: "hitl", detail: reason };
+    }
 
     // 3. Push + PR.
     yield* github.pushBranch(cwd, branch).pipe(Effect.withSpan("pushBranch"));
@@ -639,10 +649,17 @@ const runSandcastle = (
     }),
   });
 
-interface ParsedVerdict {
-  readonly kind: "approved" | "rejected";
-  readonly reason: string;
-}
+// VA-360: review verdict ADT with explicit `missing` instead of
+// silently bucketing "no marker found" as rejected. A schema doesn't
+// help here — the regex IS the parser, there's no upstream
+// structured shape to validate. The substantive change is to make
+// "missing" a distinct outcome so `processIssue` can route a
+// truncated / crashed review pass to HITL with the right detail line
+// instead of pretending the agent rejected the work.
+export type ParsedVerdict =
+  | { readonly kind: "approved"; readonly reason: string }
+  | { readonly kind: "rejected"; readonly reason: string }
+  | { readonly kind: "missing"; readonly reason: string };
 
 type ImplVerdict =
   | { readonly kind: "done" }
@@ -686,9 +703,15 @@ export function parseReviewVerdict(result: unknown): ParsedVerdict {
   const text = stringifyResult(result);
   const matches = [...text.matchAll(REVIEW_VERDICT_RE)];
   const last = matches[matches.length - 1];
+  // VA-360: explicit `missing` kind. Pre-VA-360 this returned a
+  // rejection with the message "review output did not contain a
+  // REVIEW: verdict line" — which conflated "agent reviewed and
+  // rejected" with "agent never emitted a verdict (crash, truncation,
+  // OOM)". `processIssue` now routes the two to HITL with distinct
+  // reason lines so the operator can tell them apart.
   if (!last) {
     return {
-      kind: "rejected",
+      kind: "missing",
       reason: "review output did not contain a REVIEW: verdict line",
     };
   }

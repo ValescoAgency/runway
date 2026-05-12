@@ -1,6 +1,47 @@
 import { LinearClient } from "@linear/sdk";
-import { Data, Effect, Redacted, Schedule, type RateLimiter } from "effect";
+import {
+  Data,
+  Effect,
+  ParseResult,
+  Redacted,
+  Schedule,
+  Schema,
+  type RateLimiter,
+} from "effect";
 import type { Config } from "./config.js";
+
+// VA-360: schemas covering only the fields runway actually reads
+// off the Linear SDK. Validation runs at the gateway boundary so an
+// upstream API drift (renamed field, removed field, type change)
+// surfaces as a typed `LinearSchemaError` rather than a `Cannot read
+// property 'nodes' of undefined` deep in the call stack.
+const IssueNodeSchema = Schema.Struct({
+  id: Schema.String,
+  identifier: Schema.String,
+  title: Schema.String,
+  description: Schema.NullOr(Schema.String),
+});
+const WorkflowStateNodeSchema = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+});
+const TeamNodeSchema = Schema.Struct({
+  id: Schema.String,
+  key: Schema.String,
+});
+const IssueLabelNodeSchema = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+});
+const ProjectNodeSchema = Schema.Struct({
+  id: Schema.String,
+});
+
+const decodeIssueNode = Schema.decodeUnknownSync(IssueNodeSchema);
+const decodeWorkflowStateNode = Schema.decodeUnknownSync(WorkflowStateNodeSchema);
+const decodeTeamNode = Schema.decodeUnknownSync(TeamNodeSchema);
+const decodeIssueLabelNode = Schema.decodeUnknownSync(IssueLabelNodeSchema);
+const decodeProjectNode = Schema.decodeUnknownSync(ProjectNodeSchema);
 
 /**
  * Trimmed-down view of a Linear issue — just what runway's loop needs.
@@ -58,12 +99,23 @@ export class LinearTimeout extends Data.TaggedError("LinearTimeout")<{
   readonly message: string;
 }> {}
 
+// VA-360: SDK response failed schema validation — Linear's GraphQL
+// schema drifted, an expected field went missing, or a type changed.
+// NOT retryable: re-running the same call will produce the same
+// drift. The operator needs to update runway's schemas (or pin the
+// SDK version) before this gets better.
+export class LinearSchemaError extends Data.TaggedError("LinearSchemaError")<{
+  readonly call: string;
+  readonly message: string;
+}> {}
+
 export type LinearError =
   | LinearNotFound
   | LinearUnauthorized
   | LinearRateLimited
   | LinearNetworkError
-  | LinearTimeout;
+  | LinearTimeout
+  | LinearSchemaError;
 
 // VA-357: which typed errors a retry policy will re-attempt. Hard
 // failures (NotFound, Unauthorized) bypass the retry loop and surface
@@ -129,9 +181,19 @@ function classifyLinearError(err: unknown, context: string): LinearError {
     err instanceof LinearUnauthorized ||
     err instanceof LinearRateLimited ||
     err instanceof LinearNetworkError ||
-    err instanceof LinearTimeout
+    err instanceof LinearTimeout ||
+    err instanceof LinearSchemaError
   ) {
     return err;
+  }
+  // VA-360: a schema validation throw (Linear API drift) should
+  // surface as `LinearSchemaError`, not get bucketed as a transient
+  // NetworkError — retrying won't fix a drifted field.
+  if (ParseResult.isParseError(err)) {
+    return new LinearSchemaError({
+      call: context,
+      message: `${context}: SDK response failed schema validation — ${err.message}`,
+    });
   }
   const msg = err instanceof Error ? err.message : String(err);
   if (/\b(401|403)\b|unauthorized|invalid api key|forbidden/i.test(msg)) {
@@ -187,30 +249,33 @@ export function createLinearGateway(
     const states = await client.workflowStates({
       filter: { team: { id: { eq: teamId } }, name: { eq: name } },
     });
-    const state = states.nodes[0];
-    if (!state) {
+    const rawState = states.nodes[0];
+    if (!rawState) {
       throw new LinearNotFound({
         resource: "state",
         identifier: name,
         message: `Linear workflow state "${name}" not found on team ${teamId}`,
       });
     }
-    return state.id;
+    // VA-360: validate the SDK shape. `decodeWorkflowStateNode` throws
+    // `ParseError` on drift, which `classifyLinearError` maps to
+    // `LinearSchemaError` (non-retryable).
+    return decodeWorkflowStateNode(rawState).id;
   }
 
   async function findTeamId(): Promise<string> {
     const teams = await client.teams({
       filter: { key: { eq: config.linearTeam } },
     });
-    const team = teams.nodes[0];
-    if (!team) {
+    const rawTeam = teams.nodes[0];
+    if (!rawTeam) {
       throw new LinearNotFound({
         resource: "team",
         identifier: config.linearTeam,
         message: `Linear team "${config.linearTeam}" not found`,
       });
     }
-    return team.id;
+    return decodeTeamNode(rawTeam).id;
   }
 
   /**
@@ -228,15 +293,15 @@ export function createLinearGateway(
         ],
       },
     });
-    const project = projects.nodes[0];
-    if (!project) {
+    const rawProject = projects.nodes[0];
+    if (!rawProject) {
       throw new LinearNotFound({
         resource: "project",
         identifier,
         message: `Linear project "${identifier}" not found`,
       });
     }
-    return project.id;
+    return decodeProjectNode(rawProject).id;
   }
 
   return {
@@ -258,12 +323,18 @@ export function createLinearGateway(
               // Stable order: oldest first so the queue drains FIFO.
               orderBy: "createdAt" as never,
             });
-            return issues.nodes.map((i) => ({
-              id: i.id,
-              identifier: i.identifier,
-              title: i.title,
-              description: i.description ?? "",
-            })) as readonly RunwayIssue[];
+            // VA-360: validate every issue node through the schema —
+            // a single drifted issue surfaces as `LinearSchemaError`
+            // instead of a downstream `cannot read property X`.
+            return issues.nodes.map((raw) => {
+              const i = decodeIssueNode(raw);
+              return {
+                id: i.id,
+                identifier: i.identifier,
+                title: i.title,
+                description: i.description ?? "",
+              };
+            }) as readonly RunwayIssue[];
           },
           catch: (err) => classifyLinearError(err, "fetchReady"),
         }),
@@ -312,19 +383,20 @@ export function createLinearGateway(
                 name: { eq: labelName },
               },
             });
-            const label = labels.nodes[0];
-            if (!label) {
+            const rawLabel = labels.nodes[0];
+            if (!rawLabel) {
               throw new LinearNotFound({
                 resource: "label",
                 identifier: labelName,
                 message: `Linear label "${labelName}" not found on team ${team.id}`,
               });
             }
+            const label = decodeIssueLabelNode(rawLabel);
             const existing = await issue.labels();
-            const labelIds = [
-              ...existing.nodes.map((l) => l.id),
-              label.id,
-            ];
+            const existingIds = existing.nodes.map(
+              (l) => decodeIssueLabelNode(l).id,
+            );
+            const labelIds = [...existingIds, label.id];
             await client.updateIssue(issueId, { labelIds });
           },
           catch: (err) => classifyLinearError(err, `applyLabel(${labelName})`),

@@ -578,6 +578,61 @@ describe("drainQueue HITL ordering (VA-355)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Tests — VA-360 missing-verdict routing
+// ---------------------------------------------------------------------------
+
+describe("drainQueue missing-verdict routing (VA-360)", () => {
+  it("routes a review pass with no REVIEW: marker to HITL with a 'crashed or truncated' reason — not a generic rejection", async () => {
+    // Pre-VA-360 this case was bucketed as "Sub-agent review
+    // rejected: review output did not contain a REVIEW: verdict
+    // line" — indistinguishable from a real rejection. The operator
+    // would argue with a verdict that wasn't actually made.
+    routeExeca({ revListCount: "3" });
+    sandcastleRunMock
+      .mockResolvedValueOnce({
+        stdout: "implementation done\nIMPL: DONE",
+        commits: [{ sha: "abc" }],
+      })
+      .mockResolvedValueOnce({
+        // No REVIEW: marker anywhere — review pass crashed mid-output.
+        stdout: "reviewing...\nReached max iterations (1).",
+        commits: [],
+      });
+
+    const linear = makeLinear();
+    linear.fetchReady
+      .mockReturnValueOnce(Effect.succeed([issue]))
+      .mockReturnValueOnce(Effect.succeed([]));
+
+    const result = await drainQueue({
+      config,
+      linear: asLinear(linear),
+      github: makeGithub(),
+      cwd: "/tmp/repo",
+    });
+
+    expect(result).toMatchObject({
+      attempts: 1,
+      opened: 0,
+      hitl: 1,
+      errored: 0,
+    });
+
+    const commentBodies = linear.comment.mock.calls.map((c) => String(c[1]));
+    const hitlComment = commentBodies.find((b) =>
+      /flagged for human review/.test(b),
+    );
+    expect(hitlComment).toBeDefined();
+    // The post-VA-360 reason explicitly distinguishes
+    // crashed/truncated from a real rejection.
+    expect(hitlComment).toMatch(
+      /without a REVIEW: marker \(likely crashed or truncated\)/,
+    );
+    expect(hitlComment).not.toMatch(/Sub-agent review rejected/);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Tests — VA-353 review marker parsing
 // ---------------------------------------------------------------------------
 
@@ -617,20 +672,24 @@ describe("parseReviewVerdict (VA-353)", () => {
     });
   });
 
-  it("rejects (with a 'no marker' reason) when the agent never emitted a verdict", () => {
+  it("returns kind=missing when the agent never emitted a verdict (VA-360)", () => {
+    // VA-360 distinguishes "no marker found" from "agent rejected".
+    // Pre-VA-360 this returned `{ kind: "rejected", reason: "…no
+    // REVIEW: verdict line" }` and the orchestrator treated a
+    // truncated / crashed review the same as a real rejection.
     expect(parseReviewVerdict({ stdout: "i forgot to emit anything useful" }))
       .toEqual({
-        kind: "rejected",
+        kind: "missing",
         reason: "review output did not contain a REVIEW: verdict line",
       });
   });
 
-  it("does not match a marker in mid-prose (not at line start)", () => {
+  it("returns kind=missing for a marker in mid-prose (not at line start)", () => {
     // The reviewer is discussing the contract, not emitting it.
     const stdout =
       "I should remind the agent: the reviewer should output REVIEW: APPROVED when…";
     expect(parseReviewVerdict({ stdout })).toMatchObject({
-      kind: "rejected",
+      kind: "missing",
       reason: "review output did not contain a REVIEW: verdict line",
     });
   });
