@@ -158,3 +158,60 @@ export const hasCommits = (
       return Number.parseInt(out.trim(), 10) > 0;
     }),
   );
+
+/**
+ * VA-366: prune an agent/<issue> branch from a prior failed attempt
+ * so the next worktree creation forks from current `base` HEAD
+ * instead of reusing a stale tip.
+ *
+ * Logic:
+ *   1. If the branch doesn't exist → no-op.
+ *   2. If it has commits ahead of `base` (`hasCommits` returns true)
+ *      → preserve. Agent did real work; resetting would discard it.
+ *   3. Otherwise (branch present, no commits ahead) → `git branch -D`.
+ *      `-D` (not `-d`) because the branch tip equals or trails base
+ *      after the failed attempt, and `-d`'s merge check can refuse
+ *      otherwise-equivalent tips.
+ *
+ * Best-effort: this is a *retry hygiene* operation, not a correctness
+ * guarantee. If git fails, we log and continue — sandcastle's
+ * worktree creation will still work; the agent just sees the stale
+ * branch state that motivated this fix.
+ */
+export const pruneStaleAgentBranch = (
+  repoPath: string,
+  base: string,
+  branch: string,
+): Effect.Effect<void, { readonly message: string }, never> =>
+  Effect.gen(function* () {
+    // 1. Existence check.
+    const exists = yield* runExecaScoped(
+      "git",
+      ["rev-parse", "--verify", `refs/heads/${branch}`],
+      { cwd: repoPath, reject: false },
+      (err) => ({
+        message: err instanceof Error ? err.message : String(err),
+      }),
+    ).pipe(
+      Effect.map((res) => res.exitCode === 0),
+      Effect.catchAll(() => Effect.succeed(false)),
+    );
+    if (!exists) return;
+
+    // 2. Preserve if the branch carries real work.
+    const hasWork = yield* hasCommits(repoPath, base, branch).pipe(
+      // If we can't tell, prefer the safe option — keep the branch.
+      Effect.catchAll(() => Effect.succeed(true)),
+    );
+    if (hasWork) return;
+
+    // 3. Stale → delete so the next worktree creation forks from base HEAD.
+    yield* runExecaScoped(
+      "git",
+      ["branch", "-D", branch],
+      { cwd: repoPath, reject: false },
+      (err) => ({
+        message: err instanceof Error ? err.message : String(err),
+      }),
+    ).pipe(Effect.catchAll(() => Effect.succeed(undefined)));
+  });
