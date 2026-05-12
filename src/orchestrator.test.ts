@@ -16,14 +16,8 @@ vi.mock("@ai-hero/sandcastle/sandboxes/docker", () => ({
   docker: vi.fn(() => ({ kind: "docker" })),
 }));
 vi.mock("./prompts.js", () => ({
-  loadImplementPrompt: vi.fn().mockResolvedValue("implement template"),
-  loadReviewPrompt: vi.fn().mockResolvedValue("review template"),
-  renderPrompt: (tmpl: string) => tmpl,
-  implementVars: () => ({}),
-  reviewVars: () => ({}),
-  buildIterationSummary: (args: { iterationsRun: number }) =>
-    `summary-after-${args.iterationsRun}`,
-  tailOfMessage: (s: string) => s,
+  renderImplementPrompt: vi.fn().mockResolvedValue("implement prompt rendered"),
+  renderReviewPrompt: vi.fn().mockResolvedValue("review prompt rendered"),
 }));
 
 const { drainQueue: drainQueueEffect } = await import("./orchestrator.js");

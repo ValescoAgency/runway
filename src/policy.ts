@@ -94,14 +94,3 @@ export function loadPolicy(
   };
 }
 
-/**
- * Render the bullet sentence the impl prompt shows the agent. Stable
- * formatting so a missing path is visible in a diff.
- */
-export function renderForbiddenPathsBullet(policy: Policy): string {
-  if (policy.forbiddenPaths.length === 0) {
-    return "- (No write-path restrictions for this repo. Use judgment.)";
-  }
-  const quoted = policy.forbiddenPaths.map((p) => `\`${p}\``).join(", ");
-  return `- Never modify ${quoted}. If the issue's acceptance criteria require modifying one of these paths, **stop and emit \`IMPL: BLOCKED — issue requires modifying <path>, which working-style policy forbids\`** — do not silently skip the work.`;
-}
