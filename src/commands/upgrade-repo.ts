@@ -272,12 +272,17 @@ function execName(): string {
 
 // Either ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN — capture which
 // it is so upgrade-repo can re-render in the same auth mode.
+// Item capture uses [^/"]+ (no slashes) so a path like
+// op://vault/item/credential doesn't bleed /field into the item group.
+// (?:/[^"]*)? strips any trailing /field before the closing quotes so
+// upgrade-repo round-trips correctly even when the schema was rendered
+// with a doubled field (e.g. /credential/credential from the prior bug).
 const ANTHROPIC_RE = new RegExp(
-  `^\\s*(ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN)\\s*=\\s*${execName()}\\(\\s*['"]op read "op://([^/"]+)/([^"]+)"['"]\\s*\\)\\s*$`,
+  `^\\s*(ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN)\\s*=\\s*${execName()}\\(\\s*['"]op read "op://([^/"]+)/([^/"]+)(?:/[^"]*)?["]['"]\\s*\\)\\s*$`,
   "m",
 );
 const GH_TOKEN_RE = new RegExp(
-  `^\\s*GH_TOKEN\\s*=\\s*${execName()}\\(\\s*['"]op read "op://([^/"]+)/([^"]+)"['"]\\s*\\)\\s*$`,
+  `^\\s*GH_TOKEN\\s*=\\s*${execName()}\\(\\s*['"]op read "op://([^/"]+)/([^/"]+)(?:/[^"]*)?["]['"]\\s*\\)\\s*$`,
   "m",
 );
 
