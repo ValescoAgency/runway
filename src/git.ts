@@ -78,3 +78,53 @@ export const detectBaseBranch = (
       }),
     );
   });
+
+/**
+ * Capture `git diff base...branch` as a string for the review
+ * prompt. Truncated to 60_000 chars to keep the reviewer's context
+ * budget under control — larger diffs almost always mean the issue
+ * was scoped too wide and will benefit from human review anyway.
+ */
+export const captureDiff = (
+  repoPath: string,
+  base: string,
+  branch: string,
+): Effect.Effect<string, { readonly message: string }, never> =>
+  runExecaScoped(
+    "git",
+    ["diff", `${base}...${branch}`],
+    { cwd: repoPath },
+    (err) => ({
+      message: err instanceof Error ? err.message : String(err),
+    }),
+  ).pipe(
+    Effect.map((res) => {
+      const raw = res.stdout;
+      const out = typeof raw === "string" ? raw : "";
+      return out.length > 60_000 ? `${out.slice(0, 60_000)}\n…(truncated)` : out;
+    }),
+  );
+
+/**
+ * Capture `git log --oneline base..branch` for the review prompt and
+ * for the implement loop's per-iteration summary. Empty string when
+ * the branch has no commits beyond base.
+ */
+export const captureCommitLog = (
+  repoPath: string,
+  base: string,
+  branch: string,
+): Effect.Effect<string, { readonly message: string }, never> =>
+  runExecaScoped(
+    "git",
+    ["log", "--oneline", `${base}..${branch}`],
+    { cwd: repoPath },
+    (err) => ({
+      message: err instanceof Error ? err.message : String(err),
+    }),
+  ).pipe(
+    Effect.map((res) => {
+      const raw = res.stdout;
+      return typeof raw === "string" ? raw : "";
+    }),
+  );
