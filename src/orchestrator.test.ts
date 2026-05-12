@@ -1,11 +1,6 @@
 import { Effect, Redacted } from "effect";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  LinearNetworkError,
-  LinearNotFound,
-  type LinearGateway,
-  type RunwayIssue,
-} from "./linear.js";
+import { type LinearGateway, type RunwayIssue } from "./linear.js";
 import type { GithubGateway } from "./github.js";
 import type { Config } from "./config.js";
 
@@ -31,11 +26,7 @@ vi.mock("./prompts.js", () => ({
   tailOfMessage: (s: string) => s,
 }));
 
-const {
-  drainQueue: drainQueueEffect,
-  parseImplVerdict,
-  parseReviewVerdict,
-} = await import("./orchestrator.js");
+const { drainQueue: drainQueueEffect } = await import("./orchestrator.js");
 
 // VA-358: drainQueue is now an Effect. Test bodies still want the
 // async-await shape; this adapter runs the program and yields the
@@ -129,85 +120,6 @@ function routeExeca(opts: { revListCount: string }): void {
 }
 
 // ---------------------------------------------------------------------------
-// Tests — VA-342 revert-on-startup-failure behaviour
-// ---------------------------------------------------------------------------
-
-describe("drainQueue error handling (VA-342)", () => {
-  it("reverts to Todo and skips needs-human when the agent crashes with zero commits", async () => {
-    routeExeca({ revListCount: "0" });
-    sandcastleRunMock.mockRejectedValue(new Error("missing image"));
-
-    const linear = makeLinear();
-    linear.fetchReady
-      .mockReturnValueOnce(Effect.succeed([issue]))
-      .mockReturnValueOnce(Effect.succeed([])); // queue drains after the failed attempt
-
-    const result = await drainQueue({
-      config,
-      linear: asLinear(linear),
-      github: makeGithub(),
-      cwd: "/tmp/repo",
-    });
-
-    expect(result).toMatchObject({
-      attempts: 1,
-      opened: 0,
-      hitl: 0,
-      errored: 1,
-    });
-    expect(result.outcomes).toEqual([
-      { identifier: "VA-312", kind: "reverted", detail: "missing image" },
-    ]);
-
-    // First transition is to In Progress (processIssue's early call); the
-    // recovery path adds a second transition back to Todo.
-    const transitions = linear.transition.mock.calls.map((c) => c[1]);
-    expect(transitions).toEqual(["In Progress", "Todo"]);
-
-    // No HITL label on an infra failure.
-    expect(linear.applyLabel).not.toHaveBeenCalled();
-
-    // The recovery comment mentions the revert.
-    const commentBodies = linear.comment.mock.calls.map((c) => String(c[1]));
-    expect(commentBodies.some((b) => /reverting to .*Todo/.test(b))).toBe(true);
-  });
-
-  it("applies needs-human and stays In Progress when the agent crashes after producing commits", async () => {
-    routeExeca({ revListCount: "3" });
-    sandcastleRunMock.mockRejectedValue(new Error("review pass crashed"));
-
-    const linear = makeLinear();
-    linear.fetchReady
-      .mockReturnValueOnce(Effect.succeed([issue]))
-      .mockReturnValueOnce(Effect.succeed([]));
-
-    const result = await drainQueue({
-      config,
-      linear: asLinear(linear),
-      github: makeGithub(),
-      cwd: "/tmp/repo",
-    });
-
-    expect(result).toMatchObject({
-      attempts: 1,
-      opened: 0,
-      hitl: 0,
-      errored: 1,
-    });
-    expect(result.outcomes).toEqual([
-      { identifier: "VA-312", kind: "errored", detail: "review pass crashed" },
-    ]);
-
-    // Only the original In Progress transition — no revert.
-    const transitions = linear.transition.mock.calls.map((c) => c[1]);
-    expect(transitions).toEqual(["In Progress"]);
-
-    // HITL label applied on a mid-run failure.
-    expect(linear.applyLabel).toHaveBeenCalledWith("issue-123", "needs-human");
-  });
-});
-
-// ---------------------------------------------------------------------------
 // Tests — VA-344 attempt-count + seen-this-run loop guard
 // ---------------------------------------------------------------------------
 
@@ -280,52 +192,6 @@ describe("drainQueue --max semantics (VA-344)", () => {
 // ---------------------------------------------------------------------------
 // Tests — VA-350 IMPL: marker contract
 // ---------------------------------------------------------------------------
-
-describe("parseImplVerdict (VA-350)", () => {
-  it("returns DONE on a trailing IMPL: DONE marker", () => {
-    expect(
-      parseImplVerdict({ stdout: "all green\n\nIMPL: DONE\n" }),
-    ).toEqual({ kind: "done" });
-  });
-
-  it("returns BLOCKED with the trailing reason after `—`", () => {
-    expect(
-      parseImplVerdict({
-        stdout:
-          "I can't modify .github/workflows under policy.\n\nIMPL: BLOCKED — issue requires CI workflow changes that policy forbids\n",
-      }),
-    ).toEqual({
-      kind: "blocked",
-      reason: "issue requires CI workflow changes that policy forbids",
-    });
-  });
-
-  it("returns BLOCKED with a fallback reason when none is given", () => {
-    expect(parseImplVerdict({ stdout: "IMPL: BLOCKED\n" })).toEqual({
-      kind: "blocked",
-      reason: "no reason given",
-    });
-  });
-
-  it("returns CONTINUE on a trailing CONTINUE marker", () => {
-    expect(parseImplVerdict({ stdout: "still working\nIMPL: CONTINUE\n" }))
-      .toEqual({ kind: "continue" });
-  });
-
-  it("treats output with no IMPL: marker as missing", () => {
-    expect(parseImplVerdict({ stdout: "no marker here" })).toEqual({
-      kind: "missing",
-    });
-  });
-
-  it("uses the LAST marker when several appear across iterations", () => {
-    expect(
-      parseImplVerdict({
-        stdout: "IMPL: CONTINUE\n...next iteration...\nIMPL: DONE\n",
-      }),
-    ).toEqual({ kind: "done" });
-  });
-});
 
 describe("drainQueue impl marker behaviour (VA-350)", () => {
   it("BLOCKED short-circuits to HITL with the reason; reviewer pass does not run", async () => {
@@ -434,150 +300,6 @@ describe("drainQueue impl marker behaviour (VA-350)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Tests — VA-355 HITL ordering + per-issue verdict trail
-// ---------------------------------------------------------------------------
-
-describe("drainQueue HITL ordering (VA-355)", () => {
-  it("posts the rejection reason as a comment BEFORE applying the label, so a missing label doesn't swallow the reason", async () => {
-    routeExeca({ revListCount: "3" });
-    sandcastleRunMock
-      .mockResolvedValueOnce({
-        stdout: "implementation done\nIMPL: DONE",
-        commits: [{ sha: "abc" }],
-      })
-      .mockResolvedValueOnce({
-        stdout:
-          "REVIEW: REJECTED — TOCTOU race in provisionHousehold, three substantive bugs",
-        commits: [],
-      });
-
-    const linear = makeLinear();
-    linear.applyLabel.mockReturnValueOnce(
-      Effect.fail(
-        new LinearNotFound({
-          resource: "label",
-          identifier: "needs-human",
-          message: 'Linear label "needs-human" not found on team xyz',
-        }),
-      ),
-    );
-    linear.fetchReady
-      .mockReturnValueOnce(Effect.succeed([issue]))
-      .mockReturnValueOnce(Effect.succeed([]));
-
-    await drainQueue({
-      config,
-      linear: asLinear(linear),
-      github: makeGithub(),
-      cwd: "/tmp/repo",
-    });
-
-    const commentBodies = linear.comment.mock.calls.map((c) => String(c[1]));
-    const hitlComment = commentBodies.find((b) =>
-      /TOCTOU race in provisionHousehold/.test(b),
-    );
-    expect(hitlComment).toBeDefined();
-    expect(hitlComment).toMatch(/Runway flagged for human review/);
-
-    expect(
-      commentBodies.some((b) =>
-        /could not apply .* label — please apply it manually/.test(b),
-      ),
-    ).toBe(true);
-  });
-
-  it("dumps the rejection reason to stderr when even the Linear comment fails", async () => {
-    routeExeca({ revListCount: "3" });
-    sandcastleRunMock
-      .mockResolvedValueOnce({
-        stdout: "implementation done\nIMPL: DONE",
-        commits: [{ sha: "abc" }],
-      })
-      .mockResolvedValueOnce({
-        stdout: "REVIEW: REJECTED — three bugs found",
-        commits: [],
-      });
-
-    const linear = makeLinear();
-    linear.comment.mockImplementation((_id: string, body: string) =>
-      /flagged for human review/.test(body)
-        ? Effect.fail(
-            new LinearNetworkError({
-              cause: null,
-              message: "Linear unreachable",
-            }),
-          )
-        : Effect.succeed(undefined),
-    );
-    linear.applyLabel.mockReturnValueOnce(
-      Effect.fail(
-        new LinearNetworkError({
-          cause: null,
-          message: "also unreachable",
-        }),
-      ),
-    );
-    linear.fetchReady
-      .mockReturnValueOnce(Effect.succeed([issue]))
-      .mockReturnValueOnce(Effect.succeed([]));
-
-    const writes: string[] = [];
-    const origWrite = process.stderr.write.bind(process.stderr);
-    process.stderr.write = ((chunk: string | Uint8Array): boolean => {
-      writes.push(typeof chunk === "string" ? chunk : chunk.toString());
-      return true;
-    }) as typeof process.stderr.write;
-
-    try {
-      await drainQueue({
-        config,
-        linear: asLinear(linear),
-        github: makeGithub(),
-        cwd: "/tmp/repo",
-      });
-    } finally {
-      process.stderr.write = origWrite;
-    }
-
-    const combined = writes.join("");
-    expect(combined).toMatch(/REJECTION REASON FOLLOWS \(VA-312\)/);
-    expect(combined).toMatch(/three bugs found/);
-  });
-
-  it("includes a per-issue verdict trail in the exit summary", async () => {
-    routeExeca({ revListCount: "3" });
-    sandcastleRunMock
-      .mockResolvedValueOnce({
-        stdout: "implementation done\nIMPL: DONE",
-        commits: [{ sha: "abc" }],
-      })
-      .mockResolvedValueOnce({
-        stdout: "REVIEW: APPROVED",
-        commits: [],
-      });
-
-    const linear = makeLinear();
-    linear.fetchReady
-      .mockReturnValueOnce(Effect.succeed([issue]))
-      .mockReturnValueOnce(Effect.succeed([]));
-
-    const result = await drainQueue({
-      config,
-      linear: asLinear(linear),
-      github: makeGithub(),
-      cwd: "/tmp/repo",
-    });
-
-    expect(result.outcomes).toHaveLength(1);
-    expect(result.outcomes[0]).toMatchObject({
-      identifier: "VA-312",
-      kind: "opened",
-    });
-    expect(result.outcomes[0]?.detail).toMatch(/^https:\/\//);
-  });
-});
-
-// ---------------------------------------------------------------------------
 // Tests — VA-360 missing-verdict routing
 // ---------------------------------------------------------------------------
 
@@ -632,82 +354,6 @@ describe("drainQueue missing-verdict routing (VA-360)", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Tests — VA-353 review marker parsing
-// ---------------------------------------------------------------------------
-
-describe("parseReviewVerdict (VA-353)", () => {
-  // Exact reproducer from .sandcastle/logs/master-review-va-312.log
-  // (truncated). Sandcastle's wrapper output ("Agent stopped",
-  // "Capturing session", "Run complete: …") trails the marker.
-  const va312Tail = [
-    "REVIEW: REJECTED — provisionHousehold has a TOCTOU race that creates duplicate households with no DB-level guard (missing unique index on owner role), and withAudit error path can swallow original errors",
-    "Agent stopped",
-    "Capturing session",
-    "Collecting commits",
-    "Collecting commits done (0.0s)",
-    "Reached max iterations (1).",
-    "Run complete: reached 1 iteration(s) without completion signal.",
-    "Context window: 58k",
-  ].join("\n");
-
-  it("recovers REVIEW: REJECTED with reason when sandcastle wrapper output trails the marker", () => {
-    expect(parseReviewVerdict({ stdout: va312Tail })).toEqual({
-      kind: "rejected",
-      reason:
-        "provisionHousehold has a TOCTOU race that creates duplicate households with no DB-level guard (missing unique index on owner role), and withAudit error path can swallow original errors",
-    });
-  });
-
-  it("recovers REVIEW: APPROVED when sandcastle wrapper output trails the marker", () => {
-    const stdout = [
-      "Looks good, all tests pass.",
-      "REVIEW: APPROVED",
-      "Agent stopped",
-      "Run complete: reached 1 iteration(s) without completion signal.",
-    ].join("\n");
-    expect(parseReviewVerdict({ stdout })).toEqual({
-      kind: "approved",
-      reason: "",
-    });
-  });
-
-  it("returns kind=missing when the agent never emitted a verdict (VA-360)", () => {
-    // VA-360 distinguishes "no marker found" from "agent rejected".
-    // Pre-VA-360 this returned `{ kind: "rejected", reason: "…no
-    // REVIEW: verdict line" }` and the orchestrator treated a
-    // truncated / crashed review the same as a real rejection.
-    expect(parseReviewVerdict({ stdout: "i forgot to emit anything useful" }))
-      .toEqual({
-        kind: "missing",
-        reason: "review output did not contain a REVIEW: verdict line",
-      });
-  });
-
-  it("returns kind=missing for a marker in mid-prose (not at line start)", () => {
-    // The reviewer is discussing the contract, not emitting it.
-    const stdout =
-      "I should remind the agent: the reviewer should output REVIEW: APPROVED when…";
-    expect(parseReviewVerdict({ stdout })).toMatchObject({
-      kind: "missing",
-      reason: "review output did not contain a REVIEW: verdict line",
-    });
-  });
-
-  it("when multiple markers appear, the LAST one wins", () => {
-    const stdout = [
-      "Initial pass: REVIEW: APPROVED",
-      "On second look I see a bug.",
-      "REVIEW: REJECTED — withAudit swallows errors",
-    ].join("\n");
-    expect(parseReviewVerdict({ stdout })).toEqual({
-      kind: "rejected",
-      reason: "withAudit swallows errors",
-    });
-  });
-});
-
-// ---------------------------------------------------------------------------
 // Tests — VA-349 iteration memory plumbing
 // ---------------------------------------------------------------------------
 

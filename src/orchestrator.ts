@@ -6,7 +6,7 @@ import { detectBaseBranch } from "./git.js";
 import type { GithubError, GithubGateway } from "./github.js";
 import type { LinearError, LinearGateway, RunwayIssue } from "./linear.js";
 import { loadPolicy, type Policy } from "./policy.js";
-import { runExecaScoped } from "./subprocess.js";
+import { flagHitl, handleProcessFailure } from "./hitl.js";
 import { runImplementLoop } from "./implement.js";
 import { runReviewPass } from "./review.js";
 import { finalize } from "./finalize.js";
@@ -193,62 +193,17 @@ export const drainQueue = (
         });
       } else {
         errored += 1;
-        const errDetail = errMsg(processed.left);
-        yield* Effect.logError(`error on ${issue.identifier}`).pipe(
-          Effect.annotateLogs({
-            issue: issue.identifier,
-            error: errDetail,
-          }),
-        );
-
-        // If the agent crashed before producing any commits (missing
-        // image, varlock validation, container failed to boot, etc.),
-        // it's an infrastructure failure — not a HITL. Revert the
-        // issue to the ready state and skip the HITL label so the
-        // next run can pick it up cleanly. `In Progress` is reserved
-        // for "agent has committed to the branch".
-        const startedRealWork = yield* hasCommits(
-          deps.cwd,
-          baseBranchResolved,
+        const failureOutcome = yield* handleProcessFailure(
+          processed.left,
+          issue,
+          runDeps,
           branch,
-        ).pipe(Effect.catchAll(() => Effect.succeed(false)));
-
-        if (!startedRealWork) {
-          yield* runSwallow(
-            linear.transition(issue.id, config.readyStatus),
-            `${issue.identifier}: revert transition to ${config.readyStatus}`,
-          );
-          yield* runSwallow(
-            linear.comment(
-              issue.id,
-              `Runway hit a startup failure before the agent produced any commits — reverting to \`${config.readyStatus}\` for retry:\n\n\`\`\`\n${errDetail}\n\`\`\``,
-            ),
-            `${issue.identifier}: revert-comment`,
-          );
-          outcomes.push({
-            identifier: issue.identifier,
-            kind: "reverted",
-            detail: errDetail,
-          });
-        } else {
-          // VA-355: comment first with the substantive reason, label
-          // second (best-effort). If we labeled first and the label
-          // didn't exist (Flightplan workspaces hitting the
-          // `needs-human` default — see VA-354), the orchestrator's
-          // catch would never get to the reason and the operator
-          // would see an infrastructure error in Linear with no clue
-          // what the agent actually found.
-          yield* flagHitl(
-            issue,
-            runDeps,
-            `Runway hit an unrecoverable error and flagged for human review: ${errDetail}`,
-          );
-          outcomes.push({
-            identifier: issue.identifier,
-            kind: "errored",
-            detail: errDetail,
-          });
-        }
+        );
+        outcomes.push({
+          identifier: issue.identifier,
+          kind: failureOutcome.kind,
+          detail: failureOutcome.detail,
+        });
       }
     }
 
@@ -298,109 +253,6 @@ const processIssue = (
     return yield* finalize(issue, deps, branch);
   });
 
-/**
- * VA-355: comment is the load-bearing artifact, label is metadata.
- * Post the comment FIRST so the substantive reason lands on the
- * issue even if the label apply later fails (Flightplan workspaces
- * hitting the `needs-human` default, transient Linear errors, etc.).
- * On full failure (comment didn't even post), dump the reason to
- * stderr with a clear banner so the operator sees it terminal-side.
- */
-const flagHitl = (
-  issue: RunwayIssue,
-  deps: ResolvedDeps,
-  reason: string,
-): Effect.Effect<void, never, never> =>
-  Effect.gen(function* () {
-    const { config, linear } = deps;
-    const body = `Runway flagged for human review: ${reason}`;
-
-    const commentResult = yield* linear.comment(issue.id, body).pipe(
-      Effect.either,
-    );
-    const commentPosted = commentResult._tag === "Right";
-    if (!commentPosted) {
-      yield* Effect.logError(`${issue.identifier}: failed to post HITL comment`).pipe(
-        Effect.annotateLogs({
-          issue: issue.identifier,
-          error: errMsg(commentResult.left),
-        }),
-      );
-    }
-
-    const labelResult = yield* linear
-      .applyLabel(issue.id, config.hitlLabel)
-      .pipe(Effect.either);
-    if (labelResult._tag === "Left") {
-      const detail = errMsg(labelResult.left);
-      yield* Effect.logError(
-        `${issue.identifier}: failed to apply HITL label "${config.hitlLabel}"`,
-      ).pipe(
-        Effect.annotateLogs({
-          issue: issue.identifier,
-          label: config.hitlLabel,
-          error: detail,
-        }),
-      );
-      if (commentPosted) {
-        // Best-effort follow-up note; the real reason is already on
-        // the issue from the first comment.
-        yield* runSwallow(
-          linear.comment(
-            issue.id,
-            `Note: could not apply \`${config.hitlLabel}\` label — please apply it manually. (${detail})`,
-          ),
-          `${issue.identifier}: HITL follow-up note`,
-        );
-      }
-    }
-
-    if (!commentPosted) {
-      // Last resort: the operator at least sees the reason in their
-      // terminal, even with Linear entirely unreachable.
-      yield* Effect.sync(() => {
-        process.stderr.write(
-          [
-            "",
-            `===== REJECTION REASON FOLLOWS (${issue.identifier}) =====`,
-            reason,
-            "===== END REJECTION REASON =====",
-            "",
-            "",
-          ].join("\n"),
-        );
-      });
-    }
-  });
-
-/**
- * VA-356: explicit-by-intent "swallow this failure" runner for
- * best-effort Linear calls (revert paths, HITL follow-up notes). The
- * pre-Effect code used `.catch(() => undefined)`, which made the
- * decision-to-ignore invisible. Here we log a one-liner so a failed
- * label apply or transition leaves a trail without aborting the
- * drain.
- */
-const runSwallow = (
-  effect: Effect.Effect<unknown, LinearError>,
-  label: string,
-): Effect.Effect<void, never, never> =>
-  effect.pipe(
-    Effect.catchAll((err) =>
-      Effect.logWarning(
-        `${label}: best-effort call failed (${err._tag}): ${err.message}`,
-      ),
-    ),
-    Effect.asVoid,
-  );
-
-const errMsg = (err: unknown): string => {
-  if (err && typeof err === "object" && "message" in err) {
-    const m = (err as { message?: unknown }).message;
-    if (typeof m === "string") return m.split("\n")[0] ?? m;
-  }
-  return String(err);
-};
 
 /**
  * VA-355: render a per-issue verdict trail at the end of the drain so
@@ -426,30 +278,3 @@ const printExitSummary = (
     }
   });
 
-/**
- * VA-358: Whether the agent branch has any commits beyond `base`.
- * Used by the drain loop to distinguish "agent crashed mid-run, after
- * producing real work" (→ HITL) from "agent crashed during startup,
- * no work done" (→ revert to Todo). If the branch doesn't exist or
- * git fails, treat as "no commits" so we revert rather than strand
- * the issue.
- */
-const hasCommits = (
-  repoPath: string,
-  base: string,
-  branch: string,
-): Effect.Effect<boolean, { readonly message: string }, never> =>
-  runExecaScoped(
-    "git",
-    ["rev-list", "--count", `${base}..${branch}`],
-    { cwd: repoPath, reject: false },
-    (err) => ({
-      message: err instanceof Error ? err.message : String(err),
-    }),
-  ).pipe(
-    Effect.map((res) => {
-      const raw = res.stdout;
-      const out = typeof raw === "string" ? raw : "";
-      return Number.parseInt(out.trim(), 10) > 0;
-    }),
-  );
