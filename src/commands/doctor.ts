@@ -577,8 +577,9 @@ async function checkDockerImage(cwd: string): Promise<SectionResult> {
         [
           "run",
           "--rm",
-          imageName,
+          "--entrypoint",
           "bash",
+          imageName,
           "-lc",
           'set -e; which pnpm >/dev/null && printf "HOME=%s\\nXDG_CACHE_HOME=%s\\nTURBO_CACHE_DIR=%s\\n" "$HOME" "$XDG_CACHE_HOME" "$TURBO_CACHE_DIR"',
         ],

@@ -472,8 +472,9 @@ export async function validateLinearConfig(
       ? { kind: "ok", name: want }
       : { kind: "missing", name: want, available: stateNames };
 
+  // Accept labels scoped to this team OR workspace-level labels (team: null).
   const labels = await client.issueLabels({
-    filter: { team: { id: { eq: team.id } } },
+    filter: { or: [{ team: { id: { eq: team.id } } }, { team: { null: true } }] },
   });
   const labelNames = labels.nodes.map((l) => l.name);
   const hitlLabel = labelNames.includes(config.hitlLabel)
