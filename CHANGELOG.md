@@ -4,6 +4,37 @@ All notable changes to runway are documented here. Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); breaking
 changes bump the major.
 
+## 0.6.0 — 2026-05-12
+
+Architectural decomposition release. The five-candidate architecture punch list (VA-361 → VA-365, plus follow-up VA-367) all land, bringing `commands/` to a uniformly thin wiring layer and pushing domain logic into focused modules in `src/`. One new public flag, one bug fix, and the agent default model bumps to Claude Opus 4.7. Seven PRs ([#47](https://github.com/ValescoAgency/runway/pull/47) → [#54](https://github.com/ValescoAgency/runway/pull/54)) plus three direct-master fixes (VA-368, VA-369 — paper-trail filed retroactively).
+
+### Added
+
+- **`runway doctor --check=NAME` flag** ([PR #50](https://github.com/ValescoAgency/runway/pull/50), VA-364). Diagnostic seam with 16 adapters under `src/diagnostics/`. Each adapter declares its name, section, and tier; the runner filters by `--check=NAME` (repeatable) and by the active tier. `--check=help` lists available names grouped by section. Default behavior unchanged — running `runway doctor` with no flags is bit-for-bit identical to the pre-0.6.0 output.
+- **Claude Opus 4.7 is now the default agent model** ([commit `7a542bb`](https://github.com/ValescoAgency/runway/commit/7a542bb), VA-370). Both the implementation pass and the reviewer pass run on `claude-opus-4-7` from this release forward (was `claude-opus-4-6`). Same wire protocol, same pricing tiers.
+
+### Fixed
+
+- **Stale `agent/<issue>` branch reused on retry** ([PR #54](https://github.com/ValescoAgency/runway/pull/54), VA-366). When a prior attempt failed before any commits, the branch tip stayed at the old base — sandcastle would recreate the worktree on the stale tip instead of forking from current `baseBranch` HEAD. `processIssue` now calls `pruneStaleAgentBranch(cwd, base, branch)` after the Linear claim and before the implement loop: branch missing → no-op, branch with commits ahead → preserve, branch with zero commits ahead → `git branch -D`. Reuses `hasCommits` from VA-367.
+- **`runway doctor` container probe always failed** ([commit `69ef540`](https://github.com/ValescoAgency/runway/commit/69ef540), VA-368). `docker run --rm <image> bash -lc ...` was passing `bash` as an arg to the image's `ENTRYPOINT` (`sleep infinity`); the probe never actually ran the shell. Adding `--entrypoint bash` makes the intent unambiguous. Also: workspace-level Linear labels (created without a team scope, like Flightplan's `ready-for-human`) were silently filtered out by the doctor's team-only label filter; the filter is now an OR of workspace + team scope.
+- **`runway upgrade-repo` round-trip artifact `op://vault/item/credential/credential`** ([commit `6ed6ecd`](https://github.com/ValescoAgency/runway/commit/6ed6ecd), VA-369). The op:// item-capture regex used a greedy `[^"]+` that swallowed any trailing `/field`, so re-renders appended a second `/credential` to the already-captured path. The capture is now `([^/"]+)` (stops at first slash) with an optional `(?:/[^"]*)?` to absorb any trailing field. Tests updated to assert the new shape (commit `f107d9d`).
+
+### Internal — architectural decomposition (no behavior change)
+
+- **`orchestrator.ts` 781 → 280 LOC, phases extracted** ([PRs #47, #48](https://github.com/ValescoAgency/runway/pull/48), VA-363). New modules: `src/implement.ts` (`runImplementLoop` + `parseImplVerdict`), `src/review.ts` (`runReviewPass` + `parseReviewVerdict`), `src/finalize.ts` (`finalize`), `src/sandcastle.ts` (`runSandcastle`, `dockerEnv`, `stringifyResult`), `src/hitl.ts` (`flagHitl`, `handleProcessFailure`). `captureDiff` + `captureCommitLog` moved to `src/git.ts`. Each phase has its own narrow Deps interface. `orchestrator.test.ts` 857 → 503 LOC (−41%).
+- **`commands/doctor.ts` 875 → 210 LOC, Diagnostic seam** ([PR #50](https://github.com/ValescoAgency/runway/pull/50), VA-364). 16 adapter files under `src/diagnostics/`, registry-driven runner, render layer in `src/diagnostics/render.ts`. Tier filtering happens at the registry level, not inline in each check.
+- **`commands/init.ts` 554 → 141 LOC + `commands/upgrade-repo.ts` 497 → 103 LOC** ([PRs #51, #52](https://github.com/ValescoAgency/runway/pull/52), VA-365). New `src/scaffolder.ts` + 5 phase files (preflight/dockerfile/image/varlock/verify); new `src/repo-upgrade.ts` (orchestrator + parseOpRefs + renderers). Command files now do argv parsing + a single domain call each.
+- **`prompts.ts` deepened from 6 leaves to 2 deep calls** ([PR #53](https://github.com/ValescoAgency/runway/pull/53), VA-361, also closes VA-362). `renderImplementPrompt({issue, policy, previousIterations})` and `renderReviewPrompt({issue, diff, commits})` replace the load + vars + render chain. `renderForbiddenPathsBullet` absorbed from `policy.ts` (which becomes a pure data module). `buildIterationSummary` + `tailOfMessage` move to `implement.ts` as private helpers. Tests rewritten as contract tests against the deep API.
+- **`hasCommits` moved to `src/git.ts` + `HitlDeps` split** ([PR #49](https://github.com/ValescoAgency/runway/pull/49), VA-367). All git plumbing lives in one module. `HitlDeps = {config, linear}` for `flagHitl`; `FailureRoutingDeps = HitlDeps & {cwd, baseBranch}` for `handleProcessFailure` — each function's surface now matches what it actually uses.
+
+### Internal — release stats
+
+- **11 commits since 0.5.0** across 7 PRs + 3 direct-master fixes.
+- **+4,815 / −2,609 lines** (net +2,206 — almost all of the addition is new focused test files).
+- **176 Vitest specs across 33 files** (up from 100 across 11 files at 0.5.0). New: `src/diagnostics/*.test.ts` (×17), `src/implement.test.ts`, `src/review.test.ts`, `src/hitl.test.ts`, `src/scaffolder.test.ts`, `src/commands/doctor.test.ts`; `src/commands/upgrade-repo.test.ts` → `src/repo-upgrade.test.ts`.
+- **`commands/` uniformly thin**: doctor 210, run 160, init 141, upgrade-repo 103; `upgrade.ts` 229 (self-upgrade — CLI orchestration only, no domain to extract).
+- No new runtime deps. No removed deps.
+
 ## 0.5.0 — 2026-05-11
 
 Effect adoption across the gateway and orchestrator layer. The CLI surface is unchanged; what changes is what happens inside `runway run` when something goes wrong, when a secret gets logged, when the Linear API changes shape, and when an operator wants to ask the orchestrator what it just did. Five PRs ([VA-356](https://github.com/ValescoAgency/runway/pull/41) → [VA-360](https://github.com/ValescoAgency/runway/pull/45)) landed in order, each independently reviewable; see [`docs/effect-adoption-retro.md`](./docs/effect-adoption-retro.md) for the retrospective.
