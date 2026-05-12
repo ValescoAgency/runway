@@ -2,11 +2,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-  DEFAULT_FORBIDDEN_PATHS,
-  loadPolicy,
-  renderForbiddenPathsBullet,
-} from "./policy.js";
+import { DEFAULT_FORBIDDEN_PATHS, loadPolicy } from "./policy.js";
 
 let cwd: string;
 
@@ -66,20 +62,7 @@ describe("loadPolicy (VA-352)", () => {
   });
 });
 
-describe("renderForbiddenPathsBullet (VA-352)", () => {
-  it("renders each forbidden path as a backticked literal and tells the agent to emit IMPL: BLOCKED", () => {
-    const out = renderForbiddenPathsBullet({
-      forbiddenPaths: [".env*", "*.pem"],
-      source: "test",
-    });
-    expect(out).toContain("`.env*`");
-    expect(out).toContain("`*.pem`");
-    expect(out).toContain("IMPL: BLOCKED");
-  });
-
-  it("falls back to a no-restriction sentence when forbiddenPaths is empty", () => {
-    expect(
-      renderForbiddenPathsBullet({ forbiddenPaths: [], source: "test" }),
-    ).toMatch(/No write-path restrictions/);
-  });
-});
+// VA-361: renderForbiddenPathsBullet moved into prompts.ts as a
+// private helper. Its rendering is now covered by the contract tests
+// in src/prompts.test.ts ("renders the policy's forbidden paths into
+// the working-style bullet" / "emits the no-restriction sentence …").

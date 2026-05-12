@@ -5,13 +5,7 @@ import type { Config } from "./config.js";
 import { captureCommitLog } from "./git.js";
 import type { RunwayIssue } from "./linear.js";
 import type { Policy } from "./policy.js";
-import {
-  buildIterationSummary,
-  implementVars,
-  loadImplementPrompt,
-  renderPrompt,
-  tailOfMessage,
-} from "./prompts.js";
+import { renderImplementPrompt } from "./prompts.js";
 import {
   dockerEnv,
   runSandcastle,
@@ -94,18 +88,17 @@ export const runImplementLoop = (
 ): Effect.Effect<ImplementOutcome, { readonly message: string }, never> =>
   Effect.gen(function* () {
     const { config, cwd, baseBranch, policy } = deps;
-    const implementTemplate = yield* Effect.promise(() => loadImplementPrompt());
     const maxIters = Math.max(1, config.maxIterations);
     let prevSummary = "";
     let implementResult: SandcastleRunResult | undefined;
     let implVerdict: ImplVerdict = { kind: "missing" };
 
     for (let iter = 1; iter <= maxIters; iter += 1) {
-      const implementPrompt = renderPrompt(
-        implementTemplate,
-        implementVars(issue, {
-          previousIterations: prevSummary,
+      const implementPrompt = yield* Effect.promise(() =>
+        renderImplementPrompt({
+          issue,
           policy,
+          previousIterations: prevSummary,
         }),
       );
 
@@ -170,3 +163,52 @@ export const runImplementLoop = (
 
     return { kind: "ready", finalResult };
   });
+
+// ---------------------------------------------------------------------------
+// Iteration-accounting helpers
+//
+// VA-361 moved these from prompts.ts. They're about assembling the
+// "previous iterations" block for the NEXT iteration's prompt — an
+// implement-loop concern, not template-rendering. prompts.ts gets a
+// finished `previousIterations` string passed in; how it was built is
+// this module's business.
+// ---------------------------------------------------------------------------
+
+/**
+ * VA-349: build the "## Previous iterations" block that gets prepended
+ * to iteration N+1's prompt. Carries the agent's commit log and the
+ * tail of its final message so the next iteration doesn't re-explore
+ * the repo from scratch.
+ */
+function buildIterationSummary(args: {
+  iterationsRun: number;
+  commits: string;
+  finalMessageTail: string;
+}): string {
+  const { iterationsRun, commits, finalMessageTail } = args;
+  return [
+    "## Previous iterations",
+    "",
+    `You have already completed ${iterationsRun} iteration(s) on this issue.`,
+    "Do **not** re-explore the repository — pick up where the last iteration left off.",
+    "",
+    "### Commits so far on this branch",
+    "",
+    "```",
+    commits.trim() || "(no commits yet)",
+    "```",
+    "",
+    "### Tail of the last iteration's final message",
+    "",
+    "```",
+    finalMessageTail.trim() || "(no output captured)",
+    "```",
+    "",
+  ].join("\n");
+}
+
+/** Keep the tail of an iteration's stdout small enough to fit alongside the prompt. */
+function tailOfMessage(stdout: string, maxChars = 2000): string {
+  if (stdout.length <= maxChars) return stdout;
+  return `…(earlier output truncated)\n${stdout.slice(-maxChars)}`;
+}

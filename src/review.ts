@@ -4,7 +4,7 @@ import { Effect } from "effect";
 import type { Config } from "./config.js";
 import { captureCommitLog, captureDiff } from "./git.js";
 import type { RunwayIssue } from "./linear.js";
-import { loadReviewPrompt, renderPrompt, reviewVars } from "./prompts.js";
+import { renderReviewPrompt } from "./prompts.js";
 import {
   dockerEnv,
   runSandcastle,
@@ -98,10 +98,8 @@ export const runReviewPass = (
     const { config, cwd, baseBranch } = deps;
     const diff = yield* captureDiff(cwd, baseBranch, branch);
     const commitLog = yield* captureCommitLog(cwd, baseBranch, branch);
-    const reviewTemplate = yield* Effect.promise(() => loadReviewPrompt());
-    const reviewPrompt = renderPrompt(
-      reviewTemplate,
-      reviewVars({ issue, diff, commits: commitLog }),
+    const reviewPrompt = yield* Effect.promise(() =>
+      renderReviewPrompt({ issue, diff, commits: commitLog }),
     );
     const reviewResult = yield* runSandcastle({
       agent: claudeCode("claude-opus-4-6"),

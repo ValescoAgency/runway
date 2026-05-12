@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import type { RunwayIssue } from "./linear.js";
-import { renderForbiddenPathsBullet, type Policy } from "./policy.js";
+import type { Policy } from "./policy.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // Prompts ship with the runway package, NOT in the target repo's
@@ -11,21 +11,60 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 //   runway/src/prompts.ts → runway/prompts/
 const PROMPT_DIR = join(__dirname, "..", "prompts");
 
-export async function loadImplementPrompt(): Promise<string> {
+// ---------------------------------------------------------------------------
+// VA-361: deep public API. Callers get a single async call that returns
+// the finished prompt string. The load → varsBuilder → renderPrompt
+// chain stays internal — bug surface that used to live at every call
+// site (forgot to load? wrong var? skipped policy?) collapses into
+// this module.
+// ---------------------------------------------------------------------------
+
+/**
+ * Render the impl-agent prompt for a single iteration. `policy` is
+ * threaded through so the agent's working-style denylist matches the
+ * effective policy for this run (subsumes the renderForbiddenPathsBullet
+ * concern that previously lived in policy.ts).
+ */
+export async function renderImplementPrompt(args: {
+  issue: RunwayIssue;
+  policy: Policy;
+  /** Empty for iteration 1; structured summary for 2+ (built by implement.ts). */
+  previousIterations: string;
+}): Promise<string> {
+  const template = await loadImplementPrompt();
+  return renderPrompt(template, implementVars(args));
+}
+
+/**
+ * Render the reviewer-agent prompt for a single review pass.
+ */
+export async function renderReviewPrompt(args: {
+  issue: RunwayIssue;
+  diff: string;
+  commits: string;
+}): Promise<string> {
+  const template = await loadReviewPrompt();
+  return renderPrompt(template, reviewVars(args));
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+async function loadImplementPrompt(): Promise<string> {
   return readFile(join(PROMPT_DIR, "implement.md"), "utf8");
 }
 
-export async function loadReviewPrompt(): Promise<string> {
+async function loadReviewPrompt(): Promise<string> {
   return readFile(join(PROMPT_DIR, "review.md"), "utf8");
 }
 
 /**
- * Render a prompt by replacing all `{{KEY}}` placeholders with values
- * from `vars`. We do the substitution here (instead of relying on
- * sandcastle's promptArgs) because we pass the prompt inline and want
- * one canonical place to template.
+ * Replace all `{{KEY}}` placeholders with values from `vars`. Done
+ * here (not in sandcastle's promptArgs) so the prompt can be passed
+ * inline with one canonical substitution rule.
  */
-export function renderPrompt(
+function renderPrompt(
   template: string,
   vars: Record<string, string>,
 ): string {
@@ -34,65 +73,21 @@ export function renderPrompt(
   );
 }
 
-export function implementVars(
-  issue: RunwayIssue,
-  opts: { previousIterations?: string; policy?: Policy } = {},
-): Record<string, string> {
+function implementVars(args: {
+  issue: RunwayIssue;
+  policy: Policy;
+  previousIterations: string;
+}): Record<string, string> {
   return {
-    ISSUE_IDENTIFIER: issue.identifier,
-    ISSUE_TITLE: issue.title,
-    ISSUE_DESCRIPTION: issue.description || "(no description)",
-    // VA-349: empty for iteration 1, a structured summary for 2+.
-    PREVIOUS_ITERATIONS: opts.previousIterations ?? "",
-    // VA-352: render the working-style denylist from the active policy
-    // so the agent never sees a hardcoded list that diverges from what
-    // runway actually enforces.
-    POLICY_FORBIDDEN_BULLET: opts.policy
-      ? renderForbiddenPathsBullet(opts.policy)
-      : "",
+    ISSUE_IDENTIFIER: args.issue.identifier,
+    ISSUE_TITLE: args.issue.title,
+    ISSUE_DESCRIPTION: args.issue.description || "(no description)",
+    PREVIOUS_ITERATIONS: args.previousIterations,
+    POLICY_FORBIDDEN_BULLET: renderForbiddenPathsBullet(args.policy),
   };
 }
 
-/**
- * VA-349: build the "## Previous iterations" block that gets prepended
- * to iteration N+1's prompt. Carries the agent's commit log and the
- * tail of its final message so the next iteration doesn't re-explore
- * the repo from scratch.
- */
-export function buildIterationSummary(args: {
-  iterationsRun: number;
-  commits: string;
-  finalMessageTail: string;
-}): string {
-  const { iterationsRun, commits, finalMessageTail } = args;
-  return [
-    "## Previous iterations",
-    "",
-    `You have already completed ${iterationsRun} iteration(s) on this issue.`,
-    "Do **not** re-explore the repository — pick up where the last iteration left off.",
-    "",
-    "### Commits so far on this branch",
-    "",
-    "```",
-    commits.trim() || "(no commits yet)",
-    "```",
-    "",
-    "### Tail of the last iteration's final message",
-    "",
-    "```",
-    finalMessageTail.trim() || "(no output captured)",
-    "```",
-    "",
-  ].join("\n");
-}
-
-/** Keep the tail of an iteration's stdout small enough to fit alongside the prompt. */
-export function tailOfMessage(stdout: string, maxChars = 2000): string {
-  if (stdout.length <= maxChars) return stdout;
-  return `…(earlier output truncated)\n${stdout.slice(-maxChars)}`;
-}
-
-export function reviewVars(args: {
+function reviewVars(args: {
   issue: RunwayIssue;
   diff: string;
   commits: string;
@@ -104,4 +99,19 @@ export function reviewVars(args: {
     DIFF: args.diff || "(empty diff)",
     COMMITS: args.commits || "(no commits)",
   };
+}
+
+/**
+ * VA-352 (absorbed from policy.ts in VA-361): render the bullet
+ * sentence the impl prompt shows the agent. Stable formatting so a
+ * missing path is visible in a diff. Lives here now because rendering
+ * for the impl prompt is a prompt-module concern; policy.ts stays a
+ * pure data module.
+ */
+function renderForbiddenPathsBullet(policy: Policy): string {
+  if (policy.forbiddenPaths.length === 0) {
+    return "- (No write-path restrictions for this repo. Use judgment.)";
+  }
+  const quoted = policy.forbiddenPaths.map((p) => `\`${p}\``).join(", ");
+  return `- Never modify ${quoted}. If the issue's acceptance criteria require modifying one of these paths, **stop and emit \`IMPL: BLOCKED — issue requires modifying <path>, which working-style policy forbids\`** — do not silently skip the work.`;
 }
