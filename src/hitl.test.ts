@@ -47,6 +47,7 @@ const config: Config = {
   hitlLabel: "needs-human",
   maxIterations: 1,
   implTurns: 1,
+  reviewRetries: 0,
 };
 
 const issue: RunwayIssue = {

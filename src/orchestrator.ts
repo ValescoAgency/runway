@@ -8,7 +8,10 @@ import type { LinearError, LinearGateway, RunwayIssue } from "./linear.js";
 import { loadPolicy, type Policy } from "./policy.js";
 import { flagHitl, handleProcessFailure } from "./hitl.js";
 import { runImplementLoop } from "./implement.js";
-import { formatPriorFeedback } from "./prompts.js";
+import {
+  formatInRunReviewerFeedback,
+  formatPriorFeedback,
+} from "./prompts.js";
 import { runReviewPass } from "./review.js";
 import { finalize, formatRebaseConflictReason } from "./finalize.js";
 
@@ -358,34 +361,82 @@ const processIssue = (
       ),
     );
 
-    const impl = yield* runImplementLoop(
-      issue,
-      { ...deps, priorFeedback },
-      branch,
-    );
-    if (impl.kind === "hitl") {
-      yield* flagHitl(issue, deps, impl.reason);
-      return { kind: "hitl", detail: impl.reason };
-    }
+    // VA-418: in-run review-rejection retry loop. Each iteration runs
+    // impl, then review; on `rejected-retry` (and remaining budget),
+    // we append the rejection reason to `inRunRejections`, re-render
+    // the impl prompt with the full chain in the
+    // `{{IN_RUN_REVIEWER_FEEDBACK}}` slot, and try again. `attempt`
+    // counts the impl+review pairs we've launched; the budget is
+    // `1 + config.reviewRetries`, matching VA-414's pattern (default
+    // 1 means up to 2 total pairs per drain pickup). `0` disables the
+    // loop entirely: every rejection escalates immediately.
+    const retryBudget = Math.max(0, config.reviewRetries);
+    const inRunRejections: string[] = [];
+    let attempt = 0;
+    while (true) {
+      attempt += 1;
+      const impl = yield* runImplementLoop(
+        issue,
+        {
+          ...deps,
+          priorFeedback,
+          inRunReviewerFeedback: formatInRunReviewerFeedback(inRunRejections),
+        },
+        branch,
+      );
+      if (impl.kind === "hitl") {
+        yield* flagHitl(issue, deps, impl.reason);
+        return { kind: "hitl", detail: impl.reason };
+      }
 
-    const review = yield* runReviewPass(issue, deps, branch);
-    if (review.kind === "hitl") {
-      yield* flagHitl(issue, deps, review.reason);
-      return { kind: "hitl", detail: review.reason };
+      const review = yield* runReviewPass(issue, deps, branch);
+      if (review.kind === "approved") {
+        // VA-419: finalize may report `rebase-conflict` when the base
+        // branch advanced during this drain and the post-review rebase
+        // hit a conflict. Route to HITL with the conflicted-file list
+        // — reviewer's APPROVED verdict is preserved in the message so
+        // the operator knows the diff was good before the conflict
+        // surfaced.
+        const finalized = yield* finalize(issue, deps, branch);
+        if (finalized.kind === "rebase-conflict") {
+          const reason = formatRebaseConflictReason(finalized);
+          yield* flagHitl(issue, deps, reason);
+          return { kind: "hitl", detail: reason };
+        }
+        return finalized;
+      }
+      if (review.kind === "hitl") {
+        // Crashed / truncated marker — distinct from a real rejection.
+        yield* flagHitl(issue, deps, review.reason);
+        return { kind: "hitl", detail: review.reason };
+      }
+      if (review.kind === "rejected-hitl") {
+        // Reviewer judged the rejection to need human input. Escalate
+        // immediately — no more impl attempts this drain.
+        const reason = `Sub-agent review rejected (needs human judgment): ${review.reason}`;
+        yield* flagHitl(issue, deps, reason);
+        return { kind: "hitl", detail: reason };
+      }
+      // rejected-retry: mechanically fixable. Hand the reason back to
+      // the impl agent on the next attempt, unless the retry budget is
+      // exhausted.
+      inRunRejections.push(review.reason);
+      if (attempt > retryBudget) {
+        // Budget exhausted. Escalate to HITL with a message that
+        // names the FINAL rejection reason plus the chain length so
+        // the operator can see how many attempts we burned through.
+        const reason = `Ran out of review retries (${attempt} attempt${
+          attempt === 1 ? "" : "s"
+        }); last rejection: ${review.reason}`;
+        yield* flagHitl(issue, deps, reason);
+        return { kind: "hitl", detail: reason };
+      }
+      yield* Effect.logInfo(
+        `${issue.identifier}: review rejected-retry; retrying impl with reviewer feedback (attempt ${
+          attempt + 1
+        } of ${retryBudget + 1})`,
+      );
     }
-
-    // VA-419: finalize may report `rebase-conflict` when the base
-    // branch advanced during this drain and the post-review rebase hit
-    // a conflict. Route to HITL with the conflicted-file list — the
-    // reviewer's APPROVED verdict is preserved in the message so the
-    // operator knows the diff was good before the conflict surfaced.
-    const finalized = yield* finalize(issue, deps, branch);
-    if (finalized.kind === "rebase-conflict") {
-      const reason = formatRebaseConflictReason(finalized);
-      yield* flagHitl(issue, deps, reason);
-      return { kind: "hitl", detail: reason };
-    }
-    return finalized;
   });
 
 

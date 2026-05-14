@@ -78,6 +78,21 @@ export interface RunwayConfig {
    */
   readonly implTurns: number;
   /**
+   * VA-418: in-run review-rejection retry budget. When the reviewer
+   * emits `REVIEW: REJECTED-RETRY — <reason>` (or the legacy bare
+   * `REVIEW: REJECTED — <reason>`), runway re-runs the impl agent
+   * with the rejection text in the `{{IN_RUN_REVIEWER_FEEDBACK}}`
+   * slot, then re-runs review. `reviewRetries` caps the number of
+   * additional impl+review attempts per drain pickup — default `1`
+   * means up to 2 total impl+review pairs. `0` disables retries
+   * entirely (every rejection escalates immediately, useful as a
+   * kill-switch). Source: `RUNWAY_REVIEW_RETRIES` env var or
+   * `--review-retries N` CLI flag on `runway run`. Distinct from
+   * `maxIterations` (outer impl-marker-missing loop) and `implTurns`
+   * (inner sandcastle turn budget).
+   */
+  readonly reviewRetries: number;
+  /**
    * VA-383: Linear-user names whose comments on an issue get surfaced
    * to the impl agent as "Review feedback from prior attempts."
    * `undefined` (the default) means runway uses the Linear user the
@@ -138,6 +153,16 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
       validation: (n): n is number => n > 0,
     }),
   ),
+  // VA-418: zero is a valid value here (operator kill-switch) so the
+  // validation accepts >= 0, unlike implTurns/maxIterations which
+  // both require >= 1.
+  reviewRetries: EConfig.integer("RUNWAY_REVIEW_RETRIES").pipe(
+    EConfig.withDefault(1),
+    EConfig.validate({
+      message: "RUNWAY_REVIEW_RETRIES must be a non-negative integer",
+      validation: (n): n is number => n >= 0,
+    }),
+  ),
   commentAuthorAllowlist: EConfig.option(
     EConfig.string("RUNWAY_COMMENT_AUTHOR_ALLOWLIST"),
   ),
@@ -155,6 +180,7 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
       hitlLabel: raw.hitlLabel,
       maxIterations: raw.maxIterations,
       implTurns: raw.implTurns,
+      reviewRetries: raw.reviewRetries,
       commentAuthorAllowlist: Option.getOrUndefined(
         raw.commentAuthorAllowlist,
       )

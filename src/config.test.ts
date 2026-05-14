@@ -18,6 +18,7 @@ describe("VA-359 — Effect.Config + Redacted secrets", () => {
     expect(cfg.hitlLabel).toBe("ready-for-human");
     expect(cfg.maxIterations).toBe(5);
     expect(cfg.implTurns).toBe(3);
+    expect(cfg.reviewRetries).toBe(1);
     // Optionals flatten Option → undefined.
     expect(cfg.opServiceAccountToken).toBeUndefined();
     expect(cfg.linearProject).toBeUndefined();
@@ -88,6 +89,31 @@ describe("VA-359 — Effect.Config + Redacted secrets", () => {
       RUNWAY_IMPL_TURNS: "5",
     });
     expect(cfg.implTurns).toBe(5);
+  });
+
+  it("RUNWAY_REVIEW_RETRIES=0 parses (kill-switch — VA-418)", () => {
+    // 0 is intentionally valid here: it disables the in-run
+    // review-rejection retry loop entirely. Unlike implTurns and
+    // maxIterations, which require >= 1.
+    const cfg = loadConfig({
+      LINEAR_API_KEY: "lin_test",
+      RUNWAY_REVIEW_RETRIES: "0",
+    });
+    expect(cfg.reviewRetries).toBe(0);
+  });
+
+  it("RUNWAY_REVIEW_RETRIES=3 parses to the integer (VA-418)", () => {
+    const cfg = loadConfig({
+      LINEAR_API_KEY: "lin_test",
+      RUNWAY_REVIEW_RETRIES: "3",
+    });
+    expect(cfg.reviewRetries).toBe(3);
+  });
+
+  it("RUNWAY_REVIEW_RETRIES=-1 fails validation (must be non-negative — VA-418)", () => {
+    expect(() =>
+      loadConfig({ LINEAR_API_KEY: "lin_test", RUNWAY_REVIEW_RETRIES: "-1" }),
+    ).toThrow(/non-negative integer/);
   });
 
   it("env-driven overrides for status names and HITL label apply", () => {

@@ -13,6 +13,7 @@ export interface RunOptions {
   readonly project?: string;
   readonly allowPaths?: readonly string[];
   readonly implTurns?: number;
+  readonly reviewRetries?: number;
 }
 
 export function parseRunArgs(argv: readonly string[]): RunOptions {
@@ -21,6 +22,7 @@ export function parseRunArgs(argv: readonly string[]): RunOptions {
     project?: string;
     allowPaths?: string[];
     implTurns?: number;
+    reviewRetries?: number;
   } = {};
   const collectAllow = (raw: string): void => {
     const paths = raw
@@ -73,6 +75,26 @@ export function parseRunArgs(argv: readonly string[]): RunOptions {
         throw new Error(`--impl-turns must be a positive integer, got "${v}"`);
       }
       opts.implTurns = n;
+    } else if (a === "--review-retries") {
+      const v = argv[i + 1];
+      if (!v) throw new Error("--review-retries requires a number");
+      const n = Number.parseInt(v, 10);
+      if (!Number.isFinite(n) || n < 0) {
+        throw new Error(
+          `--review-retries must be a non-negative integer, got "${v}"`,
+        );
+      }
+      opts.reviewRetries = n;
+      i += 1;
+    } else if (a?.startsWith("--review-retries=")) {
+      const v = a.slice("--review-retries=".length);
+      const n = Number.parseInt(v, 10);
+      if (!Number.isFinite(n) || n < 0) {
+        throw new Error(
+          `--review-retries must be a non-negative integer, got "${v}"`,
+        );
+      }
+      opts.reviewRetries = n;
     } else if (a === "--help" || a === "-h") {
       printRunUsage();
       process.exit(0);
@@ -107,6 +129,14 @@ OPTIONS
                   (how many turns the Claude agent gets per attempt
                   before it has to signal IMPL: DONE / BLOCKED).
                   Overrides RUNWAY_IMPL_TURNS. Default: 3.
+  --review-retries N
+                  In-run review-rejection retry budget. When the
+                  reviewer emits REVIEW: REJECTED-RETRY — <reason>
+                  (mechanically fixable), runway re-runs the impl
+                  agent with the reason in {{IN_RUN_REVIEWER_FEEDBACK}}
+                  and re-runs review. N caps the extra impl+review
+                  pairs per drain pickup. 0 disables retries entirely.
+                  Overrides RUNWAY_REVIEW_RETRIES. Default: 1.
   --help, -h      Show this help.
 
 ENVIRONMENT
@@ -127,6 +157,11 @@ ENVIRONMENT
   RUNWAY_IMPL_TURNS           default 3  — sandcastle inner turn
                               budget per impl phase. Overridden by
                               --impl-turns.
+  RUNWAY_REVIEW_RETRIES       default 1  — review-rejection retry
+                              loop. On REVIEW: REJECTED-RETRY, runway
+                              re-runs impl with the rejection in the
+                              prompt, then re-runs review. 0 disables
+                              entirely. Overridden by --review-retries.
 `);
 }
 
@@ -161,6 +196,9 @@ export async function runCommand(argv: readonly string[]): Promise<void> {
       ...baseConfig,
       ...(opts.project ? { linearProject: opts.project } : {}),
       ...(opts.implTurns !== undefined ? { implTurns: opts.implTurns } : {}),
+      ...(opts.reviewRetries !== undefined
+        ? { reviewRetries: opts.reviewRetries }
+        : {}),
     };
 
     const scope = config.linearProject

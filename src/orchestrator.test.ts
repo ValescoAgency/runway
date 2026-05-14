@@ -23,6 +23,10 @@ vi.mock("./prompts.js", () => ({
   // prior-feedback wiring — the orchestrator-test fixtures predate
   // VA-383 and shouldn't have to reason about comment history.
   formatPriorFeedback: vi.fn().mockReturnValue(""),
+  // VA-418: same default for the in-run reviewer-feedback formatter.
+  // The retry-loop tests assert on the number of sandcastle calls
+  // and exit shape — they don't care about the formatted string.
+  formatInRunReviewerFeedback: vi.fn().mockReturnValue(""),
 }));
 
 const { drainQueue: drainQueueEffect } = await import("./orchestrator.js");
@@ -93,6 +97,11 @@ const config: Config = {
   hitlLabel: "needs-human",
   maxIterations: 1,
   implTurns: 1,
+  // VA-418: default review-retries budget for tests is 0 — the
+  // legacy fixtures predate the in-run retry loop and shouldn't
+  // accidentally fire it. Tests exercising retry behavior override
+  // with `{ ...config, reviewRetries: N }` explicitly.
+  reviewRetries: 0,
 };
 
 const issue: RunwayIssue = {
@@ -480,6 +489,251 @@ describe("drainQueue iteration memory (VA-349)", () => {
       (c) => Array.isArray(c[1]) && (c[1] as string[])[0] === "log",
     );
     expect(logCalls).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests — VA-418 in-run review-rejection retry loop
+// ---------------------------------------------------------------------------
+
+describe("drainQueue review-rejection retry loop (VA-418)", () => {
+  it("on REJECTED-RETRY (budget remaining), re-runs impl with reviewer feedback and re-runs review", async () => {
+    routeExeca({ revListCount: "1" });
+    // Pair 1: impl DONE then review REJECTED-RETRY.
+    // Pair 2: impl DONE then review APPROVED.
+    sandcastleRunMock
+      .mockResolvedValueOnce({
+        stdout: "first impl pass\nIMPL: DONE",
+        commits: [{ sha: "abc" }],
+      })
+      .mockResolvedValueOnce({
+        stdout:
+          "REVIEW: REJECTED-RETRY — normalize both timestamps before the lex compare",
+        commits: [],
+      })
+      .mockResolvedValueOnce({
+        stdout: "second impl pass with fix\nIMPL: DONE",
+        commits: [{ sha: "abc" }, { sha: "def" }],
+      })
+      .mockResolvedValueOnce({
+        stdout: "REVIEW: APPROVED",
+        commits: [],
+      });
+
+    const linear = makeLinear();
+    linear.fetchReady
+      .mockReturnValueOnce(Effect.succeed([issue]))
+      .mockReturnValueOnce(Effect.succeed([]));
+
+    const github = makeGithub();
+    const result = await drainQueue({
+      config: { ...config, reviewRetries: 1 },
+      linear: asLinear(linear),
+      github,
+      cwd: "/tmp/repo",
+    });
+
+    expect(result).toMatchObject({
+      attempts: 1,
+      opened: 1,
+      hitl: 0,
+      errored: 0,
+    });
+
+    // Two impl + two review = 4 sandcastle calls.
+    expect(sandcastleRunMock).toHaveBeenCalledTimes(4);
+
+    const names = sandcastleRunMock.mock.calls.map(
+      (c) => (c[0] as { name?: string }).name ?? "",
+    );
+    expect(names).toEqual([
+      "impl-VA-312-iter-1",
+      "review-VA-312",
+      "impl-VA-312-iter-1",
+      "review-VA-312",
+    ]);
+    expect(github.openPullRequest).toHaveBeenCalled();
+  });
+
+  it("on REJECTED-RETRY with budget exhausted, escalates to HITL naming the FINAL rejection and chain length", async () => {
+    routeExeca({ revListCount: "1" });
+    sandcastleRunMock
+      .mockResolvedValueOnce({
+        stdout: "first impl\nIMPL: DONE",
+        commits: [{ sha: "abc" }],
+      })
+      .mockResolvedValueOnce({
+        stdout: "REVIEW: REJECTED-RETRY — fix the timestamp lex compare",
+        commits: [],
+      })
+      .mockResolvedValueOnce({
+        stdout: "second impl\nIMPL: DONE",
+        commits: [{ sha: "abc" }, { sha: "def" }],
+      })
+      .mockResolvedValueOnce({
+        stdout: "REVIEW: REJECTED-RETRY — still doesn't handle DST",
+        commits: [],
+      });
+
+    const linear = makeLinear();
+    linear.fetchReady
+      .mockReturnValueOnce(Effect.succeed([issue]))
+      .mockReturnValueOnce(Effect.succeed([]));
+
+    const result = await drainQueue({
+      config: { ...config, reviewRetries: 1 },
+      linear: asLinear(linear),
+      github: makeGithub(),
+      cwd: "/tmp/repo",
+    });
+
+    expect(result).toMatchObject({
+      attempts: 1,
+      opened: 0,
+      hitl: 1,
+      errored: 0,
+    });
+    expect(sandcastleRunMock).toHaveBeenCalledTimes(4);
+
+    const hitlComment = linear.comment.mock.calls
+      .map((c) => String(c[1]))
+      .find((b) => /flagged for human review/.test(b));
+    expect(hitlComment).toBeDefined();
+    // Names the FINAL rejection reason and the chain length so the
+    // operator can see how many attempts we burned.
+    expect(hitlComment).toMatch(/Ran out of review retries \(2 attempts\)/);
+    expect(hitlComment).toMatch(/still doesn't handle DST/);
+    expect(linear.applyLabel).toHaveBeenCalledWith("issue-123", "needs-human");
+  });
+
+  it("on REJECTED-HITL, escalates immediately — no second impl attempt", async () => {
+    routeExeca({ revListCount: "1" });
+    sandcastleRunMock
+      .mockResolvedValueOnce({
+        stdout: "first impl\nIMPL: DONE",
+        commits: [{ sha: "abc" }],
+      })
+      .mockResolvedValueOnce({
+        stdout:
+          "REVIEW: REJECTED-HITL — diff implements a different feature than the issue describes; needs a product call",
+        commits: [],
+      });
+
+    const linear = makeLinear();
+    linear.fetchReady
+      .mockReturnValueOnce(Effect.succeed([issue]))
+      .mockReturnValueOnce(Effect.succeed([]));
+
+    const result = await drainQueue({
+      // Generous retry budget — REJECTED-HITL must short-circuit it
+      // regardless.
+      config: { ...config, reviewRetries: 5 },
+      linear: asLinear(linear),
+      github: makeGithub(),
+      cwd: "/tmp/repo",
+    });
+
+    expect(result).toMatchObject({
+      attempts: 1,
+      opened: 0,
+      hitl: 1,
+      errored: 0,
+    });
+    // One impl + one review = 2 sandcastle calls. No retry.
+    expect(sandcastleRunMock).toHaveBeenCalledTimes(2);
+
+    const hitlComment = linear.comment.mock.calls
+      .map((c) => String(c[1]))
+      .find((b) => /flagged for human review/.test(b));
+    expect(hitlComment).toMatch(/needs human judgment/);
+    expect(hitlComment).toMatch(/implements a different feature/);
+  });
+
+  it("RUNWAY_REVIEW_RETRIES=0 disables retries entirely — every rejection goes straight to HITL", async () => {
+    routeExeca({ revListCount: "1" });
+    sandcastleRunMock
+      .mockResolvedValueOnce({
+        stdout: "first impl\nIMPL: DONE",
+        commits: [{ sha: "abc" }],
+      })
+      .mockResolvedValueOnce({
+        stdout:
+          "REVIEW: REJECTED-RETRY — add the missing scheme guard (would be mechanically fixable)",
+        commits: [],
+      });
+
+    const linear = makeLinear();
+    linear.fetchReady
+      .mockReturnValueOnce(Effect.succeed([issue]))
+      .mockReturnValueOnce(Effect.succeed([]));
+
+    const result = await drainQueue({
+      // Kill-switch: zero retries. Even though the marker is RETRY,
+      // the budget is exhausted after the first review and we
+      // escalate immediately.
+      config: { ...config, reviewRetries: 0 },
+      linear: asLinear(linear),
+      github: makeGithub(),
+      cwd: "/tmp/repo",
+    });
+
+    expect(result).toMatchObject({
+      attempts: 1,
+      opened: 0,
+      hitl: 1,
+      errored: 0,
+    });
+    expect(sandcastleRunMock).toHaveBeenCalledTimes(2);
+
+    const hitlComment = linear.comment.mock.calls
+      .map((c) => String(c[1]))
+      .find((b) => /flagged for human review/.test(b));
+    // Single attempt → "1 attempt" (singular), naming the rejection.
+    expect(hitlComment).toMatch(/Ran out of review retries \(1 attempt\)/);
+    expect(hitlComment).toMatch(/add the missing scheme guard/);
+  });
+
+  it("legacy bare REVIEW: REJECTED maps to rejected-retry and flows through the retry loop (VA-418 back-compat)", async () => {
+    routeExeca({ revListCount: "1" });
+    sandcastleRunMock
+      .mockResolvedValueOnce({
+        stdout: "first impl\nIMPL: DONE",
+        commits: [{ sha: "abc" }],
+      })
+      .mockResolvedValueOnce({
+        // Legacy marker — no `-RETRY` / `-HITL` suffix.
+        stdout: "REVIEW: REJECTED — withAudit swallows errors",
+        commits: [],
+      })
+      .mockResolvedValueOnce({
+        stdout: "second impl, fixed it\nIMPL: DONE",
+        commits: [{ sha: "abc" }, { sha: "def" }],
+      })
+      .mockResolvedValueOnce({
+        stdout: "REVIEW: APPROVED",
+        commits: [],
+      });
+
+    const linear = makeLinear();
+    linear.fetchReady
+      .mockReturnValueOnce(Effect.succeed([issue]))
+      .mockReturnValueOnce(Effect.succeed([]));
+
+    const result = await drainQueue({
+      config: { ...config, reviewRetries: 1 },
+      linear: asLinear(linear),
+      github: makeGithub(),
+      cwd: "/tmp/repo",
+    });
+
+    expect(result).toMatchObject({
+      attempts: 1,
+      opened: 1,
+      hitl: 0,
+      errored: 0,
+    });
+    // Legacy REJECTED flowed through retry → second impl → APPROVED → PR.
+    expect(sandcastleRunMock).toHaveBeenCalledTimes(4);
   });
 });
 

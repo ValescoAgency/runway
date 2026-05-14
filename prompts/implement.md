@@ -8,6 +8,8 @@ You are an autonomous coding agent working on a single Linear issue.
 
 {{PRIOR_REVIEW_FEEDBACK}}
 
+{{IN_RUN_REVIEWER_FEEDBACK}}
+
 {{PREVIOUS_ITERATIONS}}
 
 # Repository context
@@ -21,6 +23,15 @@ prior attempts* section above. Your job is to produce a final state
 that addresses every blocker in that feedback, replacing the existing
 commits if they would re-introduce a rejected design. Do not treat
 pre-existing commits as authoritative.
+
+If a section titled `Reviewer feedback from this run` is present
+above, the previous iteration of this drain produced commits that
+review rejected. Every blocker in that section is from review of YOUR
+work this run — treat it as the highest-priority signal and address
+each one before signaling `IMPL: DONE` again. In-run feedback ranks
+above cross-drain *Review feedback from prior attempts*; the latter
+is guidance from earlier runs, the former is the reviewer's verdict
+on the diff you just produced.
 
 # What done looks like
 
