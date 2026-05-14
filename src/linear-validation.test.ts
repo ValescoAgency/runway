@@ -127,11 +127,11 @@ describe("validateLinearConfig (VA-354)", () => {
 
 describe("config default (VA-354)", () => {
   it("defaults hitlLabel to ready-for-human (Flightplan canonical)", async () => {
-    vi.resetModules();
-    // Ensure no override is in env when re-loading config.
-    delete process.env.RUNWAY_HITL_LABEL;
-    process.env.LINEAR_API_KEY = "test";
+    // VA-411: pass an explicit env so a host-exported
+    // `RUNWAY_HITL_LABEL` can't flip the assertion.
     const { loadConfig } = await import("./config.js");
-    expect(loadConfig().hitlLabel).toBe("ready-for-human");
+    expect(loadConfig({ LINEAR_API_KEY: "test" }).hitlLabel).toBe(
+      "ready-for-human",
+    );
   });
 });

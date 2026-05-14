@@ -1,30 +1,17 @@
 import { Effect, Redacted } from "effect";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
-// VA-359: the file imports `Effect.Config` lazily — the constructor
-// reads `process.env` only when the config Effect runs, so we can set
-// vars in the test body and call `loadConfig()` directly.
-
-const originalEnv = { ...process.env };
-
-afterEach(() => {
-  // Restore env to a clean slate between tests so each one is
-  // self-contained.
-  for (const key of Object.keys(process.env)) {
-    if (!(key in originalEnv)) delete process.env[key];
-  }
-  for (const [key, value] of Object.entries(originalEnv)) {
-    if (value !== undefined) process.env[key] = value;
-  }
-});
+// VA-411: every test passes an explicit env map to `loadConfig` /
+// `makeConfigLive` so the host process.env (direnv-exported
+// `RUNWAY_*` vars, etc.) can't leak in and break assertions. See
+// VA-359 for the underlying Effect.Config + Redacted setup.
+import { ConfigTag, loadConfig, makeConfigLive } from "./config.js";
 
 describe("VA-359 — Effect.Config + Redacted secrets", () => {
-  it("loads a minimal valid config from env vars", async () => {
-    process.env.LINEAR_API_KEY = "lin_api_secret_should_not_leak";
-    delete process.env.OP_SERVICE_ACCOUNT_TOKEN;
-    delete process.env.RUNWAY_LINEAR_TEAM;
-    const { loadConfig } = await import("./config.js");
-    const cfg = loadConfig();
+  it("loads a minimal valid config from env vars", () => {
+    const cfg = loadConfig({
+      LINEAR_API_KEY: "lin_api_secret_should_not_leak",
+    });
     // Defaults applied.
     expect(cfg.linearTeam).toBe("VA");
     expect(cfg.readyStatus).toBe("Todo");
@@ -36,10 +23,10 @@ describe("VA-359 — Effect.Config + Redacted secrets", () => {
     expect(cfg.baseBranch).toBeUndefined();
   });
 
-  it("LINEAR_API_KEY is Redacted — toString and JSON.stringify both yield <redacted>, not the raw value", async () => {
-    process.env.LINEAR_API_KEY = "lin_api_secret_should_not_leak";
-    const { loadConfig } = await import("./config.js");
-    const cfg = loadConfig();
+  it("LINEAR_API_KEY is Redacted — toString and JSON.stringify both yield <redacted>, not the raw value", () => {
+    const cfg = loadConfig({
+      LINEAR_API_KEY: "lin_api_secret_should_not_leak",
+    });
     // The whole point: the raw secret value never appears in any
     // string render of the config.
     expect(String(cfg.linearApiKey)).not.toContain(
@@ -56,11 +43,11 @@ describe("VA-359 — Effect.Config + Redacted secrets", () => {
     );
   });
 
-  it("OP_SERVICE_ACCOUNT_TOKEN is Redacted when present", async () => {
-    process.env.LINEAR_API_KEY = "lin_test";
-    process.env.OP_SERVICE_ACCOUNT_TOKEN = "op_secret_token_should_not_leak";
-    const { loadConfig } = await import("./config.js");
-    const cfg = loadConfig();
+  it("OP_SERVICE_ACCOUNT_TOKEN is Redacted when present", () => {
+    const cfg = loadConfig({
+      LINEAR_API_KEY: "lin_test",
+      OP_SERVICE_ACCOUNT_TOKEN: "op_secret_token_should_not_leak",
+    });
     expect(cfg.opServiceAccountToken).toBeDefined();
     expect(JSON.stringify(cfg)).not.toContain(
       "op_secret_token_should_not_leak",
@@ -70,45 +57,52 @@ describe("VA-359 — Effect.Config + Redacted secrets", () => {
     );
   });
 
-  it("missing LINEAR_API_KEY surfaces a ConfigError-shaped failure", async () => {
-    delete process.env.LINEAR_API_KEY;
-    const { loadConfig } = await import("./config.js");
-    expect(() => loadConfig()).toThrow(/LINEAR_API_KEY/);
+  it("missing LINEAR_API_KEY surfaces a ConfigError-shaped failure", () => {
+    expect(() => loadConfig({})).toThrow(/LINEAR_API_KEY/);
   });
 
-  it("RUNWAY_MAX_ITERATIONS=0 fails validation (must be positive)", async () => {
-    process.env.LINEAR_API_KEY = "lin_test";
-    process.env.RUNWAY_MAX_ITERATIONS = "0";
-    const { loadConfig } = await import("./config.js");
-    expect(() => loadConfig()).toThrow(/positive integer/);
+  it("RUNWAY_MAX_ITERATIONS=0 fails validation (must be positive)", () => {
+    expect(() =>
+      loadConfig({ LINEAR_API_KEY: "lin_test", RUNWAY_MAX_ITERATIONS: "0" }),
+    ).toThrow(/positive integer/);
   });
 
-  it("RUNWAY_MAX_ITERATIONS=10 parses to the integer", async () => {
-    process.env.LINEAR_API_KEY = "lin_test";
-    process.env.RUNWAY_MAX_ITERATIONS = "10";
-    const { loadConfig } = await import("./config.js");
-    expect(loadConfig().maxIterations).toBe(10);
+  it("RUNWAY_MAX_ITERATIONS=10 parses to the integer", () => {
+    const cfg = loadConfig({
+      LINEAR_API_KEY: "lin_test",
+      RUNWAY_MAX_ITERATIONS: "10",
+    });
+    expect(cfg.maxIterations).toBe(10);
   });
 
-  it("env-driven overrides for status names and HITL label apply", async () => {
-    process.env.LINEAR_API_KEY = "lin_test";
-    process.env.RUNWAY_LINEAR_TEAM = "FLIGHT";
-    process.env.RUNWAY_READY_STATUS = "Backlog";
-    process.env.RUNWAY_HITL_LABEL = "needs-review";
-    const { loadConfig } = await import("./config.js");
-    const cfg = loadConfig();
+  it("env-driven overrides for status names and HITL label apply", () => {
+    const cfg = loadConfig({
+      LINEAR_API_KEY: "lin_test",
+      RUNWAY_LINEAR_TEAM: "FLIGHT",
+      RUNWAY_READY_STATUS: "Backlog",
+      RUNWAY_HITL_LABEL: "needs-review",
+    });
     expect(cfg.linearTeam).toBe("FLIGHT");
     expect(cfg.readyStatus).toBe("Backlog");
     expect(cfg.hitlLabel).toBe("needs-review");
   });
 
+  it("VA-411 — host env leaks (e.g. RUNWAY_LINEAR_PROJECT exported by direnv) do not affect loadConfig when an explicit env is passed", () => {
+    const cfg = loadConfig({ LINEAR_API_KEY: "lin_test" });
+    // Even if the test process has `RUNWAY_LINEAR_PROJECT` set,
+    // the optional must flatten to undefined because the explicit
+    // env map doesn't include it.
+    expect(cfg.linearProject).toBeUndefined();
+    expect(cfg.baseBranch).toBeUndefined();
+    expect(cfg.opServiceAccountToken).toBeUndefined();
+  });
+
   it("ConfigLive Layer provides the resolved config via ConfigTag", async () => {
-    process.env.LINEAR_API_KEY = "lin_layer_test";
-    const { ConfigLive, ConfigTag } = await import("./config.js");
+    const ConfigLayer = makeConfigLive({ LINEAR_API_KEY: "lin_layer_test" });
     const program = Effect.gen(function* () {
       const cfg = yield* ConfigTag;
       return cfg.linearTeam;
-    }).pipe(Effect.provide(ConfigLive));
+    }).pipe(Effect.provide(ConfigLayer));
     const team = await Effect.runPromise(program);
     expect(team).toBe("VA");
   });
