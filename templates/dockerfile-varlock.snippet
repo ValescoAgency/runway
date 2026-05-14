@@ -4,7 +4,7 @@
 
 # Install varlock via npm. The official `ghcr.io/dmno-dev/varlock`
 # image is musl/Alpine — copying its binary into a glibc base
-# (node:22-bookworm) produces an ELF that the loader can't resolve
+# (node:24-bookworm) produces an ELF that the loader can't resolve
 # ("not found" on exec). npm install gets the right binary for the
 # image's libc.
 USER root

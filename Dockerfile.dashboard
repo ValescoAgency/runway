@@ -1,12 +1,12 @@
 # VA-386 (dashboard slice 1): collector container for runway traces.
 #
 # Two-stage build: stage 1 installs deps and compiles TypeScript;
-# stage 2 ships only dist/ + production node_modules. node:22 is the
-# baseline so `node:sqlite` is available (added in v22.5.0). We use
-# the `slim` variant — not alpine — because pnpm + native modules
-# behave better against glibc.
+# stage 2 ships only dist/ + production node_modules. node:24 keeps
+# `node:sqlite` available (it was added in v22.5.0 and stabilised in
+# the v24 line). We use the `slim` variant — not alpine — because pnpm
+# + native modules behave better against glibc.
 
-FROM node:22-slim AS build
+FROM node:24-slim AS build
 WORKDIR /app
 
 # Enable corepack-managed pnpm; the lockfile pins the version
@@ -20,12 +20,13 @@ COPY tsconfig.json tsconfig.build.json ./
 COPY src ./src
 RUN pnpm build
 
-FROM node:22-slim
+FROM node:24-slim
 WORKDIR /app
 ENV NODE_ENV=production
 
 # `--experimental-sqlite` keeps the warning quiet on v22.x; v23+ no
-# longer needs it but accepts it as a no-op.
+# longer needs it but accepts it as a no-op (still set on v24 for
+# defensive parity in case the runtime is ever pinned back).
 ENV NODE_OPTIONS="--experimental-sqlite --no-warnings"
 
 COPY package.json ./

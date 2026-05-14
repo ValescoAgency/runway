@@ -156,7 +156,7 @@ sandcastle reads `.sandcastle/.env` per its docs.
 ## Install
 
 ```bash
-pnpm install -g @valescoagency/runway       # or npm i -g, yarn global add
+pnpm add -g @valescoagency/runway           # or npm i -g, yarn global add
 ```
 
 Export runway's own env (in your shell rc, or wherever you keep API keys):
