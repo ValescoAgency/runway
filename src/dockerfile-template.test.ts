@@ -32,9 +32,9 @@ describe("Dockerfile.claude-code.base (VA-351)", () => {
     expect(dockerfile).toMatch(/^ENV TURBO_CACHE_DIR=\/tmp\/turbo-cache$/m);
   });
 
-  it("redirects npm cache into the agent's cache dir", () => {
+  it("redirects pnpm cache into the agent's cache dir (pnpm 11: no longer reads npm_config_*)", () => {
     expect(dockerfile).toMatch(
-      /^ENV npm_config_cache=\/home\/agent\/.cache\/npm$/m,
+      /^ENV pnpm_config_cache=\/home\/agent\/.cache\/pnpm$/m,
     );
   });
 

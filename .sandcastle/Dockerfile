@@ -48,12 +48,12 @@ RUN if ! getent group $AGENT_GID >/dev/null; then \
 ENV HOME=/home/agent
 ENV XDG_CACHE_HOME=/home/agent/.cache
 ENV TURBO_CACHE_DIR=/tmp/turbo-cache
-ENV npm_config_cache=/home/agent/.cache/npm
+ENV pnpm_config_cache=/home/agent/.cache/pnpm
 
 # Pre-create cache dirs with agent ownership so the first pnpm/turbo
 # run doesn't have to chown them. Both are inside paths the agent owns
 # anyway; this just makes them exist.
-RUN mkdir -p /home/agent/.cache /home/agent/.cache/npm /tmp/turbo-cache \
+RUN mkdir -p /home/agent/.cache /home/agent/.cache/pnpm /tmp/turbo-cache \
  && chown -R $AGENT_UID:$AGENT_GID /home/agent/.cache /tmp/turbo-cache
 
 # Bake pnpm via corepack at build time so `pnpm` is on PATH inside the
