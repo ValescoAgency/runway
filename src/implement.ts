@@ -114,6 +114,10 @@ export const runImplementLoop = (
           // and iteration N+1, since the implementer keeps drifting
           // toward the same code paths until corrected.
           priorReviewFeedback: priorFeedback,
+          // VA-417: pass the actual base branch so the prompt
+          // renders the real name (`main`, `master`, etc.) rather
+          // than a hardcoded default.
+          baseBranch,
         }),
       );
 

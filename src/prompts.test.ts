@@ -123,6 +123,29 @@ describe("renderImplementPrompt (VA-361)", () => {
     });
     expect(out).not.toContain("{{PRIOR_REVIEW_FEEDBACK}}");
   });
+
+  it("substitutes the actual baseBranch into the prompt (VA-417)", async () => {
+    const out = await renderImplementPrompt({
+      issue,
+      policy: policyWithPaths,
+      previousIterations: "",
+      priorReviewFeedback: "",
+      baseBranch: "master",
+    });
+    expect(out).toContain("based off\n`master`");
+    expect(out).not.toContain("{{BASE_BRANCH}}");
+  });
+
+  it("falls back to `main` when baseBranch is omitted (VA-417 back-compat)", async () => {
+    const out = await renderImplementPrompt({
+      issue,
+      policy: policyWithPaths,
+      previousIterations: "",
+      priorReviewFeedback: "",
+    });
+    expect(out).toContain("based off\n`main`");
+    expect(out).not.toContain("{{BASE_BRANCH}}");
+  });
 });
 
 describe("renderReviewPrompt (VA-361)", () => {
