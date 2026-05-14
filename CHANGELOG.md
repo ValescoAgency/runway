@@ -4,6 +4,28 @@ All notable changes to runway are documented here. Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); breaking
 changes bump the major.
 
+## 0.8.0 — 2026-05-14
+
+Operator-tunable iteration budget, the first two slices of the operations dashboard ([VA-385](https://linear.app/valescoagency/issue/VA-385)), and two fixes that close round-trip loops with Linear. The headline is `--impl-turns` — the sandcastle inner turn budget per impl phase is no longer hardcoded to `1`, so harder issues can complete in a single attempt instead of round-tripping back to Todo. The headline fix is the `Closes` magic-word swap in `buildPrBody`, which finally lets a runway-generated PR auto-transition its Linear issue to Done on merge.
+
+### Added
+
+- **`--impl-turns` CLI flag + `RUNWAY_IMPL_TURNS` env var** ([PR #67](https://github.com/ValescoAgency/runway/pull/67), VA-414). New `RunwayConfig.implTurns: number` field, defaulting to `3`, validated as a positive integer. Replaces the hardcoded `maxIterations: 1` inside the implement loop's sandcastle call. Distinct from `RUNWAY_MAX_ITERATIONS` (the outer impl re-prompt loop, which only fires when the agent fails to signal `IMPL: DONE`/`IMPL: BLOCKED` at all); the help text and ENV section both spell out the difference. Both `--impl-turns N` and `--impl-turns=N` forms accepted; CLI override beats env value.
+- **Operations dashboard — slice 1: tracer plumbing** ([PR #63](https://github.com/ValescoAgency/runway/pull/63), VA-386). End-to-end OTel trace plumbing from runway → custom collector → SQLite → minimal dashboard. `docker-compose.yml` + `Dockerfile.dashboard` at the repo root stand up a collector container exposing OTLP HTTP on `OTLP_PORT` (4318) and the dashboard on `DASHBOARD_PORT` (3001). `src/dashboard/projector.ts` projects `drainQueue` and `processIssue` spans into typed `Drain` / `IssueProcess` rows; `src/dashboard/storage.ts` writes them to SQLite (with a `raw_spans` escape hatch); `src/dashboard/server.ts` serves a list view at `/`. Wired to runway-run via `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318`.
+- **Operations dashboard — slice 4: agent iterations + phase timeline** ([PR #66](https://github.com/ValescoAgency/runway/pull/66), VA-389). `impl-iter-N` spans now project into an `agent_iterations` table keyed on the parent `processIssue` spanId; detail pane (`/issue/<traceId>/<spanId>`) renders a horizontal phase timeline showing implement → review → finalize durations, with implement expanding to per-iteration index / duration / exit status. Hitl-loop (review-rejected) iterations are covered at both projector and view layers.
+- **`runway init` scaffold for self-hosted AFK runs** ([PR #61](https://github.com/ValescoAgency/runway/pull/61)). `runway init` now writes a `.sandcastle/Dockerfile` (vendored from `@ai-hero/sandcastle`'s `CLAUDE_CODE_DOCKERFILE`) and an `.env.schema` that wires `CLAUDE_CODE_OAUTH_TOKEN` and `GH_TOKEN` through varlock + 1Password CLI for in-container secret resolution. Removes the need to clone the runway repo to drive a drain against your own project.
+
+### Fixed
+
+- **`buildPrBody` emits `Closes VA-NNN` instead of `Refs VA-NNN`** ([PR #65](https://github.com/ValescoAgency/runway/pull/65), VA-412). Linear's GitHub integration only auto-transitions an issue to Done on merge when the PR body uses one of the magic words (`Closes`/`Fixes`/`Resolves`); `Refs` only attaches the PR. The previous body left every merged runway PR's Linear issue stuck In Progress until a human flipped it manually. `buildPrBody` is now exported and unit-tested with both a positive assertion and a paranoid negative regex against the old wording.
+- **`loadConfig` no longer reads `process.env` directly in tests** ([PR #62](https://github.com/ValescoAgency/runway/pull/62), VA-411). The "minimal valid config" test asserted that optional `RUNWAY_*` env vars resolve to `undefined`, but it read from the inherited `process.env` — so any host shell exporting `RUNWAY_LINEAR_PROJECT` (e.g. via `.envrc` / direnv) broke the test locally even though CI passed. `loadConfig(env?)` and `makeConfigLive(env?)` now accept an explicit env map routed through `Effect.withConfigProvider`; the brittle `afterEach` + dynamic `await import("./config.js")` dance is gone. Production callers default to `process.env` so the public API is unchanged.
+- **Security dep bump** ([PR #64](https://github.com/ValescoAgency/runway/pull/64)). `@opentelemetry/exporter-trace-otlp-http` 0.217.0 → 0.218.0 via Snyk auto-PR to reduce vulnerabilities surfaced on the default branch.
+
+### Internal — release stats
+
+- **7 commits since 0.7.1** (3 feat + 3 fix + 1 chore).
+- All 39 test files, 247 specs pass.
+
 ## 0.7.1 — 2026-05-14
 
 Patch release: tightens `fetchReady`'s queue-picker contract so runway only attempts issues it should actually pick up.
