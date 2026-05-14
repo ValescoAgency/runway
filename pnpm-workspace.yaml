@@ -1,0 +1,11 @@
+# pnpm 11 moved build-script approval out of package.json's `pnpm`
+# block into this file. `allowBuilds` maps package selectors to a
+# boolean — `true` = run the package's install scripts, `false` =
+# silently skip them. Without an explicit entry, pnpm 11 errors out
+# with ERR_PNPM_IGNORED_BUILDS on every install (was a warning under
+# pnpm 10). See https://pnpm.io/settings#allowbuilds.
+allowBuilds:
+  '@parcel/watcher': true
+  esbuild: true
+  lefthook: true
+  msgpackr-extract: true

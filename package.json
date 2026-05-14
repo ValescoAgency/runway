@@ -78,13 +78,5 @@
   },
   "publishConfig": {
     "access": "public"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "@parcel/watcher",
-      "esbuild",
-      "lefthook",
-      "msgpackr-extract"
-    ]
   }
 }
