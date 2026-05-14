@@ -20,6 +20,12 @@ const IssueNodeSchema = Schema.Struct({
   identifier: Schema.String,
   title: Schema.String,
   description: Schema.NullOr(Schema.String),
+  // VA-420: drain order is `priority ASC (Urgent=1 → Low=4, No-priority=0
+  // sorted last), then createdAt ASC`. The sort reads this off the raw
+  // SDK node; the schema entry narrows the field at the seam so a Linear
+  // API drift surfaces as `LinearSchemaError` instead of a silent NaN
+  // comparison.
+  priority: Schema.Number,
 });
 const WorkflowStateNodeSchema = Schema.Struct({
   id: Schema.String,
@@ -451,8 +457,27 @@ export function createLinearGateway(
                 state: { id: { eq: readyStateId } },
                 ...(projectId ? { project: { id: { eq: projectId } } } : {}),
               },
-              // Stable order: oldest first so the queue drains FIFO.
+              // VA-420: order doesn't matter at the SDK call — Linear's
+              // `IssueOrderBy` enum doesn't expose `priority`, and the
+              // SDK type for this argument hides the ASC/DESC direction
+              // anyway. We re-sort the candidate set in JS below.
               orderBy: "createdAt" as never,
+            });
+            // VA-420: drain by Linear priority first, then by createdAt
+            // within a priority bucket. Linear's priority encoding is
+            // non-monotonic — `1 = Urgent, 2 = High, 3 = Medium,
+            // 4 = Low, 0 = No priority` — so `0` is remapped to
+            // `Infinity` to sit behind every prioritised bucket
+            // (operator intuition: Urgent first, unprioritised last).
+            // Within a bucket, oldest-first restores the FIFO intent.
+            const candidates = [...issues.nodes].sort((a, b) => {
+              const pa = a.priority === 0 ? Infinity : a.priority;
+              const pb = b.priority === 0 ? Infinity : b.priority;
+              if (pa !== pb) return pa - pb;
+              return (
+                new Date(a.createdAt).getTime() -
+                new Date(b.createdAt).getTime()
+              );
             });
             // VA-360: validate every issue node through the schema —
             // a single drifted issue surfaces as `LinearSchemaError`
@@ -467,7 +492,7 @@ export function createLinearGateway(
             // candidate go through the rate limiter and the retry
             // policy alongside everything else.
             const eligible: RunwayIssue[] = [];
-            for (const raw of issues.nodes) {
+            for (const raw of candidates) {
               const i = decodeIssueNode(raw);
               const labels = await fetchIssueLabelNames(raw);
               if (labels.includes(config.hitlLabel)) continue;

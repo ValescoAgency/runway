@@ -64,6 +64,11 @@ interface FakeIssueArgs {
     readonly type: string;
     readonly blockerStateType: string | null;
   }[];
+  // VA-420: Linear priority encoding — 1=Urgent, 2=High, 3=Medium,
+  // 4=Low, 0=No priority. Defaults to 0 so existing tests keep
+  // exercising the "no explicit priority" path.
+  readonly priority?: number;
+  readonly createdAt?: string;
 }
 
 function fakeIssue(args: FakeIssueArgs) {
@@ -72,6 +77,8 @@ function fakeIssue(args: FakeIssueArgs) {
     identifier: args.identifier,
     title: args.title,
     description: args.description ?? null,
+    priority: args.priority ?? 0,
+    createdAt: args.createdAt ?? "2026-01-01T00:00:00.000Z",
     labels: () =>
       Promise.resolve({
         nodes: (args.labels ?? []).map((name, i) => ({
@@ -234,5 +241,128 @@ describe("VA-394 — fetchReady eligibility filters", () => {
     const result = await Effect.runPromise(gateway.fetchReady());
 
     expect(result.map((i) => i.identifier)).toEqual(["VA-8"]);
+  });
+});
+
+// VA-420: the SDK's `IssueOrderBy` enum doesn't expose `priority`, and
+// the un-directioned `createdAt` actually defaults to DESC on Linear's
+// GraphQL — i.e. newest-first, the opposite of the FIFO comment the
+// code used to carry. `fetchReady` now re-sorts the candidate set in
+// JS: by priority bucket (Urgent → High → Medium → Low → No-priority),
+// then by `createdAt` ASC within a bucket.
+describe("VA-420 — fetchReady drain order", () => {
+  it("drains higher Linear priority before lower priority", async () => {
+    stubTeamAndState();
+    // SDK returns newest-first (createdAt DESC default); the JS sort
+    // must override that with priority-first ordering.
+    issuesMock.mockResolvedValueOnce({
+      nodes: [
+        fakeIssue({
+          id: "issue-medium",
+          identifier: "VA-419",
+          title: "medium, newest",
+          priority: 3,
+          createdAt: "2026-05-14T21:20:00.000Z",
+        }),
+        fakeIssue({
+          id: "issue-urgent-middle",
+          identifier: "VA-418",
+          title: "urgent, middle-created",
+          priority: 1,
+          createdAt: "2026-05-14T20:49:00.000Z",
+        }),
+        fakeIssue({
+          id: "issue-urgent-oldest",
+          identifier: "VA-417",
+          title: "urgent, oldest",
+          priority: 1,
+          createdAt: "2026-05-14T18:11:00.000Z",
+        }),
+      ],
+    });
+
+    const gateway = createLinearGateway(baseConfig);
+    const result = await Effect.runPromise(gateway.fetchReady());
+
+    // VA-417 (Urgent, oldest) → VA-418 (Urgent, newer) → VA-419 (Medium).
+    expect(result.map((i) => i.identifier)).toEqual([
+      "VA-417",
+      "VA-418",
+      "VA-419",
+    ]);
+  });
+
+  it("breaks ties within a priority bucket by createdAt ASC (oldest first)", async () => {
+    stubTeamAndState();
+    issuesMock.mockResolvedValueOnce({
+      nodes: [
+        fakeIssue({
+          id: "issue-newest",
+          identifier: "VA-A",
+          title: "high, newest",
+          priority: 2,
+          createdAt: "2026-05-14T21:00:00.000Z",
+        }),
+        fakeIssue({
+          id: "issue-oldest",
+          identifier: "VA-B",
+          title: "high, oldest",
+          priority: 2,
+          createdAt: "2026-05-14T18:00:00.000Z",
+        }),
+        fakeIssue({
+          id: "issue-middle",
+          identifier: "VA-C",
+          title: "high, middle",
+          priority: 2,
+          createdAt: "2026-05-14T19:30:00.000Z",
+        }),
+      ],
+    });
+
+    const gateway = createLinearGateway(baseConfig);
+    const result = await Effect.runPromise(gateway.fetchReady());
+
+    expect(result.map((i) => i.identifier)).toEqual(["VA-B", "VA-C", "VA-A"]);
+  });
+
+  it("sorts No-priority (Linear priority=0) behind every prioritised bucket", async () => {
+    stubTeamAndState();
+    issuesMock.mockResolvedValueOnce({
+      nodes: [
+        fakeIssue({
+          id: "issue-no-prio-old",
+          identifier: "VA-NP",
+          title: "no priority, ancient",
+          priority: 0,
+          createdAt: "2024-01-01T00:00:00.000Z",
+        }),
+        fakeIssue({
+          id: "issue-low",
+          identifier: "VA-LOW",
+          title: "low priority, recent",
+          priority: 4,
+          createdAt: "2026-05-14T20:00:00.000Z",
+        }),
+        fakeIssue({
+          id: "issue-urgent",
+          identifier: "VA-UR",
+          title: "urgent",
+          priority: 1,
+          createdAt: "2026-05-14T19:00:00.000Z",
+        }),
+      ],
+    });
+
+    const gateway = createLinearGateway(baseConfig);
+    const result = await Effect.runPromise(gateway.fetchReady());
+
+    // Urgent → Low → No-priority, even though the No-priority issue is
+    // by far the oldest.
+    expect(result.map((i) => i.identifier)).toEqual([
+      "VA-UR",
+      "VA-LOW",
+      "VA-NP",
+    ]);
   });
 });
