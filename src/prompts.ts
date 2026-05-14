@@ -38,6 +38,14 @@ export async function renderImplementPrompt(args: {
    * section header disappears from the rendered prompt.
    */
   priorReviewFeedback: string;
+  /**
+   * VA-417: the repo's actual base branch (resolved from
+   * `config.baseBranch` or auto-detected from `origin/HEAD` at
+   * orchestrator startup). Substituted into the prompt so the agent
+   * sees the real branch name — `main` vs. `master` vs. anything
+   * else — instead of a hardcoded default.
+   */
+  baseBranch?: string;
 }): Promise<string> {
   const template = await loadImplementPrompt();
   return renderPrompt(template, implementVars(args));
@@ -86,6 +94,7 @@ function implementVars(args: {
   policy: Policy;
   previousIterations: string;
   priorReviewFeedback: string;
+  baseBranch?: string;
 }): Record<string, string> {
   return {
     ISSUE_IDENTIFIER: args.issue.identifier,
@@ -94,6 +103,10 @@ function implementVars(args: {
     PREVIOUS_ITERATIONS: args.previousIterations,
     PRIOR_REVIEW_FEEDBACK: args.priorReviewFeedback,
     POLICY_FORBIDDEN_BULLET: renderForbiddenPathsBullet(args.policy),
+    // VA-417: fall back to "main" if the caller didn't pass one, so
+    // older test fixtures keep working. Production always passes the
+    // resolved base branch from config / orchestrator detection.
+    BASE_BRANCH: args.baseBranch ?? "main",
   };
 }
 
