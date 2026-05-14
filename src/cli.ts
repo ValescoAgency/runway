@@ -101,5 +101,6 @@ async function main(): Promise<void> {
 
 main().catch((err) => {
   console.error("[runway] fatal:", err instanceof Error ? err.message : err);
+  console.error("[runway:exit] status=failure");
   process.exit(1);
 });
