@@ -13,6 +13,8 @@ const workflowStatesMock = vi.fn();
 const projectsMock = vi.fn();
 const issueLabelsMock = vi.fn();
 const issueGetMock = vi.fn();
+// VA-416: hoisted so applyLabel tests can assert the call args.
+const updateIssueMock = vi.fn();
 
 vi.mock("@linear/sdk", () => {
   class LinearClient {
@@ -22,7 +24,7 @@ vi.mock("@linear/sdk", () => {
     projects = projectsMock;
     issueLabels = issueLabelsMock;
     issue = issueGetMock;
-    updateIssue = vi.fn();
+    updateIssue = updateIssueMock;
     createComment = vi.fn();
   }
   return { LinearClient };
@@ -48,6 +50,7 @@ beforeEach(() => {
   projectsMock.mockReset();
   issueLabelsMock.mockReset();
   issueGetMock.mockReset();
+  updateIssueMock.mockReset();
 });
 
 afterEach(() => {
@@ -220,5 +223,125 @@ describe("VA-360 — Linear SDK response schemas", () => {
     // loop. If schema errors slipped into the retryable set this
     // counter would be 6 (1 + 5 retries).
     expect(counter.n).toBe(1);
+  });
+});
+
+describe("VA-415 — fetchComments tolerates missing `user` field", () => {
+  it("decodes a comment node where `user` is absent from the payload (not just null)", async () => {
+    issueGetMock.mockResolvedValueOnce({
+      comments: vi.fn().mockResolvedValueOnce({
+        nodes: [
+          // System / integration / deleted-user shape: `user` key is
+          // entirely missing. Pre-VA-415 this tripped Schema.NullOr.
+          { id: "c-1", body: "system comment", createdAt: "2026-05-14T00:00:00Z" },
+          // Present-and-null still works.
+          {
+            id: "c-2",
+            body: "explicit null user",
+            createdAt: "2026-05-14T00:01:00Z",
+            user: null,
+          },
+          // Full struct still works.
+          {
+            id: "c-3",
+            body: "human comment",
+            createdAt: "2026-05-14T00:02:00Z",
+            user: { id: "u-1", name: "Alice" },
+          },
+        ],
+      }),
+    });
+
+    const gateway = createLinearGateway(config);
+    const result = await Effect.runPromise(
+      gateway.fetchComments("issue-uuid").pipe(Effect.either),
+    );
+    expect(Either.isRight(result)).toBe(true);
+    if (Either.isRight(result)) {
+      expect(result.right).toHaveLength(3);
+      // Missing-user and null-user both surface as empty `author` so
+      // downstream allowlist filtering doesn't trip on undefined.
+      const byId = Object.fromEntries(result.right.map((c) => [c.id, c]));
+      expect(byId["c-1"]?.author).toBe("");
+      expect(byId["c-2"]?.author).toBe("");
+      expect(byId["c-3"]?.author).toBe("Alice");
+    }
+  });
+});
+
+describe("VA-416 — applyLabel resolves workspace-scope labels, not just team-scope", () => {
+  it("applies a workspace-scoped label (no team association) when the team has no same-name label", async () => {
+    updateIssueMock.mockResolvedValueOnce({});
+    issueGetMock.mockResolvedValueOnce({
+      team: Promise.resolve({ id: "team-1" }),
+      labels: vi.fn().mockResolvedValueOnce({ nodes: [] }),
+    });
+    issueLabelsMock.mockResolvedValueOnce({
+      nodes: [
+        {
+          id: "lbl-workspace",
+          name: "ready-for-human",
+          team: Promise.resolve(null),
+        },
+      ],
+    });
+
+    const gateway = createLinearGateway(config);
+    const result = await Effect.runPromise(
+      gateway.applyLabel("issue-uuid", "ready-for-human").pipe(Effect.either),
+    );
+    expect(Either.isRight(result)).toBe(true);
+    expect(updateIssueMock).toHaveBeenCalledWith("issue-uuid", {
+      labelIds: ["lbl-workspace"],
+    });
+  });
+
+  it("prefers a team-scoped label over a workspace-scoped one when both share a name", async () => {
+    updateIssueMock.mockResolvedValueOnce({});
+    issueGetMock.mockResolvedValueOnce({
+      team: Promise.resolve({ id: "team-1" }),
+      labels: vi.fn().mockResolvedValueOnce({ nodes: [] }),
+    });
+    issueLabelsMock.mockResolvedValueOnce({
+      nodes: [
+        {
+          id: "lbl-workspace",
+          name: "ready-for-human",
+          team: Promise.resolve(null),
+        },
+        {
+          id: "lbl-team",
+          name: "ready-for-human",
+          team: Promise.resolve({ id: "team-1" }),
+        },
+      ],
+    });
+
+    const gateway = createLinearGateway(config);
+    const result = await Effect.runPromise(
+      gateway.applyLabel("issue-uuid", "ready-for-human").pipe(Effect.either),
+    );
+    expect(Either.isRight(result)).toBe(true);
+    expect(updateIssueMock).toHaveBeenCalledWith("issue-uuid", {
+      labelIds: ["lbl-team"],
+    });
+  });
+
+  it("throws LinearNotFound when no label with that name exists at any scope", async () => {
+    issueGetMock.mockResolvedValueOnce({
+      team: Promise.resolve({ id: "team-1" }),
+      labels: vi.fn().mockResolvedValueOnce({ nodes: [] }),
+    });
+    issueLabelsMock.mockResolvedValueOnce({ nodes: [] });
+
+    const gateway = createLinearGateway(config);
+    const result = await Effect.runPromise(
+      gateway.applyLabel("issue-uuid", "does-not-exist").pipe(Effect.either),
+    );
+    expect(Either.isLeft(result)).toBe(true);
+    if (Either.isLeft(result)) {
+      expect(result.left._tag).toBe("LinearNotFound");
+    }
+    expect(updateIssueMock).not.toHaveBeenCalled();
   });
 });
