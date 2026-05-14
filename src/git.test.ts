@@ -6,9 +6,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const execaMock = vi.fn();
 vi.mock("execa", () => ({ execa: execaMock }));
 
-const { detectBaseBranch, hasCommits, pruneStaleAgentBranch } = await import(
-  "./git.js"
-);
+const {
+  detectBaseBranch,
+  hasCommits,
+  pruneStaleAgentBranch,
+  rebaseOntoBase,
+} = await import("./git.js");
 
 // VA-358: detectBaseBranch is now an Effect. Tests run it via
 // `Effect.runPromise` so the assertion shape (resolves / rejects)
@@ -163,5 +166,76 @@ describe("pruneStaleAgentBranch (VA-366)", () => {
     expect(
       execaMock.mock.calls.find((c) => c[1]?.[0] === "branch"),
     ).toBeUndefined();
+  });
+});
+
+describe("rebaseOntoBase (VA-419)", () => {
+  const runRebase = (base = "master", branch = "agent/va-419") =>
+    Effect.runPromise(rebaseOntoBase("/tmp/repo", base, branch));
+
+  it("returns `ok` when fetch and rebase both exit 0 (clean replay)", async () => {
+    execaMock
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "" }) // fetch
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "" }); // rebase
+    await expect(runRebase()).resolves.toEqual({ kind: "ok" });
+
+    expect(execaMock.mock.calls[0]?.[1]).toEqual([
+      "fetch",
+      "origin",
+      "master",
+    ]);
+    expect(execaMock.mock.calls[1]?.[1]).toEqual([
+      "rebase",
+      "origin/master",
+      "agent/va-419",
+    ]);
+    // Clean path doesn't run diff or --abort.
+    expect(execaMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("on non-zero rebase exit: captures the conflicted-file list and aborts", async () => {
+    execaMock
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "" }) // fetch
+      .mockResolvedValueOnce({ exitCode: 1, stdout: "" }) // rebase fails
+      .mockResolvedValueOnce({
+        // diff --name-only --diff-filter=U
+        exitCode: 0,
+        stdout: "src/dashboard/storage.ts\nsrc/dashboard/storage.test.ts\n",
+      })
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "" }); // rebase --abort
+
+    await expect(runRebase()).resolves.toEqual({
+      kind: "conflict",
+      conflictedFiles: [
+        "src/dashboard/storage.ts",
+        "src/dashboard/storage.test.ts",
+      ],
+    });
+
+    // Confirm we asked git for the unmerged file list, then aborted.
+    expect(execaMock.mock.calls[2]?.[1]).toEqual([
+      "diff",
+      "--name-only",
+      "--diff-filter=U",
+    ]);
+    expect(execaMock.mock.calls[3]?.[1]).toEqual(["rebase", "--abort"]);
+  });
+
+  it("still emits a conflict outcome (with an empty file list) when the diff probe fails", async () => {
+    execaMock
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "" }) // fetch
+      .mockResolvedValueOnce({ exitCode: 1, stdout: "" }) // rebase fails
+      .mockRejectedValueOnce(new Error("git broke")) // diff probe throws
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "" }); // rebase --abort
+
+    await expect(runRebase()).resolves.toEqual({
+      kind: "conflict",
+      conflictedFiles: [],
+    });
+  });
+
+  it("propagates a fetch failure — finalize routes it through processIssue's failure path", async () => {
+    execaMock.mockRejectedValueOnce(new Error("origin unreachable"));
+    await expect(runRebase()).rejects.toThrow(/origin unreachable/);
   });
 });
