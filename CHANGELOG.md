@@ -4,6 +4,20 @@ All notable changes to runway are documented here. Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); breaking
 changes bump the major.
 
+## 0.8.1 — 2026-05-14
+
+Patch release fronting two Linear-gateway fixes that the 2026-05-14 PM drain surfaced. Both quietly degraded the HITL / prior-attempt-feedback loops in ways that only show up under real operator conditions.
+
+### Fixed
+
+- **`fetchComments` rejected comment nodes where `user` was absent from the payload** ([PR #69](https://github.com/ValescoAgency/runway/pull/69), VA-415). The schema declared `user: Schema.NullOr(...)` — accepting present-and-null, but not missing-entirely. Linear's API can omit `user` on system / integration / deleted-user comments, which made the decoder throw; the error was swallowed per VA-383's never-block AC and `priorReviewFeedback` quietly fell back to description-only. Net effect: a reviewer's rejection reason that should have reached the retry's impl agent never did, and the retry walked back into the same defect. Field shape is now `Schema.optional(Schema.NullOr(...))`; downstream code already null-coalesces.
+- **`applyLabel` filtered `issueLabels` by team only, silently excluding workspace-scope labels** ([PR #69](https://github.com/ValescoAgency/runway/pull/69), VA-416). Linear labels can be scoped to either a single team OR the workspace; the default `ready-for-human` HITL label lives at workspace scope in most setups. The previous filter (`team: { id: { eq: team.id } }`) required a team match, so the label never resolved, `LinearNotFound` threw, and HITL routing emitted the "Note: could not apply" fallback comment instead of applying the label. Workspace-scope is the right shape for cross-team operational labels — runway now searches by name alone and prefers a team-scoped match when one exists (workspace-scoped is the fallback). The team-vs-workspace name-collision edge resolves to team-scoped.
+
+### Internal — release stats
+
+- **1 commit since 0.8.0** (1 fix bundling 2 Linear tickets).
+- All 39 test files, 251 specs pass (4 new: missing-user decode, workspace-only label match, team-beats-workspace on tie, not-found-at-any-scope still throws LinearNotFound).
+
 ## 0.8.0 — 2026-05-14
 
 Operator-tunable iteration budget, the first two slices of the operations dashboard ([VA-385](https://linear.app/valescoagency/issue/VA-385)), and two fixes that close round-trip loops with Linear. The headline is `--impl-turns` — the sandcastle inner turn budget per impl phase is no longer hardcoded to `1`, so harder issues can complete in a single attempt instead of round-tripping back to Todo. The headline fix is the `Closes` magic-word swap in `buildPrBody`, which finally lets a runway-generated PR auto-transition its Linear issue to Done on merge.
