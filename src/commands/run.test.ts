@@ -85,4 +85,32 @@ describe("parseRunArgs", () => {
       );
     });
   });
+
+  describe("--impl-turns", () => {
+    it("parses --impl-turns with a separate value", () => {
+      expect(parseRunArgs(["--impl-turns", "5"])).toEqual({ implTurns: 5 });
+    });
+
+    it("parses --impl-turns=value (inline form)", () => {
+      expect(parseRunArgs(["--impl-turns=7"])).toEqual({ implTurns: 7 });
+    });
+
+    it("rejects a non-numeric value", () => {
+      expect(() => parseRunArgs(["--impl-turns", "lots"])).toThrow(
+        /--impl-turns must be a positive integer/,
+      );
+    });
+
+    it("rejects a zero or negative value", () => {
+      expect(() => parseRunArgs(["--impl-turns", "0"])).toThrow(
+        /--impl-turns must be a positive integer/,
+      );
+    });
+
+    it("rejects --impl-turns with no value", () => {
+      expect(() => parseRunArgs(["--impl-turns"])).toThrow(
+        /--impl-turns requires a number/,
+      );
+    });
+  });
 });

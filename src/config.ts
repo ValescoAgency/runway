@@ -67,6 +67,17 @@ export interface RunwayConfig {
   readonly hitlLabel: string;
   readonly maxIterations: number;
   /**
+   * Sandcastle inner turn budget for the impl phase — i.e. how many
+   * turns the Claude agent gets per `runSandcastle` call before it
+   * has to signal `IMPL: DONE` / `IMPL: BLOCKED`. Distinct from
+   * `maxIterations`, which controls the *outer* impl re-prompt loop
+   * (and only fires when the agent fails to signal at all). Source:
+   * `RUNWAY_IMPL_TURNS` env var or `--impl-turns` CLI flag on
+   * `runway run`. Defaults to 3 so single-pass agents have headroom
+   * for harder tasks; bump higher for very large changes.
+   */
+  readonly implTurns: number;
+  /**
    * VA-383: Linear-user names whose comments on an issue get surfaced
    * to the impl agent as "Review feedback from prior attempts."
    * `undefined` (the default) means runway uses the Linear user the
@@ -120,6 +131,13 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
       validation: (n): n is number => n > 0,
     }),
   ),
+  implTurns: EConfig.integer("RUNWAY_IMPL_TURNS").pipe(
+    EConfig.withDefault(3),
+    EConfig.validate({
+      message: "RUNWAY_IMPL_TURNS must be a positive integer",
+      validation: (n): n is number => n > 0,
+    }),
+  ),
   commentAuthorAllowlist: EConfig.option(
     EConfig.string("RUNWAY_COMMENT_AUTHOR_ALLOWLIST"),
   ),
@@ -136,6 +154,7 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
       inReviewStatus: raw.inReviewStatus,
       hitlLabel: raw.hitlLabel,
       maxIterations: raw.maxIterations,
+      implTurns: raw.implTurns,
       commentAuthorAllowlist: Option.getOrUndefined(
         raw.commentAuthorAllowlist,
       )

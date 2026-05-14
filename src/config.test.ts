@@ -17,6 +17,7 @@ describe("VA-359 — Effect.Config + Redacted secrets", () => {
     expect(cfg.readyStatus).toBe("Todo");
     expect(cfg.hitlLabel).toBe("ready-for-human");
     expect(cfg.maxIterations).toBe(5);
+    expect(cfg.implTurns).toBe(3);
     // Optionals flatten Option → undefined.
     expect(cfg.opServiceAccountToken).toBeUndefined();
     expect(cfg.linearProject).toBeUndefined();
@@ -73,6 +74,20 @@ describe("VA-359 — Effect.Config + Redacted secrets", () => {
       RUNWAY_MAX_ITERATIONS: "10",
     });
     expect(cfg.maxIterations).toBe(10);
+  });
+
+  it("RUNWAY_IMPL_TURNS=0 fails validation (must be positive)", () => {
+    expect(() =>
+      loadConfig({ LINEAR_API_KEY: "lin_test", RUNWAY_IMPL_TURNS: "0" }),
+    ).toThrow(/positive integer/);
+  });
+
+  it("RUNWAY_IMPL_TURNS=5 parses to the integer", () => {
+    const cfg = loadConfig({
+      LINEAR_API_KEY: "lin_test",
+      RUNWAY_IMPL_TURNS: "5",
+    });
+    expect(cfg.implTurns).toBe(5);
   });
 
   it("env-driven overrides for status names and HITL label apply", () => {
