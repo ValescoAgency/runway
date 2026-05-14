@@ -4,6 +4,37 @@ All notable changes to runway are documented here. Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); breaking
 changes bump the major.
 
+## 0.9.0 — 2026-05-14
+
+Minor release. Drops Node 22 support in favor of Node 24, bumps the agent runtime container to pnpm 11.1.1, and patches the impl-agent prompt so it no longer treats yesterday's rejected commits as authoritative on retry. Two PRs since 0.8.1.
+
+### Changed — minor-bumping
+
+- **Node 22 → Node 24 across containers, workflows, and the package's `engines` pin** ([PR #72](https://github.com/ValescoAgency/runway/pull/72)). `templates/Dockerfile.claude-code.base` (the canonical template `runway init` writes from) and the runway repo's dogfooded `.sandcastle/Dockerfile` both move to `node:24-bookworm`; `Dockerfile.dashboard` to `node:24-slim` in both stages; `.github/workflows/{ci,release}.yml` to `node-version: 24`. `package.json#engines.node` bumps from `>=22` to `>=24` — anyone installing `@valescoagency/runway` now needs Node 24+. Use `runway upgrade-repo` to refresh existing scaffolded target repos against the new template.
+- **pnpm 10.x → pnpm 11.1.1 across containers, CI runners, and corepack** ([PR #72](https://github.com/ValescoAgency/runway/pull/72)). `corepack prepare pnpm@10.0.0 --activate` → `pnpm@11.1.1` in the agent Dockerfile templates; `pnpm/action-setup@v4 with: version: 10` dropped from both workflows so the action reads `packageManager` from `package.json` (now pinned to `"packageManager": "pnpm@11.1.1"`). `actions/checkout@v4` → `@v6` and `pnpm/action-setup@v4` → `@v6` in the same pass.
+
+### Added
+
+- **pnpm 11 build-script approval via `pnpm-workspace.yaml`** ([PR #72](https://github.com/ValescoAgency/runway/pull/72)). pnpm 11 promotes `ERR_PNPM_IGNORED_BUILDS` from a warning to a hard install failure; the four packages whose install scripts runway depends on (`@parcel/watcher`, `esbuild`, `lefthook`, `msgpackr-extract`) are now allowlisted via the new `pnpm-workspace.yaml#allowBuilds` map (the legacy `package.json#pnpm.onlyBuiltDependencies` field is recognized but silently ignored under v11).
+
+### Fixed
+
+- **Impl agent acknowledges retry case instead of verifying stale rejected commits** ([PR #71](https://github.com/ValescoAgency/runway/pull/71), partial fix for VA-417). The previous `prompts/implement.md` framed the agent branch as unconditionally clean — on a retry, the agent saw existing rejected commits and concluded "the work is already done," signaling `IMPL: DONE` without addressing the reviewer feedback that put the issue back in the queue. The rewrite explicitly distinguishes first-attempt (clean branch) from retry (may carry rejected prior commits), and instructs the agent to replace existing commits if they would re-introduce a rejected design. Also threads `{{BASE_BRANCH}}` as a real template variable so `main` vs. `master` vs. anything else reflects the actual base branch instead of a hardcoded "main". The structural-fix half of VA-417 (orchestrator-side prune of `agent/X` before the impl phase on HITL retry) is **not** in this release — that's a future drain.
+
+### Internal — pnpm v11 footgun sweep
+
+Surveyed [pnpm's migration guide](https://pnpm.io/migration) for every documented breaking change and audited the repo against the full list. Two items needed action ([PR #72](https://github.com/ValescoAgency/runway/pull/72), final commit):
+
+- **`npm_config_cache` → `pnpm_config_cache` in the agent Dockerfile.** pnpm 11 no longer reads `npm_config_*` env vars; the agent container's baked cache redirect (VA-351) became a silent no-op. Renamed the env var and aligned the directory path from `~/.cache/npm` to `~/.cache/pnpm`; updated the corresponding `dockerfile-template.test.ts` pin.
+- **`pnpm install -g <pkg>` → `pnpm add -g <pkg>` in the README.** v11 deprecated the no-argument form and the `install -g <pkg>` form is now ambiguous; `add -g` is the canonical install path.
+
+Items audited and confirmed not present in the repo: `neverBuiltDependencies` / `ignoredBuiltDependencies` / `onlyBuiltDependenciesFile`, `useNodeVersion`, scripts shadowing v11 built-ins (`clean`/`setup`/`deploy`/`rebuild`), `auditConfig.ignoreCves`, `pnpm server`, `pnpm link <name>`, `allowNonAppliedPatches`, `managePackageManagerVersions` / `packageManagerStrict`. The only `.npmrc` content is the `@valescoagency:registry=` scope pin, which v11 still reads from `.npmrc`.
+
+### Internal — release stats
+
+- **2 commits since 0.8.1** (1 fix + 1 chore-alignment, with the chore-alignment PR carrying 6 commits internally).
+- All 39 test files, 253 specs pass (2 new: `{{BASE_BRANCH}}` substitution + default fallback).
+
 ## 0.8.1 — 2026-05-14
 
 Patch release fronting two Linear-gateway fixes that the 2026-05-14 PM drain surfaced. Both quietly degraded the HITL / prior-attempt-feedback loops in ways that only show up under real operator conditions.
