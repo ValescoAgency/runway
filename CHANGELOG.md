@@ -4,6 +4,22 @@ All notable changes to runway are documented here. Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); breaking
 changes bump the major.
 
+## 0.7.1 — 2026-05-14
+
+Patch release: tightens `fetchReady`'s queue-picker contract so runway only attempts issues it should actually pick up.
+
+### Fixed
+
+- **`fetchReady` ignored `blockedBy` and the HITL label** ([PR #58](https://github.com/ValescoAgency/runway/pull/58), VA-394). The queue picker previously returned every `Todo` issue regardless of dependency state or applied labels — so sequential dependency chains could advance out of order, and triage's `ready-for-human` flag (also applied by runway on prior HITL escapes) was silently overridden. Per-candidate eligibility now:
+  - Skips any issue with at least one `blocks`-type `inverseRelation` whose blocker is in a non-terminal workflow state (anything other than `completed`/`canceled`).
+  - Skips any issue carrying `config.hitlLabel` (default `ready-for-human`).
+- Eligibility uses the SDK's chained `labels()` and `inverseRelations()` calls, both validated through narrow `effect/Schema` decoders. Non-`blocks` relation types (`duplicate`, `related`) do not gate pickup. Drift in either relation node surfaces as the usual `LinearSchemaError` rather than a downstream runtime crash.
+
+### Internal — release stats
+
+- **1 commit since 0.7.0** (1 fix).
+- All 34 test files, 189 specs pass. New: `src/linear-filter.test.ts` (6 specs covering the eligibility filters); `src/linear-schema.test.ts` happy path updated to mock the new chained calls.
+
 ## 0.7.0 — 2026-05-14
 
 Closes the **reject → comment → retry feedback loop** that was silently broken: when the sandcastle review agent rejected an issue and HITL posted the rejection reason as a Linear comment, the next runway pickup of that issue did not fetch those comments and the implementer would silently re-bug. One feat ([PR #56](https://github.com/ValescoAgency/runway/pull/56), VA-383) plus a dep-freshening pass — every dep ≥2 days old at publish time got bumped, including four majors (`@linear/sdk` 41→84, `typescript` 5→6, `zod` 3→4, `@types/node` 22→25). All 183 tests pass under the bumped tree.
