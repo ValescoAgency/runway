@@ -14,14 +14,14 @@ jobs:
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup pnpm
         # Version is read from `packageManager` in package.json
         # (pnpm@11.1.1). Don't set `version:` here — it conflicts with
         # the package.json pin and pnpm/action-setup@v4 will refuse to
         # pick a winner.
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       - name: Setup Node 24
         uses: actions/setup-node@v4
