@@ -52,15 +52,23 @@ const WorkflowStateTypeNodeSchema = Schema.Struct({
 // integration comments can lack an author); we map a missing user to
 // the empty string so downstream filters can match by name without a
 // null-guard at every call site.
+//
+// VA-415: `user` can also be *absent from the payload entirely* (vs.
+// present-and-null) on some system / deleted-user comments. The
+// optional + nullable shape below accepts all three forms: missing,
+// null, and full struct. Downstream code already null-coalesces via
+// `comment.user?.name ?? ""`.
 const CommentNodeSchema = Schema.Struct({
   id: Schema.String,
   body: Schema.String,
   createdAt: Schema.Union(Schema.String, Schema.DateFromSelf),
-  user: Schema.NullOr(
-    Schema.Struct({
-      id: Schema.String,
-      name: Schema.String,
-    }),
+  user: Schema.optional(
+    Schema.NullOr(
+      Schema.Struct({
+        id: Schema.String,
+        name: Schema.String,
+      }),
+    ),
   ),
 });
 const ViewerSchema = Schema.Struct({
@@ -505,21 +513,42 @@ export function createLinearGateway(
                 message: `Issue ${issueId} has no team`,
               });
             }
+            // VA-416: Linear labels can be team-scoped OR
+            // workspace-scoped (no team association). Earlier code
+            // filtered by team only, which silently excluded
+            // workspace-scoped labels like the default
+            // `ready-for-human`. Query by name alone, then prefer a
+            // team-scoped match when one exists so the team-vs-
+            // workspace name-collision edge resolves the obvious way.
             const labels = await client.issueLabels({
-              filter: {
-                team: { id: { eq: team.id } },
-                name: { eq: labelName },
-              },
+              filter: { name: { eq: labelName } },
             });
-            const rawLabel = labels.nodes[0];
-            if (!rawLabel) {
+            const decoded = labels.nodes.map((l) => ({
+              raw: l,
+              decoded: decodeIssueLabelNode(l),
+            }));
+            const teamScoped = await (async () => {
+              for (const { raw, decoded: d } of decoded) {
+                const labelTeam = await raw.team;
+                if (labelTeam?.id === team.id) return d;
+              }
+              return undefined;
+            })();
+            const workspaceScoped = await (async () => {
+              for (const { raw, decoded: d } of decoded) {
+                const labelTeam = await raw.team;
+                if (!labelTeam) return d;
+              }
+              return undefined;
+            })();
+            const label = teamScoped ?? workspaceScoped;
+            if (!label) {
               throw new LinearNotFound({
                 resource: "label",
                 identifier: labelName,
-                message: `Linear label "${labelName}" not found on team ${team.id}`,
+                message: `Linear label "${labelName}" not found at workspace scope or on team ${team.id}`,
               });
             }
-            const label = decodeIssueLabelNode(rawLabel);
             const existing = await issue.labels();
             const existingIds = existing.nodes.map(
               (l) => decodeIssueLabelNode(l).id,
