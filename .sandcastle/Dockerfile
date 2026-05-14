@@ -1,0 +1,123 @@
+# Canonical claude-code Dockerfile — vendored from
+# @ai-hero/sandcastle's InitService.ts (CLAUDE_CODE_DOCKERFILE constant).
+# Kept here so `runway init` can write it directly, without invoking
+# `sandcastle init` (which has interactive prompts that hang in
+# non-TTY environments like CI / Mac Mini cron).
+#
+# Drift policy: when sandcastle bumps its claude-code Dockerfile,
+# refresh this file. The diff should be tiny — runway's tier 2 layer
+# patches AFTER this base, so adopters re-run `runway init --force`
+# to roll forward.
+
+FROM node:22-bookworm
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+  git \
+  curl \
+  jq \
+  && rm -rf /var/lib/apt/lists/*
+
+# Build-args for UID/GID alignment: defaults match the host user's
+# UID/GID at build time so image-built files and bind-mounted files
+# share an owner without runtime chown.
+ARG AGENT_UID=1000
+ARG AGENT_GID=1000
+
+# Rename the base image's "node" user to "agent" and align UID/GID.
+#
+# Divergence from sandcastle's stock Dockerfile: stock runs
+# `groupmod -g $AGENT_GID node` unconditionally, which fails on macOS
+# hosts where the host GID is 20 (`staff`) — Debian's `dialout` group
+# already has GID 20, and `groupmod` refuses to assign a duplicate
+# GID. We guard with `getent group` so groupmod only runs if the
+# target GID is unused; if it's already taken, we point the agent
+# user at the pre-existing group via `usermod -g <gid>` and the
+# image still works (the in-image group name is irrelevant — only the
+# numeric GID matters for bind-mount permissions).
+RUN if ! getent group $AGENT_GID >/dev/null; then \
+      groupmod -g $AGENT_GID node; \
+    fi \
+ && usermod -u $AGENT_UID -g $AGENT_GID -d /home/agent -m -l agent node
+
+# VA-351: bake the container env up front so agents don't manually
+# work around host-path leaks, missing pnpm, or unset HOME on every
+# iteration. Without these, every agent run repeats the same
+# corepack/TURBO_CACHE_DIR/HOME setup commands — see VA-312's run log
+# for the receipts.
+ENV HOME=/home/agent
+ENV XDG_CACHE_HOME=/home/agent/.cache
+ENV TURBO_CACHE_DIR=/tmp/turbo-cache
+ENV npm_config_cache=/home/agent/.cache/npm
+
+# Pre-create cache dirs with agent ownership so the first pnpm/turbo
+# run doesn't have to chown them. Both are inside paths the agent owns
+# anyway; this just makes them exist.
+RUN mkdir -p /home/agent/.cache /home/agent/.cache/npm /tmp/turbo-cache \
+ && chown -R $AGENT_UID:$AGENT_GID /home/agent/.cache /tmp/turbo-cache
+
+# Bake pnpm via corepack at build time so `pnpm` is on PATH inside the
+# container before any agent command runs. Pin a default; target repos
+# can override at runtime via `packageManager` in package.json +
+# `corepack use`.
+RUN corepack enable \
+ && corepack prepare pnpm@10.0.0 --activate
+
+USER ${AGENT_UID}:${AGENT_GID}
+
+# Install Claude Code CLI
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+# Add Claude to PATH
+ENV PATH="/home/agent/.local/bin:$PATH"
+
+WORKDIR /home/agent
+
+# In worktree sandbox mode, Sandcastle bind-mounts the git worktree at
+# the sandbox repo dir and overrides the working directory to that dir
+# at container start.
+# --- runway tier-2 layer (varlock + 1Password) ---
+# Spliced in by `runway init --tier=2` immediately before the
+# final `ENTRYPOINT ["sleep", "infinity"]` line.
+
+# Install varlock via npm. The official `ghcr.io/dmno-dev/varlock`
+# image is musl/Alpine — copying its binary into a glibc base
+# (node:22-bookworm) produces an ELF that the loader can't resolve
+# ("not found" on exec). npm install gets the right binary for the
+# image's libc.
+USER root
+RUN npm install -g varlock
+
+# Install the 1Password CLI so varlock can resolve `op://` references.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl gnupg \
+  && curl -sS https://downloads.1password.com/linux/keys/1password.asc \
+      | gpg --dearmor -o /usr/share/keyrings/1password-archive-keyring.gpg \
+  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/1password-archive-keyring.gpg] https://downloads.1password.com/linux/debian/$(dpkg --print-architecture) stable main" \
+      > /etc/apt/sources.list.d/1password.list \
+  && apt-get update && apt-get install -y 1password-cli \
+  && rm -rf /var/lib/apt/lists/*
+
+# Shim the `claude` binary so every invocation runs through varlock.
+# The real binary moves to claude.real; the shim resolves secrets from
+# 1Password (using OP_SERVICE_ACCOUNT_TOKEN passed in by runway) and
+# execs the real claude with secrets in its process env. Secrets exist
+# only inside the lifetime of one claude invocation — never in any
+# image layer, never on the container filesystem.
+RUN mv /home/agent/.local/bin/claude /home/agent/.local/bin/claude.real \
+  && printf '%s\n' \
+       '#!/usr/bin/env bash' \
+       'set -euo pipefail' \
+       'exec varlock run --env-file /home/agent/workspace/.env.schema -- /home/agent/.local/bin/claude.real "$@"' \
+       > /home/agent/.local/bin/claude \
+  && chmod +x /home/agent/.local/bin/claude \
+  && chown ${AGENT_UID}:${AGENT_GID} /home/agent/.local/bin/claude
+
+USER ${AGENT_UID}:${AGENT_GID}
+
+# Final ENTRYPOINT remains:
+#   ENTRYPOINT ["sleep", "infinity"]
+# Sandcastle will `docker exec <container> claude ...` and our shim
+# transparently wraps each invocation.
+
+ENTRYPOINT ["sleep", "infinity"]
