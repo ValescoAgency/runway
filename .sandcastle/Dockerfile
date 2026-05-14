@@ -9,7 +9,7 @@
 # patches AFTER this base, so adopters re-run `runway init --force`
 # to roll forward.
 
-FROM node:22-bookworm
+FROM node:24-bookworm
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -61,7 +61,7 @@ RUN mkdir -p /home/agent/.cache /home/agent/.cache/npm /tmp/turbo-cache \
 # can override at runtime via `packageManager` in package.json +
 # `corepack use`.
 RUN corepack enable \
- && corepack prepare pnpm@10.0.0 --activate
+ && corepack prepare pnpm@11.1.1 --activate
 
 USER ${AGENT_UID}:${AGENT_GID}
 
@@ -82,7 +82,7 @@ WORKDIR /home/agent
 
 # Install varlock via npm. The official `ghcr.io/dmno-dev/varlock`
 # image is musl/Alpine — copying its binary into a glibc base
-# (node:22-bookworm) produces an ELF that the loader can't resolve
+# (node:24-bookworm) produces an ELF that the loader can't resolve
 # ("not found" on exec). npm install gets the right binary for the
 # image's libc.
 USER root
