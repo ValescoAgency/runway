@@ -172,6 +172,14 @@ export LINEAR_API_KEY=lin_api_...
 # export RUNWAY_IN_REVIEW_STATUS="In Review"
 # export RUNWAY_HITL_LABEL="ready-for-human"
 # export RUNWAY_MAX_ITERATIONS=5
+# export RUNWAY_COMMENT_AUTHOR_ALLOWLIST="Reviewer Bot,Jane Reviewer"
+#   optional, comma-separated Linear user names whose comments on a
+#   re-queued issue surface as "Review feedback from prior attempts"
+#   in the implement prompt. Defaults to the Linear user the API key
+#   authenticates as (which is both the reviewer-agent's identity
+#   and, in the solo-dev case, the repo owner). Set this only when
+#   the reviewer agent and the repo owner are split across distinct
+#   Linear identities.
 ```
 
 `RUNWAY_HITL_LABEL` defaults to `ready-for-human`, matching the

@@ -65,6 +65,17 @@ export interface RunwayConfig {
   // override via `RUNWAY_HITL_LABEL`.
   readonly hitlLabel: string;
   readonly maxIterations: number;
+  /**
+   * VA-383: Linear-user names whose comments on an issue get surfaced
+   * to the impl agent as "Review feedback from prior attempts."
+   * `undefined` (the default) means runway uses the Linear user the
+   * API key authenticates as — which is both the reviewer-agent's
+   * identity and, in the solo-dev case, the repo owner's identity.
+   * Override via `RUNWAY_COMMENT_AUTHOR_ALLOWLIST` as a
+   * comma-separated list of Linear user names when reviewer and owner
+   * are split across distinct identities.
+   */
+  readonly commentAuthorAllowlist?: readonly string[];
 }
 
 // Back-compat alias — existing consumers (orchestrator, gateways)
@@ -108,6 +119,9 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
       validation: (n): n is number => n > 0,
     }),
   ),
+  commentAuthorAllowlist: EConfig.option(
+    EConfig.string("RUNWAY_COMMENT_AUTHOR_ALLOWLIST"),
+  ),
 }).pipe(
   Effect.map(
     (raw): RunwayConfig => ({
@@ -121,6 +135,12 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
       inReviewStatus: raw.inReviewStatus,
       hitlLabel: raw.hitlLabel,
       maxIterations: raw.maxIterations,
+      commentAuthorAllowlist: Option.getOrUndefined(
+        raw.commentAuthorAllowlist,
+      )
+        ?.split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
     }),
   ),
 );

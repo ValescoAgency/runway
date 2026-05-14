@@ -6,6 +6,8 @@ You are an autonomous coding agent working on a single Linear issue.
 
 {{ISSUE_DESCRIPTION}}
 
+{{PRIOR_REVIEW_FEEDBACK}}
+
 {{PREVIOUS_ITERATIONS}}
 
 # Repository context

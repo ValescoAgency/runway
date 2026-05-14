@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import type { RunwayIssue } from "./linear.js";
+import type { RunwayComment, RunwayIssue } from "./linear.js";
 import type { Policy } from "./policy.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -30,6 +30,14 @@ export async function renderImplementPrompt(args: {
   policy: Policy;
   /** Empty for iteration 1; structured summary for 2+ (built by implement.ts). */
   previousIterations: string;
+  /**
+   * VA-383: comments from prior runway attempts on this issue,
+   * pre-filtered and pre-formatted by the orchestrator via
+   * `formatPriorFeedback`. Empty string when there's nothing to
+   * surface — the template variable expands to empty and the
+   * section header disappears from the rendered prompt.
+   */
+  priorReviewFeedback: string;
 }): Promise<string> {
   const template = await loadImplementPrompt();
   return renderPrompt(template, implementVars(args));
@@ -77,12 +85,14 @@ function implementVars(args: {
   issue: RunwayIssue;
   policy: Policy;
   previousIterations: string;
+  priorReviewFeedback: string;
 }): Record<string, string> {
   return {
     ISSUE_IDENTIFIER: args.issue.identifier,
     ISSUE_TITLE: args.issue.title,
     ISSUE_DESCRIPTION: args.issue.description || "(no description)",
     PREVIOUS_ITERATIONS: args.previousIterations,
+    PRIOR_REVIEW_FEEDBACK: args.priorReviewFeedback,
     POLICY_FORBIDDEN_BULLET: renderForbiddenPathsBullet(args.policy),
   };
 }
@@ -99,6 +109,79 @@ function reviewVars(args: {
     DIFF: args.diff || "(empty diff)",
     COMMITS: args.commits || "(no commits)",
   };
+}
+
+/**
+ * VA-383: known orchestrator-emitted comment prefixes that are
+ * bookkeeping noise, not feedback the impl agent should learn from.
+ * Filtering by author alone is insufficient because runway and the
+ * reviewer both post under the API-key owner's identity — so
+ * "Runway picked up this issue. Branch: …" would otherwise leak into
+ * the prior-feedback block on every retry.
+ *
+ * Intentionally does NOT include `Runway flagged for human review:` —
+ * that comment carries the reviewer's rejection reason, which is the
+ * load-bearing signal VA-383 exists to surface.
+ */
+const RUNWAY_BOOKKEEPING_PREFIXES = [
+  "Runway picked up this issue",
+  "Runway opened a PR for review:",
+  "Runway hit a startup failure",
+  "Note: could not apply",
+] as const;
+
+const isRunwayBookkeeping = (body: string): boolean =>
+  RUNWAY_BOOKKEEPING_PREFIXES.some((p) => body.startsWith(p));
+
+/**
+ * VA-383: filter + format the comment set fetched off an issue into
+ * the "Review feedback from prior attempts" block the implement
+ * prompt renders. Pure, side-effect-free, no Linear deps — the
+ * orchestrator owns I/O, this owns the shape.
+ *
+ * Comments survive the filter when **all** of:
+ *   1. author name is in `allowlist` (case-sensitive exact match)
+ *   2. body does NOT begin with a known runway bookkeeping prefix
+ *      (orchestrator transitions, PR-opened announcements, etc.)
+ *
+ * Returns the empty string when nothing makes it through — the
+ * `{{PRIOR_REVIEW_FEEDBACK}}` slot expands to empty and the section
+ * disappears from the rendered prompt entirely.
+ */
+export function formatPriorFeedback(
+  comments: readonly RunwayComment[],
+  allowlist: readonly string[],
+): string {
+  const allowed = new Set(allowlist);
+  const surviving = comments.filter(
+    (c) => allowed.has(c.author) && !isRunwayBookkeeping(c.body),
+  );
+  if (surviving.length === 0) return "";
+
+  // Already sorted ascending by createdAt at the gateway boundary —
+  // re-sort here defensively in case a caller hands us an unsorted
+  // array (the test fixture, for instance, asserts ordering explicitly).
+  const ordered = [...surviving].sort(
+    (a, b) => a.createdAt.getTime() - b.createdAt.getTime(),
+  );
+
+  const entries = ordered.map((c) => {
+    const when = c.createdAt.toISOString();
+    return `### ${when} — ${c.author}\n\n${c.body.trim()}`;
+  });
+  return [
+    "# Review feedback from prior attempts",
+    "",
+    "Prior runway attempts on this issue were rejected. Each block below is a",
+    "review comment to internalize **before** redoing the work — these are the",
+    "specific blockers that caused the previous attempt to be rejected. The",
+    "issue description above is the spec; the comments here are augmenting",
+    "guidance. If the two contradict, prefer the spec and call out the conflict",
+    "in your final message.",
+    "",
+    entries.join("\n\n"),
+    "",
+  ].join("\n");
 }
 
 /**

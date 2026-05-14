@@ -16,13 +16,22 @@ import {
 /**
  * Narrow per-phase deps: the implement loop has no business with
  * Linear or GitHub gateways. Policy is here because it shapes the
- * implement prompt's "do-not-touch" bullet (VA-352).
+ * implement prompt's "do-not-touch" bullet (VA-352). `priorFeedback`
+ * (VA-383) is pre-fetched and pre-formatted by the orchestrator —
+ * the implement loop never reaches for Linear itself.
  */
 export interface ImplementDeps {
   readonly config: Config;
   readonly cwd: string;
   readonly baseBranch: string;
   readonly policy: Policy;
+  /**
+   * VA-383: formatted "Review feedback from prior attempts" block to
+   * inject into iteration 1's prompt. Empty string when the
+   * orchestrator found no surviving comments (or the fetch failed —
+   * in which case the run continues, per VA-383's never-block AC).
+   */
+  readonly priorFeedback: string;
 }
 
 /**
@@ -87,7 +96,7 @@ export const runImplementLoop = (
   branch: string,
 ): Effect.Effect<ImplementOutcome, { readonly message: string }, never> =>
   Effect.gen(function* () {
-    const { config, cwd, baseBranch, policy } = deps;
+    const { config, cwd, baseBranch, policy, priorFeedback } = deps;
     const maxIters = Math.max(1, config.maxIterations);
     let prevSummary = "";
     let implementResult: SandcastleRunResult | undefined;
@@ -99,6 +108,12 @@ export const runImplementLoop = (
           issue,
           policy,
           previousIterations: prevSummary,
+          // VA-383: surface prior-attempt review feedback on every
+          // iteration of this run — the rejection blockers that put
+          // the issue back to Todo are equally relevant on iteration 1
+          // and iteration N+1, since the implementer keeps drifting
+          // toward the same code paths until corrected.
+          priorReviewFeedback: priorFeedback,
         }),
       );
 

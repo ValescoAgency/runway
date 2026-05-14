@@ -36,12 +36,34 @@ const IssueLabelNodeSchema = Schema.Struct({
 const ProjectNodeSchema = Schema.Struct({
   id: Schema.String,
 });
+// VA-383: comments fetched for surfacing prior-attempt review feedback
+// to the implementer. `user` is nullable on Linear's side (system /
+// integration comments can lack an author); we map a missing user to
+// the empty string so downstream filters can match by name without a
+// null-guard at every call site.
+const CommentNodeSchema = Schema.Struct({
+  id: Schema.String,
+  body: Schema.String,
+  createdAt: Schema.Union(Schema.String, Schema.DateFromSelf),
+  user: Schema.NullOr(
+    Schema.Struct({
+      id: Schema.String,
+      name: Schema.String,
+    }),
+  ),
+});
+const ViewerSchema = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+});
 
 const decodeIssueNode = Schema.decodeUnknownSync(IssueNodeSchema);
 const decodeWorkflowStateNode = Schema.decodeUnknownSync(WorkflowStateNodeSchema);
 const decodeTeamNode = Schema.decodeUnknownSync(TeamNodeSchema);
 const decodeIssueLabelNode = Schema.decodeUnknownSync(IssueLabelNodeSchema);
 const decodeProjectNode = Schema.decodeUnknownSync(ProjectNodeSchema);
+const decodeCommentNode = Schema.decodeUnknownSync(CommentNodeSchema);
+const decodeViewer = Schema.decodeUnknownSync(ViewerSchema);
 
 /**
  * Trimmed-down view of a Linear issue — just what runway's loop needs.
@@ -53,6 +75,20 @@ export interface RunwayIssue {
   readonly identifier: string; // "VA-123"
   readonly title: string;
   readonly description: string;
+}
+
+/**
+ * VA-383: trimmed comment view used to surface prior-attempt review
+ * feedback to the implementer. `author` is the comment author's
+ * `name` field (empty string for system/integration comments with no
+ * user) — the orchestrator filters on this against a configured
+ * allowlist before formatting into the prompt.
+ */
+export interface RunwayComment {
+  readonly id: string;
+  readonly author: string;
+  readonly body: string;
+  readonly createdAt: Date;
 }
 
 // VA-356: typed error ADT for the Linear gateway. The orchestrator
@@ -219,6 +255,23 @@ export interface LinearGateway {
     labelName: string,
   ): Effect.Effect<void, LinearError>;
   comment(issueId: string, body: string): Effect.Effect<void, LinearError>;
+  /**
+   * VA-383: fetch every comment on an issue, ordered ascending by
+   * `createdAt`. Used by the orchestrator to surface prior-attempt
+   * review feedback to the implementer. Filtering by author is the
+   * orchestrator's concern — this returns the raw set.
+   */
+  fetchComments(
+    issueId: string,
+  ): Effect.Effect<readonly RunwayComment[], LinearError>;
+  /**
+   * VA-383: the Linear user the API key authenticates as. Resolved
+   * once per drain and used as the default author allowlist for
+   * `fetchComments` — the reviewer agent and orchestrator both post
+   * comments under this identity, so it covers the "review feedback
+   * + repo owner" default named in VA-383's ACs.
+   */
+  viewer(): Effect.Effect<{ readonly id: string; readonly name: string }, LinearError>;
 }
 
 /**
@@ -414,6 +467,53 @@ export function createLinearGateway(
           catch: (err) => classifyLinearError(err, "comment"),
         }),
         { call: "comment" },
+      ));
+    },
+
+    fetchComments(issueId) {
+      return gate(applyLinearPolicy(
+        Effect.tryPromise({
+          try: async () => {
+            // Linear SDK paginates by default — use the issue-scoped
+            // accessor and let the SDK's first page suffice for the
+            // common case (Runway's HITL + reviewer flow rarely
+            // produces more than a handful per attempt). If issues
+            // start blowing past the page limit, fold in pagination.
+            const issue = await client.issue(issueId);
+            const comments = await issue.comments();
+            const decoded = comments.nodes.map((raw) => {
+              const c = decodeCommentNode(raw);
+              const createdAt =
+                c.createdAt instanceof Date ? c.createdAt : new Date(c.createdAt);
+              return {
+                id: c.id,
+                author: c.user?.name ?? "",
+                body: c.body,
+                createdAt,
+              } satisfies RunwayComment;
+            });
+            // VA-383: ascending by createdAt so the impl agent reads
+            // feedback in the order it was given.
+            return [...decoded].sort(
+              (a, b) => a.createdAt.getTime() - b.createdAt.getTime(),
+            ) as readonly RunwayComment[];
+          },
+          catch: (err) => classifyLinearError(err, "fetchComments"),
+        }),
+        { call: "fetchComments" },
+      ));
+    },
+
+    viewer() {
+      return gate(applyLinearPolicy(
+        Effect.tryPromise({
+          try: async () => {
+            const v = await client.viewer;
+            return decodeViewer({ id: v.id, name: v.name });
+          },
+          catch: (err) => classifyLinearError(err, "viewer"),
+        }),
+        { call: "viewer" },
       ));
     },
   };
