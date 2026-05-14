@@ -1,6 +1,7 @@
 import {
   Config as EConfig,
   type ConfigError,
+  ConfigProvider,
   Context,
   Effect,
   Layer,
@@ -155,12 +156,44 @@ export class ConfigTag extends Context.Tag("RunwayConfig")<
   RunwayConfig
 >() {}
 
+// VA-411: Build a ConfigProvider from an explicit env-like object so
+// tests (and any other caller that needs hermetic isolation from the
+// host environment) can drive config loading without mutating
+// `process.env`. The path delimiter matches Effect's `fromEnv` so a
+// `Map(process.env)` and a real env behave the same for our flat
+// `RUNWAY_*` keys.
+const providerFromEnv = (
+  env: Record<string, string | undefined>,
+): ConfigProvider.ConfigProvider => {
+  const map = new Map<string, string>();
+  for (const [k, v] of Object.entries(env)) {
+    if (typeof v === "string") map.set(k, v);
+  }
+  return ConfigProvider.fromMap(map, { pathDelim: "_" });
+};
+
+/**
+ * VA-411: Build a `ConfigLive` Layer that resolves env vars from an
+ * explicit env map instead of `process.env`. Production callers use
+ * the default `ConfigLive` (which reads `process.env`); tests pass
+ * an explicit map so host env leaks (e.g. an `.envrc` that exports
+ * `RUNWAY_LINEAR_PROJECT`) can't break assertions.
+ */
+export function makeConfigLive(
+  env: Record<string, string | undefined> = process.env,
+): Layer.Layer<ConfigTag, ConfigError.ConfigError> {
+  return Layer.effect(
+    ConfigTag,
+    configEffect.pipe(Effect.withConfigProvider(providerFromEnv(env))),
+  );
+}
+
 /**
  * Layer that resolves env vars once and makes the result available
  * via `ConfigTag` for the rest of the program.
  */
 export const ConfigLive: Layer.Layer<ConfigTag, ConfigError.ConfigError> =
-  Layer.effect(ConfigTag, configEffect);
+  makeConfigLive();
 
 /**
  * Sync helper for non-Effect callers (`runway doctor` early
@@ -169,7 +202,15 @@ export const ConfigLive: Layer.Layer<ConfigTag, ConfigError.ConfigError> =
  * the `ConfigError` on a missing/invalid env var — the caller's
  * existing `catch (err) { … errMsg(err) … }` shape rendered the
  * Zod issue the same way it'll now render the Effect ConfigError.
+ *
+ * VA-411: Accepts an optional `env` map so tests can drive the
+ * loader hermetically. Defaults to `process.env` for production
+ * callers.
  */
-export function loadConfig(): RunwayConfig {
-  return Effect.runSync(configEffect);
+export function loadConfig(
+  env: Record<string, string | undefined> = process.env,
+): RunwayConfig {
+  return Effect.runSync(
+    configEffect.pipe(Effect.withConfigProvider(providerFromEnv(env))),
+  );
 }
