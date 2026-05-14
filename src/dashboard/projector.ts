@@ -54,36 +54,60 @@ export interface RawSpanRow {
   readonly payload: string;
 }
 
+/**
+ * VA-389 (dashboard slice 4): one row per implement-loop iteration.
+ * `issueProcessSpanId` is the parent `processIssue` span id — the
+ * detail pane joins iterations to their issue process on that key.
+ * `iterationIndex` is parsed from the span name (`impl-iter-N`); we
+ * don't trust the `runway.iteration` attribute as the source of truth
+ * because the name is what classifies the span as an iteration in
+ * the first place.
+ */
+export interface AgentIterationRow {
+  readonly traceId: string;
+  readonly spanId: string;
+  readonly issueProcessSpanId: string | null;
+  readonly iterationIndex: number;
+  readonly startTimeUnixNano: string;
+  readonly endTimeUnixNano: string;
+  readonly sandcastleRunId: string | null;
+  readonly exitStatus: string | null;
+}
+
 export interface Projection {
   readonly drains: readonly DrainRow[];
   readonly issueProcesses: readonly IssueProcessRow[];
+  readonly agentIterations: readonly AgentIterationRow[];
   readonly rawSpans: readonly RawSpanRow[];
 }
 
 const DRAIN_SPAN = "drainQueue";
 const ISSUE_PROCESS_SPAN = "processIssue";
+const IMPL_ITER_SPAN_RE = /^impl-iter-(\d+)$/;
 
 /**
  * Project an OTLP traces payload into typed runway rows + the raw
  * escape hatch. Every span (typed or not) lands in `raw_spans`; the
- * two domain spans additionally project into their typed tables.
+ * domain spans additionally project into their typed tables.
  */
 export function projectPayload(payload: OtlpTracesPayload): Projection {
   const drains: DrainRow[] = [];
   const issueProcesses: IssueProcessRow[] = [];
+  const agentIterations: AgentIterationRow[] = [];
   const rawSpans: RawSpanRow[] = [];
 
   for (const rs of payload.resourceSpans ?? []) {
-    collectFromResourceSpan(rs, drains, issueProcesses, rawSpans);
+    collectFromResourceSpan(rs, drains, issueProcesses, agentIterations, rawSpans);
   }
 
-  return { drains, issueProcesses, rawSpans };
+  return { drains, issueProcesses, agentIterations, rawSpans };
 }
 
 function collectFromResourceSpan(
   rs: OtlpResourceSpans,
   drains: DrainRow[],
   issueProcesses: IssueProcessRow[],
+  agentIterations: AgentIterationRow[],
   rawSpans: RawSpanRow[],
 ): void {
   for (const ss of rs.scopeSpans ?? []) {
@@ -94,6 +118,9 @@ function collectFromResourceSpan(
       } else if (span.name === ISSUE_PROCESS_SPAN) {
         const ip = projectIssueProcess(span);
         if (ip) issueProcesses.push(ip);
+      } else {
+        const iter = projectAgentIteration(span);
+        if (iter) agentIterations.push(iter);
       }
     }
   }
@@ -149,6 +176,31 @@ function projectIssueProcess(span: OtlpSpan): IssueProcessRow | undefined {
     endTimeUnixNano: span.endTimeUnixNano,
     statusCode: span.status?.code ?? null,
     statusMessage: span.status?.message ?? null,
+  };
+}
+
+/**
+ * VA-389: project a span named `impl-iter-N` into an `AgentIteration`
+ * row. Iteration index comes from the span name (the canonical
+ * classifier); `runway.iteration.exit_status` and
+ * `runway.iteration.sandcastle_run_id` (annotated by the implement
+ * loop) carry the per-iteration metadata the detail pane shows.
+ */
+function projectAgentIteration(span: OtlpSpan): AgentIterationRow | undefined {
+  const match = IMPL_ITER_SPAN_RE.exec(span.name);
+  if (!match) return undefined;
+  const idx = Number(match[1]);
+  if (!Number.isFinite(idx)) return undefined;
+  const m = attrMap(span.attributes);
+  return {
+    traceId: span.traceId,
+    spanId: span.spanId,
+    issueProcessSpanId: span.parentSpanId ?? null,
+    iterationIndex: idx,
+    startTimeUnixNano: span.startTimeUnixNano,
+    endTimeUnixNano: span.endTimeUnixNano,
+    sandcastleRunId: strAttr(m["runway.iteration.sandcastle_run_id"]) ?? null,
+    exitStatus: strAttr(m["runway.iteration.exit_status"]) ?? null,
   };
 }
 

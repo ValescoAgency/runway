@@ -255,6 +255,140 @@ describe("projectPayload — multiple resource/scope spans", () => {
 
   it("returns empty projections for an empty payload (smoke)", () => {
     const out = projectPayload({ resourceSpans: [] });
-    expect(out).toEqual({ drains: [], issueProcesses: [], rawSpans: [] });
+    expect(out).toEqual({
+      drains: [],
+      issueProcesses: [],
+      agentIterations: [],
+      rawSpans: [],
+    });
+  });
+});
+
+// VA-389: agent iterations are children of a processIssue span. The
+// projector keys them on the parent_span_id so the detail pane can
+// fetch them by issue process.
+describe("projectPayload — impl-iter-N (VA-389)", () => {
+  it("projects a single impl-iter-N span into an agent_iterations row", () => {
+    const out = projectPayload(
+      payload([
+        span({
+          name: "impl-iter-1",
+          spanId: "aaaa000000000001",
+          parentSpanId: "1111111111111111",
+          startTimeUnixNano: "1715000000000000000",
+          endTimeUnixNano: "1715000010000000000",
+          attributes: [
+            { key: "runway.iteration", value: { intValue: "1" } },
+            { key: "runway.iteration.max", value: { intValue: "5" } },
+            {
+              key: "runway.iteration.exit_status",
+              value: { stringValue: "done" },
+            },
+            {
+              key: "runway.iteration.sandcastle_run_id",
+              value: { stringValue: "impl-VA-1-iter-1" },
+            },
+          ],
+        }),
+      ]),
+    );
+
+    expect(out.agentIterations).toHaveLength(1);
+    expect(out.agentIterations[0]).toMatchObject({
+      spanId: "aaaa000000000001",
+      issueProcessSpanId: "1111111111111111",
+      iterationIndex: 1,
+      startTimeUnixNano: "1715000000000000000",
+      endTimeUnixNano: "1715000010000000000",
+      sandcastleRunId: "impl-VA-1-iter-1",
+      exitStatus: "done",
+    });
+  });
+
+  it("extracts a multi-iteration hitl loop (e.g. iter 1 continue → iter 2 blocked)", () => {
+    const out = projectPayload(
+      payload([
+        span({
+          name: "processIssue",
+          spanId: "1111111111111111",
+          attributes: [
+            { key: "runway.issue.identifier", value: { stringValue: "VA-9" } },
+            { key: "runway.outcome.kind", value: { stringValue: "hitl" } },
+          ],
+        }),
+        span({
+          name: "impl-iter-1",
+          spanId: "aaaa000000000001",
+          parentSpanId: "1111111111111111",
+          startTimeUnixNano: "1715000000000000000",
+          endTimeUnixNano: "1715000010000000000",
+          attributes: [
+            {
+              key: "runway.iteration.exit_status",
+              value: { stringValue: "continue" },
+            },
+            {
+              key: "runway.iteration.sandcastle_run_id",
+              value: { stringValue: "impl-VA-9-iter-1" },
+            },
+          ],
+        }),
+        span({
+          name: "impl-iter-2",
+          spanId: "aaaa000000000002",
+          parentSpanId: "1111111111111111",
+          startTimeUnixNano: "1715000010000000000",
+          endTimeUnixNano: "1715000025000000000",
+          attributes: [
+            {
+              key: "runway.iteration.exit_status",
+              value: { stringValue: "blocked" },
+            },
+            {
+              key: "runway.iteration.sandcastle_run_id",
+              value: { stringValue: "impl-VA-9-iter-2" },
+            },
+          ],
+        }),
+      ]),
+    );
+
+    expect(out.issueProcesses).toHaveLength(1);
+    expect(out.agentIterations).toHaveLength(2);
+    expect(out.agentIterations.map((r) => r.iterationIndex)).toEqual([1, 2]);
+    expect(out.agentIterations.map((r) => r.exitStatus)).toEqual([
+      "continue",
+      "blocked",
+    ]);
+    // Every iteration links back to the same processIssue span_id so
+    // the detail pane can fetch them by issue_process_id.
+    expect(
+      new Set(out.agentIterations.map((r) => r.issueProcessSpanId)),
+    ).toEqual(new Set(["1111111111111111"]));
+  });
+
+  it("leaves exit_status and sandcastle_run_id null when the iteration span has no attribute set (in-flight)", () => {
+    const out = projectPayload(
+      payload([
+        span({
+          name: "impl-iter-1",
+          parentSpanId: "1111111111111111",
+        }),
+      ]),
+    );
+    expect(out.agentIterations).toHaveLength(1);
+    expect(out.agentIterations[0]?.exitStatus).toBeNull();
+    expect(out.agentIterations[0]?.sandcastleRunId).toBeNull();
+  });
+
+  it("does not match span names that merely contain 'impl-iter-' (anchored regex)", () => {
+    const out = projectPayload(
+      payload([
+        span({ name: "pre-impl-iter-1" }),
+        span({ name: "impl-iter-X" }),
+        span({ name: "impl-iter" }),
+      ]),
+    );
+    expect(out.agentIterations).toHaveLength(0);
   });
 });
