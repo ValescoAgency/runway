@@ -348,17 +348,21 @@ const processIssue = (
       `Runway picked up this issue. Branch: \`${branch}\`.`,
     );
 
-    // VA-366: if a prior attempt left an `agent/<id>` branch behind
-    // with zero commits ahead of base (typical of a startup-failure
-    // retry), delete it so sandcastle's worktree creation forks from
-    // current `baseBranch` HEAD. Preserves the branch when it carries
-    // real work. Best-effort — failures here don't abort the issue.
+    // VA-366 + VA-417: keep the agent branch from carrying state
+    // forward across drains.
+    //   - VA-366: if a prior attempt left `agent/<id>` behind with no
+    //     commits (typical of a startup-failure retry), delete it.
+    //   - VA-417: if `agent/<id>` carries commits from a prior attempt
+    //     that review rejected, reset it to `origin/<baseBranch>` so
+    //     the impl agent doesn't observe the rejected diff and signal
+    //     `IMPL: DONE` without modification.
+    // The function fails ONLY with `AgentBranchResetTargetUnreachable`
+    // (origin/<base> AND local <base> both missing — env/config
+    // issue). `Effect.orDie` kills the drain so the operator fixes
+    // the env rather than re-trigger the no-op pattern; other git
+    // failures inside the function are already swallowed there.
     yield* pruneStaleAgentBranch(deps.cwd, deps.baseBranch, branch).pipe(
-      Effect.catchAll((err) =>
-        Effect.logWarning(
-          `${issue.identifier}: pruneStaleAgentBranch failed (continuing): ${err.message}`,
-        ),
-      ),
+      Effect.orDie,
     );
 
     // VA-418: in-run review-rejection retry loop. Each iteration runs

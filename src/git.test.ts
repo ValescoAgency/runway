@@ -118,7 +118,7 @@ describe("hasCommits (VA-358)", () => {
   });
 });
 
-describe("pruneStaleAgentBranch (VA-366)", () => {
+describe("pruneStaleAgentBranch (VA-366 + VA-417)", () => {
   const runPrune = (base = "main", branch = "agent/va-1") =>
     Effect.runPromise(pruneStaleAgentBranch("/tmp/repo", base, branch));
 
@@ -133,38 +133,142 @@ describe("pruneStaleAgentBranch (VA-366)", () => {
     ]);
   });
 
-  it("preserves the branch when it has commits ahead of base", async () => {
+  it("VA-417: resets the branch to origin/<base> when it has commits ahead", async () => {
+    // The HITL-retry case. agent/va-1 carries a rejected prior diff;
+    // we move the ref to origin/main so the impl agent re-runs from a
+    // clean tree instead of treating the rejected commits as
+    // authoritative.
     execaMock
-      .mockResolvedValueOnce({ exitCode: 0, stdout: "abc123\n" }) // rev-parse exists
-      .mockResolvedValueOnce({ exitCode: 0, stdout: "3\n" }); // rev-list count
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "abc123\n" }) // rev-parse: branch exists
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "3\n" }) // rev-list count > 0
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "def456\n" }) // rev-parse: origin/main reachable
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "" }) // worktree list — no attached worktree
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "" }); // update-ref
     await runPrune();
-    expect(execaMock).toHaveBeenCalledTimes(2);
-    // No third call (no `git branch -D`).
+    const updateRefCall = execaMock.mock.calls.find(
+      (c) => c[1]?.[0] === "update-ref",
+    );
+    expect(updateRefCall?.[1]).toEqual([
+      "update-ref",
+      "refs/heads/agent/va-1",
+      "refs/remotes/origin/main",
+    ]);
+    // No `git branch -D` — the commits are a discarded prior attempt,
+    // not state we want to delete the ref over.
     expect(
       execaMock.mock.calls.find((c) => c[1]?.[0] === "branch"),
     ).toBeUndefined();
   });
 
-  it("deletes the branch via `git branch -D` when it exists with zero commits ahead", async () => {
+  it("VA-417: removes any worktree attached to the branch before resetting the ref", async () => {
+    // If sandcastle's prior-run cleanup left a worktree dangling on
+    // the branch, sandcastle's reuse path would see a dirty worktree
+    // (HEAD ref moved out from under the working tree) and warn-and-
+    // reuse instead of forking fresh. Remove first.
+    const worktreePath = "/tmp/repo/.sandcastle/worktrees/agent-va-1";
+    const porcelain = [
+      "worktree /tmp/repo",
+      "HEAD aaa",
+      "branch refs/heads/main",
+      "",
+      `worktree ${worktreePath}`,
+      "HEAD bbb",
+      "branch refs/heads/agent/va-1",
+      "",
+    ].join("\n");
+    execaMock
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "abc123\n" }) // rev-parse: branch exists
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "1\n" }) // rev-list count > 0
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "def456\n" }) // origin/main reachable
+      .mockResolvedValueOnce({ exitCode: 0, stdout: porcelain }) // worktree list
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "" }) // worktree remove --force
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "" }); // update-ref
+    await runPrune();
+    const removeCall = execaMock.mock.calls.find(
+      (c) =>
+        Array.isArray(c[1]) &&
+        (c[1] as string[])[0] === "worktree" &&
+        (c[1] as string[])[1] === "remove",
+    );
+    expect(removeCall?.[1]).toEqual([
+      "worktree",
+      "remove",
+      "--force",
+      worktreePath,
+    ]);
+  });
+
+  it("VA-417: falls back to local <base> when origin/<base> is unreachable", async () => {
+    execaMock
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "abc123\n" }) // rev-parse: branch exists
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "2\n" }) // rev-list count > 0
+      .mockResolvedValueOnce({ exitCode: 128, stdout: "" }) // rev-parse: origin/main missing
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "def456\n" }) // rev-parse: local main reachable
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "" }) // worktree list
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "" }); // update-ref
+    await runPrune();
+    const updateRefCall = execaMock.mock.calls.find(
+      (c) => c[1]?.[0] === "update-ref",
+    );
+    expect(updateRefCall?.[1]).toEqual([
+      "update-ref",
+      "refs/heads/agent/va-1",
+      "refs/heads/main",
+    ]);
+  });
+
+  it("VA-417: surfaces a typed error when neither origin/<base> nor local <base> resolve", async () => {
+    execaMock
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "abc123\n" }) // branch exists
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "1\n" }) // commits ahead
+      .mockResolvedValueOnce({ exitCode: 128, stdout: "" }) // origin/main missing
+      .mockResolvedValueOnce({ exitCode: 128, stdout: "" }); // local main missing too
+    await expect(runPrune()).rejects.toThrow(
+      /Cannot reset stale agent branch.*neither.*origin\/main.*nor.*refs\/heads\/main/s,
+    );
+    // Bailed before touching update-ref or worktree state.
+    expect(
+      execaMock.mock.calls.find((c) => c[1]?.[0] === "update-ref"),
+    ).toBeUndefined();
+    expect(
+      execaMock.mock.calls.find(
+        (c) =>
+          Array.isArray(c[1]) &&
+          (c[1] as string[])[0] === "worktree" &&
+          (c[1] as string[])[1] === "remove",
+      ),
+    ).toBeUndefined();
+  });
+
+  it("VA-366: deletes the branch via `git branch -D` when it exists with zero commits ahead", async () => {
     execaMock
       .mockResolvedValueOnce({ exitCode: 0, stdout: "abc123\n" }) // rev-parse exists
       .mockResolvedValueOnce({ exitCode: 0, stdout: "0\n" }) // rev-list count == 0
       .mockResolvedValueOnce({ exitCode: 0, stdout: "" }); // branch -D
     await runPrune();
-    expect(execaMock).toHaveBeenCalledTimes(3);
-    expect(execaMock.mock.calls[2]?.[1]).toEqual(["branch", "-D", "agent/va-1"]);
+    const branchCall = execaMock.mock.calls.find(
+      (c) => c[1]?.[0] === "branch",
+    );
+    expect(branchCall?.[1]).toEqual(["branch", "-D", "agent/va-1"]);
+    // Did NOT take the VA-417 reset path.
+    expect(
+      execaMock.mock.calls.find((c) => c[1]?.[0] === "update-ref"),
+    ).toBeUndefined();
   });
 
   it("preserves the branch (safe default) when hasCommits can't determine state", async () => {
-    // exists check succeeds, but hasCommits throws — we default to
-    // "keep" because losing partial work is worse than reusing a stale
-    // (but committed) branch.
+    // exists check succeeds, but hasCommits throws — we bail rather
+    // than risk either destroying work (VA-417 reset) or losing a
+    // valid stale-tip branch (VA-366 delete) on uncertain state.
     execaMock
       .mockResolvedValueOnce({ exitCode: 0, stdout: "abc123\n" }) // rev-parse exists
       .mockRejectedValueOnce(new Error("git not installed")); // rev-list throws
     await runPrune();
     expect(
       execaMock.mock.calls.find((c) => c[1]?.[0] === "branch"),
+    ).toBeUndefined();
+    expect(
+      execaMock.mock.calls.find((c) => c[1]?.[0] === "update-ref"),
     ).toBeUndefined();
   });
 });

@@ -1,4 +1,4 @@
-import { Data, Effect } from "effect";
+import { Data, Effect, Option } from "effect";
 import { runExecaScoped } from "./subprocess.js";
 
 /**
@@ -160,6 +160,7 @@ export const hasCommits = (
   );
 
 /**
+/**
  * VA-419: outcome of a rebase-onto-base attempt at finalize time.
  *
  *   ok       — fast-forward or clean replay; the agent branch ref now
@@ -253,29 +254,46 @@ export const rebaseOntoBase = (
   });
 
 /**
- * VA-366: prune an agent/<issue> branch from a prior failed attempt
- * so the next worktree creation forks from current `base` HEAD
- * instead of reusing a stale tip.
+ * VA-417: typed failure when neither `origin/<base>` nor local `<base>`
+ * resolves to a SHA in the local refs database. The orchestrator dies
+ * the drain on this — the alternative (silently skip the reset) would
+ * re-trigger the no-op-on-retry pattern this fix exists to close.
+ */
+export class AgentBranchResetTargetUnreachable extends Data.TaggedError(
+  "AgentBranchResetTargetUnreachable",
+)<{
+  readonly message: string;
+  readonly base: string;
+}> {}
+
+/**
+ * VA-366 + VA-417: ensure an `agent/<issue>` branch starts from a
+ * known-good base before sandcastle's worktree creation reuses it.
  *
  * Logic:
- *   1. If the branch doesn't exist → no-op.
- *   2. If it has commits ahead of `base` (`hasCommits` returns true)
- *      → preserve. Agent did real work; resetting would discard it.
- *   3. Otherwise (branch present, no commits ahead) → `git branch -D`.
- *      `-D` (not `-d`) because the branch tip equals or trails base
- *      after the failed attempt, and `-d`'s merge check can refuse
- *      otherwise-equivalent tips.
+ *   1. Branch doesn't exist → no-op (first-attempt case).
+ *   2. Branch exists, zero commits ahead of `base` → VA-366: delete
+ *      so the next worktree creation forks from current base HEAD
+ *      instead of an old base tip.
+ *   3. Branch exists with commits ahead of `base` → VA-417: those
+ *      commits come from a prior attempt that review rejected
+ *      (`fetchReady` filters out open PRs / non-Todo states, so any
+ *      surviving commits here are from a HITL'd retry). Detach any
+ *      worktree still attached to the branch, then reset the ref to
+ *      `origin/<base>` (or local `<base>` as fallback) so the impl
+ *      agent doesn't treat the rejected diff as authoritative.
  *
- * Best-effort: this is a *retry hygiene* operation, not a correctness
- * guarantee. If git fails, we log and continue — sandcastle's
- * worktree creation will still work; the agent just sees the stale
- * branch state that motivated this fix.
+ * Steps 1 + 2 stay best-effort — git failures inside them log and
+ * continue (the existing VA-366 contract). Step 3's reset-target
+ * resolution surfaces a typed `AgentBranchResetTargetUnreachable`;
+ * the orchestrator dies on it so the operator fixes the env rather
+ * than re-trigger the no-op pattern.
  */
 export const pruneStaleAgentBranch = (
   repoPath: string,
   base: string,
   branch: string,
-): Effect.Effect<void, { readonly message: string }, never> =>
+): Effect.Effect<void, AgentBranchResetTargetUnreachable, never> =>
   Effect.gen(function* () {
     // 1. Existence check.
     const exists = yield* runExecaScoped(
@@ -291,20 +309,162 @@ export const pruneStaleAgentBranch = (
     );
     if (!exists) return;
 
-    // 2. Preserve if the branch carries real work.
-    const hasWork = yield* hasCommits(repoPath, base, branch).pipe(
-      // If we can't tell, prefer the safe option — keep the branch.
-      Effect.catchAll(() => Effect.succeed(true)),
+    // 2. Ahead-count. `Effect.option` distinguishes "definitively zero
+    // / non-zero" from "couldn't determine"; in the latter case we
+    // bail to avoid acting destructively on uncertain state.
+    const hasWorkOpt = yield* hasCommits(repoPath, base, branch).pipe(
+      Effect.option,
     );
-    if (hasWork) return;
+    if (Option.isNone(hasWorkOpt)) return;
 
-    // 3. Stale → delete so the next worktree creation forks from base HEAD.
+    if (!hasWorkOpt.value) {
+      // VA-366: branch is at-or-behind base — delete so sandcastle's
+      // next worktree creation forks from current base HEAD.
+      yield* runExecaScoped(
+        "git",
+        ["branch", "-D", branch],
+        { cwd: repoPath, reject: false },
+        (err) => ({
+          message: err instanceof Error ? err.message : String(err),
+        }),
+      ).pipe(Effect.catchAll(() => Effect.succeed(undefined)));
+      return;
+    }
+
+    // 3. VA-417: commits ahead of base come from a HITL-rejected
+    // prior attempt. Resolve the reset target first so we fail loudly
+    // (typed) before touching any worktree state.
+    const target = yield* resolveResetTarget(repoPath, base);
+
+    // 3a. Detach any worktree still attached to this branch — its
+    // working tree would otherwise diverge from the new ref and
+    // sandcastle would reuse it dirty (ADR 0003 reuse-with-warning).
+    yield* removeAttachedWorktree(repoPath, branch);
+
+    // 3b. Move the ref. `update-ref` (rather than `branch -f`) works
+    // regardless of whether step 3a actually succeeded in detaching
+    // every worktree; sandcastle's collision check still has to pass
+    // before any agent code runs.
     yield* runExecaScoped(
       "git",
-      ["branch", "-D", branch],
+      ["update-ref", `refs/heads/${branch}`, target],
       { cwd: repoPath, reject: false },
       (err) => ({
         message: err instanceof Error ? err.message : String(err),
       }),
     ).pipe(Effect.catchAll(() => Effect.succeed(undefined)));
   });
+
+/**
+ * VA-417: resolve the SHA we'll point the agent branch at. Try
+ * `origin/<base>` first (canonical source for HITL-retry resets);
+ * fall back to local `<base>` so a fresh / offline clone with no
+ * configured remote can still recover. Surface a typed error if
+ * neither resolves — silent skipping would re-trigger the no-op
+ * pattern.
+ */
+const resolveResetTarget = (
+  repoPath: string,
+  base: string,
+): Effect.Effect<string, AgentBranchResetTargetUnreachable, never> =>
+  Effect.gen(function* () {
+    const originRef = `refs/remotes/origin/${base}`;
+    const originReachable = yield* runExecaScoped(
+      "git",
+      ["rev-parse", "--verify", originRef],
+      { cwd: repoPath, reject: false },
+      (err) => ({
+        message: err instanceof Error ? err.message : String(err),
+      }),
+    ).pipe(
+      Effect.map((res) => res.exitCode === 0),
+      Effect.catchAll(() => Effect.succeed(false)),
+    );
+    if (originReachable) return originRef;
+
+    const localRef = `refs/heads/${base}`;
+    const localReachable = yield* runExecaScoped(
+      "git",
+      ["rev-parse", "--verify", localRef],
+      { cwd: repoPath, reject: false },
+      (err) => ({
+        message: err instanceof Error ? err.message : String(err),
+      }),
+    ).pipe(
+      Effect.map((res) => res.exitCode === 0),
+      Effect.catchAll(() => Effect.succeed(false)),
+    );
+    if (localReachable) return localRef;
+
+    return yield* Effect.fail(
+      new AgentBranchResetTargetUnreachable({
+        base,
+        message:
+          `Cannot reset stale agent branch: neither ${originRef} nor ` +
+          `${localRef} resolves in ${repoPath}. Run ` +
+          `\`git fetch origin ${base}\` (or set RUNWAY_BASE_BRANCH to ` +
+          `a branch that exists locally) and re-run.`,
+      }),
+    );
+  });
+
+/**
+ * VA-417: if a worktree is checked out on `branch`, remove it so the
+ * branch ref can move freely. Best-effort — sandcastle's `pruneStale`
+ * runs later and will collide on a stale managed worktree, so the
+ * worst case here is "we tried, git refused, sandcastle warns".
+ */
+const removeAttachedWorktree = (
+  repoPath: string,
+  branch: string,
+): Effect.Effect<void, never, never> =>
+  Effect.gen(function* () {
+    const list = yield* runExecaScoped(
+      "git",
+      ["worktree", "list", "--porcelain"],
+      { cwd: repoPath, reject: false },
+      (err) => ({
+        message: err instanceof Error ? err.message : String(err),
+      }),
+    ).pipe(
+      Effect.map((res) => (typeof res.stdout === "string" ? res.stdout : "")),
+      Effect.catchAll(() => Effect.succeed("")),
+    );
+
+    const path = parseWorktreePathForBranch(list, branch);
+    if (!path) return;
+
+    yield* runExecaScoped(
+      "git",
+      ["worktree", "remove", "--force", path],
+      { cwd: repoPath, reject: false },
+      (err) => ({
+        message: err instanceof Error ? err.message : String(err),
+      }),
+    ).pipe(Effect.catchAll(() => Effect.succeed(undefined)));
+  });
+
+/**
+ * Parse `git worktree list --porcelain` output. Each entry is a
+ * `worktree <path>` line followed by metadata (`HEAD`, `branch
+ * refs/heads/<name>`, …) terminated by a blank line. Return the path
+ * of the first entry whose branch matches `branch`, or null.
+ */
+function parseWorktreePathForBranch(
+  porcelain: string,
+  branch: string,
+): string | null {
+  const refPrefix = "branch refs/heads/";
+  let currentPath: string | null = null;
+  for (const line of porcelain.split("\n")) {
+    if (line.startsWith("worktree ")) {
+      currentPath = line.slice("worktree ".length).trim();
+    } else if (line.startsWith(refPrefix)) {
+      const name = line.slice(refPrefix.length).trim();
+      if (name === branch && currentPath) return currentPath;
+    } else if (line.trim() === "") {
+      currentPath = null;
+    }
+  }
+  return null;
+}
