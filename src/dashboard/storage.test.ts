@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type {
+  AgentIterationRow,
   DrainRow,
   IssueProcessRow,
   RawSpanRow,
@@ -52,6 +53,22 @@ function makeRawSpan(over: Partial<RawSpanRow> = {}): RawSpanRow {
     spanId: "3333333333333333",
     name: "unknownSpan",
     payload: JSON.stringify({ name: "unknownSpan" }),
+    ...over,
+  };
+}
+
+function makeAgentIteration(
+  over: Partial<AgentIterationRow> = {},
+): AgentIterationRow {
+  return {
+    traceId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    spanId: "aaaa000000000001",
+    issueProcessSpanId: "2222222222222222",
+    iterationIndex: 1,
+    startTimeUnixNano: "1715000000000000000",
+    endTimeUnixNano: "1715000010000000000",
+    sandcastleRunId: "impl-VA-312-iter-1",
+    exitStatus: "done",
     ...over,
   };
 }
@@ -150,5 +167,193 @@ describe("createStorage — saveDrain / saveIssueProcess / saveRawSpan", () => {
     // If the upsert is broken, the second call would have thrown.
     // No assertion needed beyond "did not throw".
     expect(true).toBe(true);
+  });
+});
+
+// VA-389: detail-pane lookups. Agent iterations are listed by their
+// parent processIssue span_id and returned in iteration_index order.
+describe("createStorage — agent iterations (VA-389)", () => {
+  it("round-trips an agent iteration and lists it under the parent issue process", () => {
+    storage.saveAgentIteration(makeAgentIteration());
+    const out = storage.listAgentIterations(
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "2222222222222222",
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      iterationIndex: 1,
+      exitStatus: "done",
+      sandcastleRunId: "impl-VA-312-iter-1",
+      issueProcessSpanId: "2222222222222222",
+    });
+  });
+
+  it("lists multiple iterations for the same issue process in iteration_index order", () => {
+    // Insert out of order so we can verify the ORDER BY does the work
+    // (a parsed hitl loop arrives over multiple OTel batches in
+    // practice — the projector doesn't sort).
+    storage.saveAgentIteration(
+      makeAgentIteration({
+        spanId: "aaaa000000000002",
+        iterationIndex: 2,
+        exitStatus: "blocked",
+      }),
+    );
+    storage.saveAgentIteration(
+      makeAgentIteration({
+        spanId: "aaaa000000000001",
+        iterationIndex: 1,
+        exitStatus: "continue",
+      }),
+    );
+
+    const out = storage.listAgentIterations(
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "2222222222222222",
+    );
+    expect(out.map((r) => r.iterationIndex)).toEqual([1, 2]);
+    expect(out.map((r) => r.exitStatus)).toEqual(["continue", "blocked"]);
+  });
+
+  it("returns an empty list when no iterations match the issue_process_id", () => {
+    storage.saveAgentIteration(makeAgentIteration());
+    expect(
+      storage.listAgentIterations(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "no-such-parent",
+      ),
+    ).toEqual([]);
+  });
+
+  it("idempotently upserts an agent iteration on a retried emit (last writer wins on exit_status)", () => {
+    storage.saveAgentIteration(
+      makeAgentIteration({ exitStatus: "continue" }),
+    );
+    storage.saveAgentIteration(makeAgentIteration({ exitStatus: "done" }));
+    const out = storage.listAgentIterations(
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "2222222222222222",
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0]?.exitStatus).toBe("done");
+  });
+});
+
+// VA-389: getIssueProcess powers the detail page. Returns undefined
+// when the row isn't yet stored — the caller renders a "not found"
+// page instead of a 500.
+describe("createStorage — getIssueProcess (VA-389)", () => {
+  it("returns the issue process row when (trace_id, span_id) matches", () => {
+    storage.saveIssueProcess(makeIssueProcess());
+    const out = storage.getIssueProcess(
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "2222222222222222",
+    );
+    expect(out?.issueIdentifier).toBe("VA-312");
+  });
+
+  it("returns undefined for an unknown (trace_id, span_id)", () => {
+    expect(
+      storage.getIssueProcess(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "0000000000000000",
+      ),
+    ).toBeUndefined();
+  });
+});
+
+// VA-389: listPhaseSpans uses json_extract over raw_spans so we don't
+// need a typed table per phase. The dashboard passes a fixed allowlist
+// of names (review / pushBranch / openPullRequest).
+describe("createStorage — listPhaseSpans (VA-389)", () => {
+  function rawPhase(over: {
+    name: string;
+    spanId: string;
+    parentSpanId: string;
+    startTimeUnixNano: string;
+    endTimeUnixNano: string;
+    traceId?: string;
+  }): RawSpanRow {
+    const traceId = over.traceId ?? "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    return {
+      traceId,
+      spanId: over.spanId,
+      name: over.name,
+      payload: JSON.stringify({
+        name: over.name,
+        traceId,
+        spanId: over.spanId,
+        parentSpanId: over.parentSpanId,
+        startTimeUnixNano: over.startTimeUnixNano,
+        endTimeUnixNano: over.endTimeUnixNano,
+      }),
+    };
+  }
+
+  it("returns named phase spans for a given issue process, sorted by start time", () => {
+    storage.saveRawSpan(
+      rawPhase({
+        name: "openPullRequest",
+        spanId: "5555555555555555",
+        parentSpanId: "2222222222222222",
+        startTimeUnixNano: "1715000020000000000",
+        endTimeUnixNano: "1715000022000000000",
+      }),
+    );
+    storage.saveRawSpan(
+      rawPhase({
+        name: "review",
+        spanId: "4444444444444444",
+        parentSpanId: "2222222222222222",
+        startTimeUnixNano: "1715000010000000000",
+        endTimeUnixNano: "1715000015000000000",
+      }),
+    );
+
+    const out = storage.listPhaseSpans(
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "2222222222222222",
+      ["review", "pushBranch", "openPullRequest"],
+    );
+    expect(out.map((s) => s.name)).toEqual(["review", "openPullRequest"]);
+  });
+
+  it("ignores spans whose parent_span_id is a different issue process", () => {
+    storage.saveRawSpan(
+      rawPhase({
+        name: "review",
+        spanId: "4444444444444444",
+        parentSpanId: "2222222222222222",
+        startTimeUnixNano: "1715000010000000000",
+        endTimeUnixNano: "1715000015000000000",
+      }),
+    );
+    storage.saveRawSpan(
+      rawPhase({
+        name: "review",
+        spanId: "5555555555555555",
+        parentSpanId: "9999999999999999",
+        startTimeUnixNano: "1715000010000000000",
+        endTimeUnixNano: "1715000015000000000",
+      }),
+    );
+
+    const out = storage.listPhaseSpans(
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "2222222222222222",
+      ["review"],
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0]?.spanId).toBe("4444444444444444");
+  });
+
+  it("returns an empty list when the names allowlist is empty (no SQL run)", () => {
+    expect(
+      storage.listPhaseSpans(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "2222222222222222",
+        [],
+      ),
+    ).toEqual([]);
   });
 });

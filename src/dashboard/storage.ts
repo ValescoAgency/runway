@@ -1,5 +1,10 @@
 import { DatabaseSync } from "node:sqlite";
-import type { DrainRow, IssueProcessRow, RawSpanRow } from "./projector.js";
+import type {
+  AgentIterationRow,
+  DrainRow,
+  IssueProcessRow,
+  RawSpanRow,
+} from "./projector.js";
 
 /**
  * VA-386 (dashboard slice 1): SQLite storage for the typed projections
@@ -25,11 +30,62 @@ export interface StoredIssueProcess extends IssueProcessRow {
   readonly insertedAt: string;
 }
 
+export interface StoredAgentIteration extends AgentIterationRow {
+  readonly insertedAt: string;
+}
+
+/**
+ * VA-389: a generic phase-span row pulled out of `raw_spans` via
+ * `json_extract`. The detail pane uses this to render the
+ * implement / review / finalize timeline without each phase needing
+ * its own typed table — only the implement iterations get a typed
+ * table because they're the only phase the AC drills into.
+ */
+export interface PhaseSpan {
+  readonly traceId: string;
+  readonly spanId: string;
+  readonly parentSpanId: string | null;
+  readonly name: string;
+  readonly startTimeUnixNano: string;
+  readonly endTimeUnixNano: string;
+}
+
 export interface Storage {
   saveDrain(d: DrainRow): void;
   saveIssueProcess(p: IssueProcessRow): void;
+  saveAgentIteration(a: AgentIterationRow): void;
   saveRawSpan(r: RawSpanRow): void;
   listIssueProcesses(filter?: IssueProcessFilter): readonly StoredIssueProcess[];
+  /**
+   * VA-389: look up an issue process by its (trace_id, span_id) pair.
+   * Returns undefined when the row isn't yet known — typical when the
+   * dashboard navigates to a detail page from an external link before
+   * the OTLP flush has landed.
+   */
+  getIssueProcess(
+    traceId: string,
+    spanId: string,
+  ): StoredIssueProcess | undefined;
+  /**
+   * VA-389: iterations sorted ascending by `iteration_index` so the
+   * detail pane can render them in execution order without a second
+   * pass.
+   */
+  listAgentIterations(
+    traceId: string,
+    issueProcessSpanId: string,
+  ): readonly StoredAgentIteration[];
+  /**
+   * VA-389: pull review/finalize phase spans for a given issue
+   * process. The names argument is an allowlist — the dashboard
+   * passes `["review", "pushBranch", "openPullRequest"]` and gets
+   * back the matching spans (if any) with their timing.
+   */
+  listPhaseSpans(
+    traceId: string,
+    issueProcessSpanId: string,
+    names: readonly string[],
+  ): readonly PhaseSpan[];
   close(): void;
 }
 
@@ -80,6 +136,22 @@ const SCHEMA = `
     inserted_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (trace_id, span_id)
   );
+
+  CREATE TABLE IF NOT EXISTS agent_iterations (
+    trace_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    issue_process_id TEXT,
+    iteration_index INTEGER NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at TEXT NOT NULL,
+    sandcastle_run_id TEXT,
+    exit_status TEXT,
+    inserted_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (trace_id, id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_agent_iterations_issue_process
+    ON agent_iterations(trace_id, issue_process_id, iteration_index);
 `;
 
 /**
@@ -138,6 +210,20 @@ export function createStorage(path: string): Storage {
       payload = excluded.payload
   `);
 
+  const insertAgentIteration = db.prepare(`
+    INSERT INTO agent_iterations (
+      trace_id, id, issue_process_id, iteration_index,
+      started_at, ended_at, sandcastle_run_id, exit_status
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT (trace_id, id) DO UPDATE SET
+      issue_process_id = excluded.issue_process_id,
+      iteration_index = excluded.iteration_index,
+      started_at = excluded.started_at,
+      ended_at = excluded.ended_at,
+      sandcastle_run_id = excluded.sandcastle_run_id,
+      exit_status = excluded.exit_status
+  `);
+
   // Two list variants instead of one with conditional SQL — keeps
   // each prepared statement static.
   const listAll = db.prepare(`
@@ -161,6 +247,26 @@ export function createStorage(path: string): Storage {
     WHERE trace_id = ?
     ORDER BY inserted_at DESC, span_id DESC
     LIMIT ?
+  `);
+
+  const getProcessStmt = db.prepare(`
+    SELECT
+      trace_id, span_id, parent_span_id, issue_identifier, issue_id,
+      branch, outcome_kind, outcome_detail,
+      start_time_unix_nano, end_time_unix_nano, status_code, status_message,
+      inserted_at
+    FROM issue_processes
+    WHERE trace_id = ? AND span_id = ?
+  `);
+
+  const listIterations = db.prepare(`
+    SELECT
+      trace_id, id, issue_process_id, iteration_index,
+      started_at, ended_at, sandcastle_run_id, exit_status,
+      inserted_at
+    FROM agent_iterations
+    WHERE trace_id = ? AND issue_process_id = ?
+    ORDER BY iteration_index ASC
   `);
 
   const saveDrain = (d: DrainRow): void => {
@@ -195,6 +301,19 @@ export function createStorage(path: string): Storage {
     );
   };
 
+  const saveAgentIteration = (a: AgentIterationRow): void => {
+    insertAgentIteration.run(
+      a.traceId,
+      a.spanId,
+      a.issueProcessSpanId,
+      asInt(a.iterationIndex),
+      a.startTimeUnixNano,
+      a.endTimeUnixNano,
+      a.sandcastleRunId,
+      a.exitStatus,
+    );
+  };
+
   const saveRawSpan = (r: RawSpanRow): void => {
     insertRawSpan.run(r.traceId, r.spanId, r.name, r.payload);
   };
@@ -209,6 +328,57 @@ export function createStorage(path: string): Storage {
     return rows.map(rowToIssueProcess);
   };
 
+  const getIssueProcess = (
+    traceId: string,
+    spanId: string,
+  ): StoredIssueProcess | undefined => {
+    const row = getProcessStmt.get(traceId, spanId);
+    return row ? rowToIssueProcess(row) : undefined;
+  };
+
+  const listAgentIterations = (
+    traceId: string,
+    issueProcessSpanId: string,
+  ): readonly StoredAgentIteration[] => {
+    const rows = listIterations.all(traceId, issueProcessSpanId);
+    return rows.map(rowToAgentIteration);
+  };
+
+  /**
+   * VA-389: phase spans (review, pushBranch, openPullRequest) live in
+   * `raw_spans` as JSON. SQLite's `json_extract` lets us pull
+   * parentSpanId + start/end without re-projecting the payload at
+   * insert time. The names allowlist becomes a comma-bind so each
+   * call is one prepared statement; we don't precompute a fixed
+   * statement because the allowlist could grow per slice.
+   */
+  const listPhaseSpans = (
+    traceId: string,
+    issueProcessSpanId: string,
+    names: readonly string[],
+  ): readonly PhaseSpan[] => {
+    if (names.length === 0) return [];
+    const placeholders = names.map(() => "?").join(", ");
+    const sql = `
+      SELECT
+        trace_id,
+        span_id,
+        name,
+        json_extract(payload, '$.parentSpanId') AS parent_span_id,
+        json_extract(payload, '$.startTimeUnixNano') AS start_time_unix_nano,
+        json_extract(payload, '$.endTimeUnixNano') AS end_time_unix_nano
+      FROM raw_spans
+      WHERE trace_id = ?
+        AND json_extract(payload, '$.parentSpanId') = ?
+        AND name IN (${placeholders})
+      ORDER BY start_time_unix_nano ASC
+    `;
+    const rows = db
+      .prepare(sql)
+      .all(traceId, issueProcessSpanId, ...names);
+    return rows.map(rowToPhaseSpan);
+  };
+
   const close = (): void => {
     db.close();
   };
@@ -216,8 +386,12 @@ export function createStorage(path: string): Storage {
   return {
     saveDrain,
     saveIssueProcess,
+    saveAgentIteration,
     saveRawSpan,
     listIssueProcesses,
+    getIssueProcess,
+    listAgentIterations,
+    listPhaseSpans,
     close,
   };
 }
@@ -245,6 +419,33 @@ function rowToIssueProcess(row: unknown): StoredIssueProcess {
     statusCode: nullableNum(r.status_code),
     statusMessage: nullableStr(r.status_message),
     insertedAt: String(r.inserted_at ?? ""),
+  };
+}
+
+function rowToAgentIteration(row: unknown): StoredAgentIteration {
+  const r = row as Record<string, unknown>;
+  return {
+    traceId: String(r.trace_id ?? ""),
+    spanId: String(r.id ?? ""),
+    issueProcessSpanId: nullableStr(r.issue_process_id),
+    iterationIndex: Number(r.iteration_index ?? 0),
+    startTimeUnixNano: String(r.started_at ?? ""),
+    endTimeUnixNano: String(r.ended_at ?? ""),
+    sandcastleRunId: nullableStr(r.sandcastle_run_id),
+    exitStatus: nullableStr(r.exit_status),
+    insertedAt: String(r.inserted_at ?? ""),
+  };
+}
+
+function rowToPhaseSpan(row: unknown): PhaseSpan {
+  const r = row as Record<string, unknown>;
+  return {
+    traceId: String(r.trace_id ?? ""),
+    spanId: String(r.span_id ?? ""),
+    parentSpanId: nullableStr(r.parent_span_id),
+    name: String(r.name ?? ""),
+    startTimeUnixNano: String(r.start_time_unix_nano ?? ""),
+    endTimeUnixNano: String(r.end_time_unix_nano ?? ""),
   };
 }
 

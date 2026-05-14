@@ -117,15 +117,30 @@ export const runImplementLoop = (
         }),
       );
 
-      implementResult = yield* runSandcastle({
-        agent: claudeCode("claude-opus-4-7"),
-        sandbox: docker({ env: dockerEnv(config) }),
-        cwd,
-        prompt: implementPrompt,
-        branchStrategy: { type: "branch", branch },
-        maxIterations: 1,
-        completionSignal: [...IMPL_COMPLETION_SIGNALS],
-        name: `impl-${issue.identifier}-iter-${iter}`,
+      const sandcastleRunId = `impl-${issue.identifier}-iter-${iter}`;
+      // VA-389: parse the verdict inside the span scope so the
+      // dashboard projector can read `runway.iteration.exit_status`
+      // off the `impl-iter-N` span without joining against the agent
+      // log. `runway.iteration.sandcastle_run_id` lets a future link
+      // to the per-run output (raw stdout, etc.) without needing to
+      // rebuild the name from issue identifier + iteration.
+      implementResult = yield* Effect.gen(function* () {
+        const result = yield* runSandcastle({
+          agent: claudeCode("claude-opus-4-7"),
+          sandbox: docker({ env: dockerEnv(config) }),
+          cwd,
+          prompt: implementPrompt,
+          branchStrategy: { type: "branch", branch },
+          maxIterations: 1,
+          completionSignal: [...IMPL_COMPLETION_SIGNALS],
+          name: sandcastleRunId,
+        });
+        const verdict = parseImplVerdict(result);
+        yield* Effect.annotateCurrentSpan({
+          "runway.iteration.exit_status": verdict.kind,
+          "runway.iteration.sandcastle_run_id": sandcastleRunId,
+        });
+        return result;
       }).pipe(
         Effect.withSpan(`impl-iter-${iter}`, {
           attributes: {

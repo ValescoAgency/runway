@@ -1,8 +1,13 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { projectPayload } from "./projector.js";
 import { createStorage, type Storage } from "./storage.js";
-import { renderListView } from "./views.js";
+import { renderDetailView, renderListView } from "./views.js";
 import type { OtlpTracesPayload } from "./otlp.js";
+
+// VA-389: phase spans we surface on the detail page's timeline.
+// Anything else stays in raw_spans for debugging but isn't rendered.
+const DETAIL_PHASE_NAMES = ["review", "pushBranch", "openPullRequest"] as const;
+const ISSUE_DETAIL_RE = /^\/issue\/([^/?#]+)\/([^/?#]+)\/?$/;
 
 /**
  * VA-386 (dashboard slice 1): the dashboard runs as a single Node HTTP
@@ -103,6 +108,16 @@ async function handle(
     return;
   }
 
+  if (method === "GET") {
+    const detailMatch = ISSUE_DETAIL_RE.exec(url.split("?")[0] ?? "");
+    if (detailMatch) {
+      const traceId = decodeURIComponent(detailMatch[1] ?? "");
+      const spanId = decodeURIComponent(detailMatch[2] ?? "");
+      handleDetailView(res, storage, traceId, spanId);
+      return;
+    }
+  }
+
   if (method === "GET" && url === "/healthz") {
     res.writeHead(200, { "content-type": "text/plain" });
     res.end("ok");
@@ -155,6 +170,7 @@ async function handleOtlpTraces(
   const projection = projectPayload(payload);
   for (const d of projection.drains) storage.saveDrain(d);
   for (const p of projection.issueProcesses) storage.saveIssueProcess(p);
+  for (const a of projection.agentIterations) storage.saveAgentIteration(a);
   for (const r of projection.rawSpans) storage.saveRawSpan(r);
 
   // OTLP success body: a small JSON envelope. Required by the spec
@@ -167,6 +183,42 @@ async function handleOtlpTraces(
 function handleListView(res: ServerResponse, storage: Storage): void {
   const rows = storage.listIssueProcesses({ limit: 100 });
   const html = renderListView(rows);
+  res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+  res.end(html);
+}
+
+/**
+ * VA-389: per-issue detail page. Composes the issue_process row,
+ * iteration list, and review/finalize phase spans into a single view
+ * model and hands it to `renderDetailView`. Returns 404 when the
+ * (trace_id, span_id) pair doesn't match a known issue process — the
+ * dashboard never auto-creates rows from a URL.
+ */
+function handleDetailView(
+  res: ServerResponse,
+  storage: Storage,
+  traceId: string,
+  spanId: string,
+): void {
+  const ip = storage.getIssueProcess(traceId, spanId);
+  if (!ip) {
+    writeError(
+      res,
+      404,
+      "not_found",
+      `no issue process for trace=${traceId} span=${spanId}`,
+    );
+    return;
+  }
+  const iterations = storage.listAgentIterations(traceId, spanId);
+  const phaseSpans = storage.listPhaseSpans(traceId, spanId, [
+    ...DETAIL_PHASE_NAMES,
+  ]);
+  const html = renderDetailView({
+    issueProcess: ip,
+    iterations,
+    phaseSpans,
+  });
   res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
   res.end(html);
 }

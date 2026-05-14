@@ -126,3 +126,104 @@ describe("dashboard HTTP server (VA-386)", () => {
     expect(await res.text()).toBe("ok");
   });
 });
+
+// VA-389: the detail route picks up impl-iter spans + review/finalize
+// phase spans from the same POST that fed the list view and renders
+// a single timeline page.
+const detailPayload = {
+  resourceSpans: [
+    {
+      resource: {
+        attributes: [{ key: "service.name", value: { stringValue: "runway" } }],
+      },
+      scopeSpans: [
+        {
+          scope: { name: "test" },
+          spans: [
+            {
+              traceId: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              spanId: "9999999999999999",
+              name: "processIssue",
+              startTimeUnixNano: "1715000000000000000",
+              endTimeUnixNano: "1715000025000000000",
+              attributes: [
+                {
+                  key: "runway.issue.identifier",
+                  value: { stringValue: "VA-389-test" },
+                },
+                {
+                  key: "runway.outcome.kind",
+                  value: { stringValue: "hitl" },
+                },
+              ],
+            },
+            {
+              traceId: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              spanId: "aaaa000000000001",
+              parentSpanId: "9999999999999999",
+              name: "impl-iter-1",
+              startTimeUnixNano: "1715000000000000000",
+              endTimeUnixNano: "1715000010000000000",
+              attributes: [
+                {
+                  key: "runway.iteration.exit_status",
+                  value: { stringValue: "continue" },
+                },
+                {
+                  key: "runway.iteration.sandcastle_run_id",
+                  value: { stringValue: "impl-VA-389-test-iter-1" },
+                },
+              ],
+            },
+            {
+              traceId: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              spanId: "aaaa000000000002",
+              parentSpanId: "9999999999999999",
+              name: "impl-iter-2",
+              startTimeUnixNano: "1715000010000000000",
+              endTimeUnixNano: "1715000020000000000",
+              attributes: [
+                {
+                  key: "runway.iteration.exit_status",
+                  value: { stringValue: "blocked" },
+                },
+                {
+                  key: "runway.iteration.sandcastle_run_id",
+                  value: { stringValue: "impl-VA-389-test-iter-2" },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
+describe("dashboard HTTP server — detail view (VA-389)", () => {
+  it("renders the implement phase with one row per iteration after ingesting a multi-iteration trace", async () => {
+    await fetch(`${base}/v1/traces`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(detailPayload),
+    });
+    const res = await fetch(
+      `${base}/issue/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/9999999999999999`,
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("VA-389-test");
+    expect(html).toContain("implement");
+    expect(html).toContain("iter 1");
+    expect(html).toContain("iter 2");
+    expect(html).toContain("continue");
+    expect(html).toContain("blocked");
+  });
+
+  it("returns 404 when the detail route is hit with unknown (trace_id, span_id)", async () => {
+    const res = await fetch(
+      `${base}/issue/00000000000000000000000000000000/0000000000000000`,
+    );
+    expect(res.status).toBe(404);
+  });
+});
