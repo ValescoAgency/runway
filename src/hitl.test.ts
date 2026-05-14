@@ -46,6 +46,7 @@ const config: Config = {
   inReviewStatus: "In Review",
   hitlLabel: "needs-human",
   maxIterations: 1,
+  implTurns: 1,
 };
 
 const issue: RunwayIssue = {

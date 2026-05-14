@@ -131,7 +131,7 @@ export const runImplementLoop = (
           cwd,
           prompt: implementPrompt,
           branchStrategy: { type: "branch", branch },
-          maxIterations: 1,
+          maxIterations: config.implTurns,
           completionSignal: [...IMPL_COMPLETION_SIGNALS],
           name: sandcastleRunId,
         });

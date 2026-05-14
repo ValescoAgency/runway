@@ -38,6 +38,7 @@ const config = {
   inReviewStatus: "In Review",
   hitlLabel: "ready-for-human",
   maxIterations: 5,
+  implTurns: 3,
 } as const;
 
 beforeEach(() => {

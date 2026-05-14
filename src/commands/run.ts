@@ -12,6 +12,7 @@ export interface RunOptions {
   readonly max?: number;
   readonly project?: string;
   readonly allowPaths?: readonly string[];
+  readonly implTurns?: number;
 }
 
 export function parseRunArgs(argv: readonly string[]): RunOptions {
@@ -19,6 +20,7 @@ export function parseRunArgs(argv: readonly string[]): RunOptions {
     max?: number;
     project?: string;
     allowPaths?: string[];
+    implTurns?: number;
   } = {};
   const collectAllow = (raw: string): void => {
     const paths = raw
@@ -55,6 +57,22 @@ export function parseRunArgs(argv: readonly string[]): RunOptions {
       i += 1;
     } else if (a?.startsWith("--allow-paths=")) {
       collectAllow(a.slice("--allow-paths=".length));
+    } else if (a === "--impl-turns") {
+      const v = argv[i + 1];
+      if (!v) throw new Error("--impl-turns requires a number");
+      const n = Number.parseInt(v, 10);
+      if (!Number.isFinite(n) || n <= 0) {
+        throw new Error(`--impl-turns must be a positive integer, got "${v}"`);
+      }
+      opts.implTurns = n;
+      i += 1;
+    } else if (a?.startsWith("--impl-turns=")) {
+      const v = a.slice("--impl-turns=".length);
+      const n = Number.parseInt(v, 10);
+      if (!Number.isFinite(n) || n <= 0) {
+        throw new Error(`--impl-turns must be a positive integer, got "${v}"`);
+      }
+      opts.implTurns = n;
     } else if (a === "--help" || a === "-h") {
       printRunUsage();
       process.exit(0);
@@ -85,6 +103,10 @@ OPTIONS
                   Example: --allow-paths='.github/workflows/**' lets
                   the agent touch CI for issues whose AC require it.
                   Repeatable; pairs with .runway/policy.yml.
+  --impl-turns N  Sandcastle inner turn budget for each impl phase
+                  (how many turns the Claude agent gets per attempt
+                  before it has to signal IMPL: DONE / BLOCKED).
+                  Overrides RUNWAY_IMPL_TURNS. Default: 3.
   --help, -h      Show this help.
 
 ENVIRONMENT
@@ -99,7 +121,12 @@ ENVIRONMENT
   RUNWAY_IN_PROGRESS_STATUS   default "In Progress"
   RUNWAY_IN_REVIEW_STATUS     default "In Review"
   RUNWAY_HITL_LABEL           default "ready-for-human"
-  RUNWAY_MAX_ITERATIONS       default 5
+  RUNWAY_MAX_ITERATIONS       default 5  — outer impl re-prompt loop
+                              (only fires when the agent fails to
+                              signal IMPL: DONE / BLOCKED at all)
+  RUNWAY_IMPL_TURNS           default 3  — sandcastle inner turn
+                              budget per impl phase. Overridden by
+                              --impl-turns.
 `);
 }
 
@@ -130,9 +157,11 @@ export async function runCommand(argv: readonly string[]): Promise<void> {
 
   const program = Effect.gen(function* () {
     const baseConfig = yield* ConfigTag;
-    const config = opts.project
-      ? { ...baseConfig, linearProject: opts.project }
-      : baseConfig;
+    const config = {
+      ...baseConfig,
+      ...(opts.project ? { linearProject: opts.project } : {}),
+      ...(opts.implTurns !== undefined ? { implTurns: opts.implTurns } : {}),
+    };
 
     const scope = config.linearProject
       ? `team ${config.linearTeam} / project ${config.linearProject}`

@@ -38,6 +38,7 @@ const baseConfig = {
   inReviewStatus: "In Review",
   hitlLabel: "needs-human",
   maxIterations: 5,
+  implTurns: 3,
 } as const;
 
 beforeEach(() => {
