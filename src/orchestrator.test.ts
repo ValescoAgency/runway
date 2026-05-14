@@ -668,3 +668,207 @@ describe("drainQueue base-branch resolution (VA-346)", () => {
     ]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Tests — VA-417 HITL-retry: prune the stale agent branch before impl
+// ---------------------------------------------------------------------------
+
+describe("drainQueue HITL-retry branch reset (VA-417)", () => {
+  it("resets agent/<id> to origin/<base> when the branch already carries commits from a rejected prior attempt", async () => {
+    // Symbolic-ref → origin/main. The HITL-retry shape: branch
+    // exists with commits ahead, origin/main reachable, no worktree
+    // attached. The orchestrator must detect the stale state and
+    // issue `git update-ref refs/heads/agent/va-312
+    // refs/remotes/origin/main` BEFORE the impl phase fires.
+    // Shared monotonic counter so we can compare orderings between
+    // execaMock and sandcastleRunMock invocations.
+    let seq = 0;
+    let updateRefSeenAt = -1;
+    let firstSandcastleSeenAt = -1;
+    execaMock.mockImplementation((bin: string, args: readonly string[]) => {
+      seq += 1;
+      if (bin !== "git") {
+        return Promise.reject(new Error(`unexpected binary: ${bin}`));
+      }
+      if (args[0] === "symbolic-ref") {
+        return Promise.resolve({ exitCode: 0, stdout: "origin/main\n" });
+      }
+      if (args[0] === "rev-parse" && args[1] === "--verify") {
+        const ref = args[2] as string | undefined;
+        // agent branch exists; origin/main is reachable.
+        if (ref?.startsWith("refs/heads/agent/")) {
+          return Promise.resolve({ exitCode: 0, stdout: "stale-sha\n" });
+        }
+        if (ref === "refs/remotes/origin/main") {
+          return Promise.resolve({ exitCode: 0, stdout: "base-sha\n" });
+        }
+        return Promise.resolve({ exitCode: 128, stdout: "" });
+      }
+      if (args[0] === "rev-list") {
+        // Stale rejected commits ahead of base.
+        return Promise.resolve({ exitCode: 0, stdout: "3\n" });
+      }
+      if (args[0] === "worktree" && args[1] === "list") {
+        // No worktree currently attached (sandcastle's prior close
+        // already cleaned it up — the typical post-HITL state).
+        return Promise.resolve({ exitCode: 0, stdout: "" });
+      }
+      if (args[0] === "update-ref") {
+        updateRefSeenAt = seq;
+        return Promise.resolve({ exitCode: 0, stdout: "" });
+      }
+      if (args[0] === "diff" || args[0] === "log") {
+        return Promise.resolve({ exitCode: 0, stdout: "" });
+      }
+      // VA-419: finalize now calls `git fetch origin <base>` and
+      // `git rebase origin/<base>` before push. The HITL-retry happy
+      // path needs both to return clean exits (no rebase conflict).
+      if (args[0] === "fetch" || args[0] === "rebase") {
+        return Promise.resolve({ exitCode: 0, stdout: "" });
+      }
+      return Promise.reject(new Error(`unexpected git args: ${args.join(" ")}`));
+    });
+
+    sandcastleRunMock
+      .mockImplementationOnce(() => {
+        seq += 1;
+        if (firstSandcastleSeenAt < 0) firstSandcastleSeenAt = seq;
+        return Promise.resolve({
+          stdout: "fixed reviewer feedback\nIMPL: DONE",
+          commits: [{ sha: "fresh" }],
+        });
+      })
+      .mockImplementationOnce(() => {
+        seq += 1;
+        return Promise.resolve({ stdout: "REVIEW: APPROVED", commits: [] });
+      });
+
+    const linear = makeLinear();
+    linear.fetchReady
+      .mockReturnValueOnce(Effect.succeed([issue]))
+      .mockReturnValueOnce(Effect.succeed([]));
+
+    const result = await drainQueue({
+      config,
+      linear: asLinear(linear),
+      github: makeGithub(),
+      cwd: "/tmp/repo",
+    });
+
+    // Reset emitted with the correct args.
+    const updateRefCall = execaMock.mock.calls.find(
+      (c) => Array.isArray(c[1]) && (c[1] as string[])[0] === "update-ref",
+    );
+    expect(updateRefCall?.[1]).toEqual([
+      "update-ref",
+      "refs/heads/agent/va-312",
+      "refs/remotes/origin/main",
+    ]);
+    // Reset must precede the first sandcastle invocation — the impl
+    // agent has to see a clean branch tip, not the stale one.
+    expect(updateRefSeenAt).toBeGreaterThan(0);
+    expect(firstSandcastleSeenAt).toBeGreaterThan(updateRefSeenAt);
+    // Drain still produced the normal opened outcome.
+    expect(result).toMatchObject({
+      attempts: 1,
+      opened: 1,
+      hitl: 0,
+      errored: 0,
+    });
+  });
+
+  it("does not call update-ref or git branch -D on the first-attempt case (no stale branch)", async () => {
+    // Branch doesn't exist; rev-parse --verify exits non-zero.
+    // Existence check should short-circuit.
+    execaMock.mockImplementation((bin: string, args: readonly string[]) => {
+      if (bin !== "git") {
+        return Promise.reject(new Error(`unexpected binary: ${bin}`));
+      }
+      if (args[0] === "symbolic-ref") {
+        return Promise.resolve({ exitCode: 0, stdout: "origin/main\n" });
+      }
+      if (args[0] === "rev-parse" && args[1] === "--verify") {
+        return Promise.resolve({ exitCode: 128, stdout: "" });
+      }
+      if (args[0] === "rev-list") {
+        return Promise.resolve({ exitCode: 0, stdout: "1\n" });
+      }
+      if (args[0] === "diff" || args[0] === "log") {
+        return Promise.resolve({ exitCode: 0, stdout: "" });
+      }
+      return Promise.reject(new Error(`unexpected git args: ${args.join(" ")}`));
+    });
+    sandcastleRunMock
+      .mockResolvedValueOnce({
+        stdout: "first attempt done\nIMPL: DONE",
+        commits: [{ sha: "fresh" }],
+      })
+      .mockResolvedValueOnce({ stdout: "REVIEW: APPROVED", commits: [] });
+
+    const linear = makeLinear();
+    linear.fetchReady
+      .mockReturnValueOnce(Effect.succeed([issue]))
+      .mockReturnValueOnce(Effect.succeed([]));
+
+    await drainQueue({
+      config,
+      linear: asLinear(linear),
+      github: makeGithub(),
+      cwd: "/tmp/repo",
+    });
+
+    // No reset, no delete. Only the agent existence-check (and the
+    // ahead-count check is skipped for non-existent branches).
+    expect(
+      execaMock.mock.calls.find(
+        (c) => Array.isArray(c[1]) && (c[1] as string[])[0] === "update-ref",
+      ),
+    ).toBeUndefined();
+    const branchCall = execaMock.mock.calls.find(
+      (c) => Array.isArray(c[1]) && (c[1] as string[])[0] === "branch",
+    );
+    expect(branchCall).toBeUndefined();
+  });
+
+  it("dies the drain when origin/<base> AND local <base> are both unreachable", async () => {
+    // Stale agent branch with commits ahead, but neither
+    // origin/main nor refs/heads/main resolves — env/config issue.
+    // The drain must NOT silently skip the reset; it must surface
+    // a fatal error so the operator fixes the env.
+    execaMock.mockImplementation((bin: string, args: readonly string[]) => {
+      if (bin !== "git") {
+        return Promise.reject(new Error(`unexpected binary: ${bin}`));
+      }
+      if (args[0] === "symbolic-ref") {
+        return Promise.resolve({ exitCode: 0, stdout: "origin/main\n" });
+      }
+      if (args[0] === "rev-parse" && args[1] === "--verify") {
+        const ref = args[2] as string | undefined;
+        if (ref?.startsWith("refs/heads/agent/")) {
+          return Promise.resolve({ exitCode: 0, stdout: "stale-sha\n" });
+        }
+        // Both origin/main and local main missing.
+        return Promise.resolve({ exitCode: 128, stdout: "" });
+      }
+      if (args[0] === "rev-list") {
+        return Promise.resolve({ exitCode: 0, stdout: "1\n" });
+      }
+      return Promise.reject(new Error(`unexpected git args: ${args.join(" ")}`));
+    });
+
+    const linear = makeLinear();
+    linear.fetchReady.mockReturnValue(Effect.succeed([issue]));
+
+    await expect(
+      drainQueue({
+        config,
+        linear: asLinear(linear),
+        github: makeGithub(),
+        cwd: "/tmp/repo",
+      }),
+    ).rejects.toThrow(/Cannot reset stale agent branch/);
+
+    // Sandcastle was NOT invoked — the drain bailed before impl.
+    expect(sandcastleRunMock).not.toHaveBeenCalled();
+  });
+});
