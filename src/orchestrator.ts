@@ -8,6 +8,7 @@ import type { LinearError, LinearGateway, RunwayIssue } from "./linear.js";
 import { loadPolicy, type Policy } from "./policy.js";
 import { flagHitl, handleProcessFailure } from "./hitl.js";
 import { runImplementLoop } from "./implement.js";
+import { formatPriorFeedback } from "./prompts.js";
 import { runReviewPass } from "./review.js";
 import { finalize } from "./finalize.js";
 
@@ -86,6 +87,14 @@ interface ResolvedDeps extends OrchestratorDeps {
   readonly baseBranch: string;
   /** Effective write-path policy (VA-352). Resolved once in drainQueue. */
   readonly policy: Policy;
+  /**
+   * VA-383: effective author allowlist for surfacing prior-attempt
+   * review feedback. Resolved once at drain startup — either from
+   * `config.commentAuthorAllowlist` or, when unset, from the Linear
+   * viewer's name (the API key's identity, which is who both runway
+   * and the reviewer post comments under).
+   */
+  readonly commentAuthorAllowlist: readonly string[];
 }
 
 /**
@@ -136,10 +145,38 @@ export const drainQueue = (
     const policy = loadPolicy(deps.cwd, { allowPathsOverride: opts.allowPaths });
     yield* Effect.logInfo(`policy source: ${policy.source}`);
 
+    // VA-383: resolve the Linear viewer once per drain to seed the
+    // default comment-author allowlist. If the operator has provided
+    // an explicit allowlist, skip the lookup. If the lookup fails,
+    // fall back to an empty allowlist — `formatPriorFeedback` will
+    // emit nothing and the run proceeds with description-only
+    // context (matching VA-383's "never blocks the run" AC).
+    const commentAuthorAllowlist: readonly string[] = config
+      .commentAuthorAllowlist?.length
+      ? config.commentAuthorAllowlist
+      : yield* linear.viewer().pipe(
+          Effect.map((v) => [v.name] as const),
+          Effect.catchAll((err) =>
+            Effect.logWarning(
+              `VA-383: viewer() failed; prior-attempt feedback will be empty (${
+                (err as { message?: string }).message ?? String(err)
+              })`,
+            ).pipe(Effect.as([] as const)),
+          ),
+        );
+    yield* Effect.logInfo(
+      `comment author allowlist: ${
+        commentAuthorAllowlist.length === 0
+          ? "(empty — prior-feedback surfacing disabled)"
+          : commentAuthorAllowlist.join(", ")
+      }`,
+    );
+
     const runDeps: ResolvedDeps = {
       ...deps,
       baseBranch: baseBranchResolved,
       policy,
+      commentAuthorAllowlist,
     };
 
     // VA-344: never re-pick an issue in the same invocation, even if
@@ -229,8 +266,31 @@ const processIssue = (
   deps: ResolvedDeps,
 ): Effect.Effect<ProcessOutcome, ProcessIssueError, never> =>
   Effect.gen(function* () {
-    const { config, linear } = deps;
+    const { config, linear, commentAuthorAllowlist } = deps;
     const branch = `agent/${issue.identifier.toLowerCase()}`;
+
+    // VA-383: fetch prior comments BEFORE posting "Runway picked up
+    // this issue" so we don't see our own bookkeeping. The allowlist
+    // resolved at drain startup filters to reviewer/repo-owner
+    // identities; `formatPriorFeedback` additionally strips known
+    // runway bookkeeping prefixes. A fetch failure logs a warning and
+    // the run proceeds with empty feedback (never blocks).
+    const priorFeedback = yield* (
+      commentAuthorAllowlist.length === 0
+        ? Effect.succeed("")
+        : linear.fetchComments(issue.id).pipe(
+            Effect.map((cs) =>
+              formatPriorFeedback(cs, commentAuthorAllowlist),
+            ),
+            Effect.catchAll((err) =>
+              Effect.logWarning(
+                `${issue.identifier}: fetchComments failed; proceeding with description-only context (${
+                  (err as { message?: string }).message ?? String(err)
+                })`,
+              ).pipe(Effect.as("")),
+            ),
+          )
+    );
 
     yield* linear.transition(issue.id, config.inProgressStatus);
     yield* linear.comment(
@@ -251,7 +311,11 @@ const processIssue = (
       ),
     );
 
-    const impl = yield* runImplementLoop(issue, deps, branch);
+    const impl = yield* runImplementLoop(
+      issue,
+      { ...deps, priorFeedback },
+      branch,
+    );
     if (impl.kind === "hitl") {
       yield* flagHitl(issue, deps, impl.reason);
       return { kind: "hitl", detail: impl.reason };

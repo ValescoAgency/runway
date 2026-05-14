@@ -18,6 +18,11 @@ vi.mock("@ai-hero/sandcastle/sandboxes/docker", () => ({
 vi.mock("./prompts.js", () => ({
   renderImplementPrompt: vi.fn().mockResolvedValue("implement prompt rendered"),
   renderReviewPrompt: vi.fn().mockResolvedValue("review prompt rendered"),
+  // VA-383: orchestrator now calls formatPriorFeedback for every
+  // issue. Default to empty string in tests that don't care about
+  // prior-feedback wiring — the orchestrator-test fixtures predate
+  // VA-383 and shouldn't have to reason about comment history.
+  formatPriorFeedback: vi.fn().mockReturnValue(""),
 }));
 
 const { drainQueue: drainQueueEffect } = await import("./orchestrator.js");
@@ -39,6 +44,8 @@ type MockedLinear = {
   transition: ReturnType<typeof vi.fn>;
   applyLabel: ReturnType<typeof vi.fn>;
   comment: ReturnType<typeof vi.fn>;
+  fetchComments: ReturnType<typeof vi.fn>;
+  viewer: ReturnType<typeof vi.fn>;
 };
 
 function makeLinear(): MockedLinear {
@@ -46,11 +53,21 @@ function makeLinear(): MockedLinear {
   // their own behavior with `.mockReturnValueOnce(Effect.succeed(...))`
   // / `.mockReturnValueOnce(Effect.fail(...))` follow the same pattern;
   // tests with no explicit setup get a successful default.
+  //
+  // VA-383: `fetchComments` and `viewer` default to benign returns —
+  // empty comment list and a viewer name that matches the test
+  // assertions' implicit expectations (no prior-feedback noise in
+  // existing fixtures). Tests exercising prior-feedback behavior
+  // override with `.mockReturnValueOnce(...)`.
   return {
     fetchReady: vi.fn(),
     transition: vi.fn().mockReturnValue(Effect.succeed(undefined)),
     applyLabel: vi.fn().mockReturnValue(Effect.succeed(undefined)),
     comment: vi.fn().mockReturnValue(Effect.succeed(undefined)),
+    fetchComments: vi.fn().mockReturnValue(Effect.succeed([])),
+    viewer: vi
+      .fn()
+      .mockReturnValue(Effect.succeed({ id: "viewer-1", name: "Test Viewer" })),
   };
 }
 
