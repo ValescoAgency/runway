@@ -22,6 +22,7 @@ const issue: RunwayIssue = {
   identifier: "VA-312",
   title: "Fix the TOCTOU race in provisionHousehold",
   description: "Acceptance: add a unique index on owner role.",
+  labels: [],
 };
 
 const policyWithPaths: Policy = {

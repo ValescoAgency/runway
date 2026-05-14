@@ -208,6 +208,12 @@ export const drainQueue = (
       // the processIssue span's attributes. Compute it inside the
       // span scope (so `annotateCurrentSpan` targets `processIssue`,
       // not `drainQueue`) and route afterwards.
+      //
+      // VA-387: annotate `runway.pr.url` on opened outcomes and
+      // `runway.hitl.reason` on HITL outcomes (both planned and
+      // failure-routed) so the detail pane can render the GitHub
+      // link / human-review reason without re-parsing the generic
+      // `runway.outcome.detail` string.
       const resolved = yield* Effect.gen(function* () {
         const processed = yield* processIssue(issue, runDeps).pipe(
           Effect.either,
@@ -217,6 +223,9 @@ export const drainQueue = (
           yield* Effect.annotateCurrentSpan({
             "runway.outcome.kind": result.kind,
             "runway.outcome.detail": result.detail,
+            ...(result.kind === "opened"
+              ? { "runway.pr.url": result.detail }
+              : { "runway.hitl.reason": result.detail }),
           });
           return { errored: false, outcome: result };
         }
@@ -234,6 +243,12 @@ export const drainQueue = (
           // from "crashed and routed to HITL" (kind=hitl,
           // errored=true) on the dashboard row.
           "runway.outcome.errored": true,
+          // VA-387: only "errored" failure outcomes land on HITL.
+          // "reverted" outcomes go back to Todo and never reach a
+          // human, so `runway.hitl.reason` would be misleading.
+          ...(failureOutcome.kind === "errored"
+            ? { "runway.hitl.reason": failureOutcome.detail }
+            : {}),
         });
         return { errored: true, outcome: failureOutcome };
       }).pipe(
@@ -241,6 +256,10 @@ export const drainQueue = (
           attributes: {
             "runway.issue.identifier": issue.identifier,
             "runway.issue.id": issue.id,
+            "runway.issue.title": issue.title,
+            // OTel encodes string[] as arrayValue on the wire. The
+            // projector decodes it back via `attrMap`.
+            "runway.issue.labels": [...issue.labels],
             "runway.branch": branch,
           },
         }),

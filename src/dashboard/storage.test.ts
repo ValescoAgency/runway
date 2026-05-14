@@ -36,9 +36,13 @@ function makeIssueProcess(
     parentSpanId: "1111111111111111",
     issueIdentifier: "VA-312",
     issueId: "issue-abc",
+    issueTitle: "Test issue title",
+    issueLabels: ["bug", "backend"],
     branch: "agent/va-312",
     outcomeKind: "opened",
     outcomeDetail: "https://github.com/x/y/pull/42",
+    prUrl: "https://github.com/x/y/pull/42",
+    hitlReason: null,
     startTimeUnixNano: "1715000000500000000",
     endTimeUnixNano: "1715000000900000000",
     statusCode: 1,
@@ -167,6 +171,63 @@ describe("createStorage — saveDrain / saveIssueProcess / saveRawSpan", () => {
     // If the upsert is broken, the second call would have thrown.
     // No assertion needed beyond "did not throw".
     expect(true).toBe(true);
+  });
+});
+
+// VA-387: span-enrichment columns round-trip through SQLite. The
+// detail pane reads these to render the issue title, PR link, and
+// HITL reason without re-fetching from Linear/GitHub.
+describe("createStorage — VA-387 span enrichment", () => {
+  it("round-trips issue_title, pr_url, hitl_reason, and issue_labels columns", () => {
+    storage.saveIssueProcess(
+      makeIssueProcess({
+        issueTitle: "Add dashboard detail pane",
+        issueLabels: ["feature", "dashboard"],
+        prUrl: "https://github.com/x/y/pull/99",
+        hitlReason: null,
+      }),
+    );
+    const out = storage.getIssueProcess(
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "2222222222222222",
+    );
+    expect(out?.issueTitle).toBe("Add dashboard detail pane");
+    expect(out?.issueLabels).toEqual(["feature", "dashboard"]);
+    expect(out?.prUrl).toBe("https://github.com/x/y/pull/99");
+    expect(out?.hitlReason).toBeNull();
+  });
+
+  it("stores hitl_reason and a null pr_url for HITL outcomes", () => {
+    storage.saveIssueProcess(
+      makeIssueProcess({
+        outcomeKind: "hitl",
+        outcomeDetail: "Needs human decision on schema",
+        prUrl: null,
+        hitlReason: "Needs human decision on schema",
+      }),
+    );
+    const out = storage.getIssueProcess(
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "2222222222222222",
+    );
+    expect(out?.prUrl).toBeNull();
+    expect(out?.hitlReason).toBe("Needs human decision on schema");
+  });
+
+  it("collapses an empty labels list back to [] (not null) on round-trip", () => {
+    storage.saveIssueProcess(makeIssueProcess({ issueLabels: [] }));
+    const out = storage.getIssueProcess(
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "2222222222222222",
+    );
+    expect(out?.issueLabels).toEqual([]);
+  });
+
+  it("looks up by span_id alone via getIssueProcessBySpanId (VA-387 detail route key)", () => {
+    storage.saveIssueProcess(makeIssueProcess());
+    const out = storage.getIssueProcessBySpanId("2222222222222222");
+    expect(out?.issueIdentifier).toBe("VA-312");
+    expect(storage.getIssueProcessBySpanId("no-such")).toBeUndefined();
   });
 });
 
@@ -416,6 +477,13 @@ describe("createStorage — evaluator aggregates view (VA-399)", () => {
       endTimeUnixNano: endNano,
       statusCode: 1,
       statusMessage: null,
+      // VA-387: added these required IssueProcessRow fields after the
+      // rebase. The VA-399 aggregates view doesn't read them, so null
+      // is the right test default for legacy fixtures.
+      issueTitle: null,
+      issueLabels: [],
+      prUrl: null,
+      hitlReason: null,
     });
     for (let i = 1; i <= args.iterations; i += 1) {
       // Iter spanIds must be unique per (trace, process) — otherwise

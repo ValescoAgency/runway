@@ -71,7 +71,8 @@ export function renderListView(rows: readonly StoredIssueProcess[]): string {
 function renderRow(r: StoredIssueProcess): string {
   const kind = r.outcomeKind ?? "pending";
   const outcomeCls = `outcome outcome-${escapeHtml(kind)}`;
-  const href = `/issue/${encodeURIComponent(r.traceId)}/${encodeURIComponent(r.spanId)}`;
+  // VA-387: canonical detail link uses the span_id alone.
+  const href = `/issue-processes/${encodeURIComponent(r.spanId)}`;
   return `<tr>
     <td class="id"><a href="${escapeHtml(href)}">${escapeHtml(r.issueIdentifier)}</a></td>
     <td class="${outcomeCls}">${escapeHtml(kind)}</td>
@@ -113,6 +114,18 @@ export function renderDetailView(vm: DetailViewModel): string {
   const ip = vm.issueProcess;
   const kind = ip.outcomeKind ?? "pending";
   const outcomeCls = `outcome outcome-${escapeHtml(kind)}`;
+  const titleLine = ip.issueTitle
+    ? `<div class="title">${escapeHtml(ip.issueTitle)}</div>`
+    : "";
+  const prLine = ip.prUrl
+    ? `<div><span class="label">PR:</span><a href="${escapeHtml(ip.prUrl)}" rel="noopener noreferrer" target="_blank">${escapeHtml(ip.prUrl)}</a></div>`
+    : "";
+  // HITL reason is only rendered when present (HITL or errored runs).
+  // For opened/reverted outcomes we omit the row entirely rather than
+  // showing an empty label.
+  const hitlLine = ip.hitlReason
+    ? `<div><span class="label">HITL reason:</span><span class="detail">${escapeHtml(ip.hitlReason)}</span></div>`
+    : "";
 
   return `<!doctype html>
 <html lang="en">
@@ -121,6 +134,7 @@ export function renderDetailView(vm: DetailViewModel): string {
   <title>${escapeHtml(ip.issueIdentifier)} · runway dashboard</title>
   <style>${SHARED_STYLE}
     .breadcrumb { color: #9ca3af; margin-bottom: 16px; font-size: 12px; }
+    .title { font-size: 14px; color: #d4d4d8; margin: -8px 0 12px; }
     .meta { margin: 4px 0 16px; }
     .meta .label { color: #9ca3af; margin-right: 4px; }
     .timeline { position: relative; height: 28px; background: #18181b;
@@ -144,8 +158,11 @@ export function renderDetailView(vm: DetailViewModel): string {
 <body>
   <div class="breadcrumb"><a href="/">← all issue processes</a></div>
   <h1>${escapeHtml(ip.issueIdentifier)} · <span class="${outcomeCls}">${escapeHtml(kind)}</span></h1>
+  ${titleLine}
   <div class="meta">
     <div><span class="label">branch:</span><code>${escapeHtml(ip.branch ?? "—")}</code></div>
+    ${prLine}
+    ${hitlLine}
     <div><span class="label">detail:</span><span class="detail">${escapeHtml(ip.outcomeDetail ?? "")}</span></div>
     <div><span class="label">seen at:</span>${escapeHtml(ip.insertedAt)}</div>
   </div>

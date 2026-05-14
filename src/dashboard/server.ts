@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { projectPayload } from "./projector.js";
-import { createStorage, type Storage } from "./storage.js";
+import { createStorage, type Storage, type StoredIssueProcess } from "./storage.js";
 import { renderDetailView, renderListView } from "./views.js";
 import type { OtlpTracesPayload } from "./otlp.js";
 
@@ -8,6 +8,10 @@ import type { OtlpTracesPayload } from "./otlp.js";
 // Anything else stays in raw_spans for debugging but isn't rendered.
 const DETAIL_PHASE_NAMES = ["review", "pushBranch", "openPullRequest"] as const;
 const ISSUE_DETAIL_RE = /^\/issue\/([^/?#]+)\/([^/?#]+)\/?$/;
+// VA-387: canonical detail route. `:id` is the issue process span_id;
+// the lookup falls back to the (trace_id, span_id) pair only for
+// older `/issue/...` links that still work for back-compat.
+const ISSUE_PROCESS_DETAIL_RE = /^\/issue-processes\/([^/?#]+)\/?$/;
 
 /**
  * VA-386 (dashboard slice 1): the dashboard runs as a single Node HTTP
@@ -109,7 +113,14 @@ async function handle(
   }
 
   if (method === "GET") {
-    const detailMatch = ISSUE_DETAIL_RE.exec(url.split("?")[0] ?? "");
+    const pathOnly = url.split("?")[0] ?? "";
+    const issueProcessMatch = ISSUE_PROCESS_DETAIL_RE.exec(pathOnly);
+    if (issueProcessMatch) {
+      const spanId = decodeURIComponent(issueProcessMatch[1] ?? "");
+      handleIssueProcessDetailView(res, storage, spanId);
+      return;
+    }
+    const detailMatch = ISSUE_DETAIL_RE.exec(pathOnly);
     if (detailMatch) {
       const traceId = decodeURIComponent(detailMatch[1] ?? "");
       const spanId = decodeURIComponent(detailMatch[2] ?? "");
@@ -215,8 +226,34 @@ function handleDetailView(
     );
     return;
   }
-  const iterations = storage.listAgentIterations(traceId, spanId);
-  const phaseSpans = storage.listPhaseSpans(traceId, spanId, [
+  renderDetailFor(res, storage, ip);
+}
+
+/**
+ * VA-387: detail-route handler keyed on the issue process span_id
+ * alone. Reuses the same view model as the older two-segment route
+ * once the row is resolved.
+ */
+function handleIssueProcessDetailView(
+  res: ServerResponse,
+  storage: Storage,
+  spanId: string,
+): void {
+  const ip = storage.getIssueProcessBySpanId(spanId);
+  if (!ip) {
+    writeError(res, 404, "not_found", `no issue process for span=${spanId}`);
+    return;
+  }
+  renderDetailFor(res, storage, ip);
+}
+
+function renderDetailFor(
+  res: ServerResponse,
+  storage: Storage,
+  ip: StoredIssueProcess,
+): void {
+  const iterations = storage.listAgentIterations(ip.traceId, ip.spanId);
+  const phaseSpans = storage.listPhaseSpans(ip.traceId, ip.spanId, [
     ...DETAIL_PHASE_NAMES,
   ]);
   const html = renderDetailView({

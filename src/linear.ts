@@ -102,13 +102,14 @@ const isTerminalStateType = (type: string): boolean =>
  * the SDK's chained `labels()` call rather than asking for labels
  * inline at the candidate-fetch site so the schema for `IssueNode`
  * stays narrow.
+ *
+ * VA-387: pulls all label names so callers that need the full list
+ * (the dashboard's `runway.issue.labels` attribute) don't have to
+ * re-issue the SDK call.
  */
-async function hasHitlLabel(issue: Issue, hitlLabel: string): Promise<boolean> {
+async function fetchIssueLabelNames(issue: Issue): Promise<readonly string[]> {
   const labels = await issue.labels();
-  for (const raw of labels.nodes) {
-    if (decodeIssueLabelNode(raw).name === hitlLabel) return true;
-  }
-  return false;
+  return labels.nodes.map((raw) => decodeIssueLabelNode(raw).name);
 }
 
 /**
@@ -145,6 +146,13 @@ export interface RunwayIssue {
   readonly identifier: string; // "VA-123"
   readonly title: string;
   readonly description: string;
+  /**
+   * VA-387: full set of label names attached to the issue at fetch
+   * time. The orchestrator forwards these onto the `processIssue`
+   * span as `runway.issue.labels` so the dashboard can surface what
+   * the agent saw. Order matches the SDK's response order.
+   */
+  readonly labels: readonly string[];
 }
 
 /**
@@ -461,13 +469,15 @@ export function createLinearGateway(
             const eligible: RunwayIssue[] = [];
             for (const raw of issues.nodes) {
               const i = decodeIssueNode(raw);
-              if (await hasHitlLabel(raw, config.hitlLabel)) continue;
+              const labels = await fetchIssueLabelNames(raw);
+              if (labels.includes(config.hitlLabel)) continue;
               if (await hasActiveBlocker(raw)) continue;
               eligible.push({
                 id: i.id,
                 identifier: i.identifier,
                 title: i.title,
                 description: i.description ?? "",
+                labels,
               });
             }
             return eligible as readonly RunwayIssue[];

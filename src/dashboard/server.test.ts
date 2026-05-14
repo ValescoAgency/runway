@@ -208,7 +208,7 @@ describe("dashboard HTTP server — detail view (VA-389)", () => {
       body: JSON.stringify(detailPayload),
     });
     const res = await fetch(
-      `${base}/issue/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/9999999999999999`,
+      `${base}/issue-processes/9999999999999999`,
     );
     expect(res.status).toBe(200);
     const html = await res.text();
@@ -220,11 +220,97 @@ describe("dashboard HTTP server — detail view (VA-389)", () => {
     expect(html).toContain("blocked");
   });
 
-  it("returns 404 when the detail route is hit with unknown (trace_id, span_id)", async () => {
-    const res = await fetch(
-      `${base}/issue/00000000000000000000000000000000/0000000000000000`,
-    );
+  it("returns 404 when the detail route is hit with an unknown span id", async () => {
+    const res = await fetch(`${base}/issue-processes/no-such-span`);
     expect(res.status).toBe(404);
+  });
+
+  it("preserves the legacy /issue/<traceId>/<spanId> detail route for back-compat", async () => {
+    await fetch(`${base}/v1/traces`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(detailPayload),
+    });
+    const res = await fetch(
+      `${base}/issue/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/9999999999999999`,
+    );
+    expect(res.status).toBe(200);
+  });
+});
+
+// VA-387: span enrichment is end-to-end visible — the new attributes
+// land in storage and the detail page renders the title + PR link.
+const enrichmentPayload = {
+  resourceSpans: [
+    {
+      resource: {
+        attributes: [{ key: "service.name", value: { stringValue: "runway" } }],
+      },
+      scopeSpans: [
+        {
+          scope: { name: "test" },
+          spans: [
+            {
+              traceId: "cccccccccccccccccccccccccccccccc",
+              spanId: "abcd0000000000ab",
+              name: "processIssue",
+              startTimeUnixNano: "1715000000000000000",
+              endTimeUnixNano: "1715000025000000000",
+              attributes: [
+                {
+                  key: "runway.issue.identifier",
+                  value: { stringValue: "VA-387" },
+                },
+                {
+                  key: "runway.issue.title",
+                  value: { stringValue: "Slice 2 build" },
+                },
+                {
+                  key: "runway.issue.labels",
+                  value: {
+                    arrayValue: {
+                      values: [
+                        { stringValue: "feature" },
+                        { stringValue: "dashboard" },
+                      ],
+                    },
+                  },
+                },
+                {
+                  key: "runway.branch",
+                  value: { stringValue: "agent/va-387" },
+                },
+                {
+                  key: "runway.outcome.kind",
+                  value: { stringValue: "opened" },
+                },
+                {
+                  key: "runway.pr.url",
+                  value: { stringValue: "https://github.com/x/y/pull/99" },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
+describe("dashboard HTTP server — VA-387 span enrichment", () => {
+  it("renders title, branch, and a clickable PR link on /issue-processes/:id", async () => {
+    await fetch(`${base}/v1/traces`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(enrichmentPayload),
+    });
+    const res = await fetch(`${base}/issue-processes/abcd0000000000ab`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("VA-387");
+    expect(html).toContain("Slice 2 build");
+    expect(html).toContain("agent/va-387");
+    expect(html).toContain(`href="https://github.com/x/y/pull/99"`);
   });
 });
 

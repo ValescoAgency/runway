@@ -150,6 +150,89 @@ describe("projectPayload — processIssue", () => {
     expect(out.issueProcesses[0]?.outcomeDetail).toBeNull();
   });
 
+  // VA-387: span-enrichment attributes (issue title, labels, PR url,
+  // HITL reason) attach onto the same processIssue span. Each projects
+  // into its own typed column so the detail pane can render without
+  // re-parsing `runway.outcome.detail`.
+  it("projects runway.issue.title, runway.issue.labels, runway.pr.url, and runway.hitl.reason (VA-387)", () => {
+    const out = projectPayload(
+      payload([
+        span({
+          name: "processIssue",
+          attributes: [
+            { key: "runway.issue.identifier", value: { stringValue: "VA-387" } },
+            { key: "runway.issue.title", value: { stringValue: "Slice 2 build" } },
+            {
+              key: "runway.issue.labels",
+              value: {
+                arrayValue: {
+                  values: [
+                    { stringValue: "feature" },
+                    { stringValue: "dashboard" },
+                  ],
+                },
+              },
+            },
+            {
+              key: "runway.outcome.kind",
+              value: { stringValue: "opened" },
+            },
+            {
+              key: "runway.pr.url",
+              value: { stringValue: "https://github.com/x/y/pull/99" },
+            },
+          ],
+        }),
+      ]),
+    );
+
+    expect(out.issueProcesses).toHaveLength(1);
+    expect(out.issueProcesses[0]).toMatchObject({
+      issueIdentifier: "VA-387",
+      issueTitle: "Slice 2 build",
+      issueLabels: ["feature", "dashboard"],
+      prUrl: "https://github.com/x/y/pull/99",
+      hitlReason: null,
+    });
+  });
+
+  it("projects runway.hitl.reason when the run flagged for human review (VA-387)", () => {
+    const out = projectPayload(
+      payload([
+        span({
+          name: "processIssue",
+          attributes: [
+            { key: "runway.issue.identifier", value: { stringValue: "VA-1" } },
+            { key: "runway.outcome.kind", value: { stringValue: "hitl" } },
+            {
+              key: "runway.hitl.reason",
+              value: { stringValue: "Needs schema decision" },
+            },
+          ],
+        }),
+      ]),
+    );
+    expect(out.issueProcesses[0]?.hitlReason).toBe("Needs schema decision");
+    expect(out.issueProcesses[0]?.prUrl).toBeNull();
+  });
+
+  it("leaves VA-387 enrichment fields null/empty when the span has no enrichment attributes", () => {
+    const out = projectPayload(
+      payload([
+        span({
+          name: "processIssue",
+          attributes: [
+            { key: "runway.issue.identifier", value: { stringValue: "VA-1" } },
+          ],
+        }),
+      ]),
+    );
+    expect(out.issueProcesses[0]?.issueTitle).toBeNull();
+    expect(out.issueProcesses[0]?.issueLabels).toEqual([]);
+    expect(out.issueProcesses[0]?.prUrl).toBeNull();
+    expect(out.issueProcesses[0]?.hitlReason).toBeNull();
+  });
+
   it("preserves the OTLP status code/message when the span carries one", () => {
     const out = projectPayload(
       payload([

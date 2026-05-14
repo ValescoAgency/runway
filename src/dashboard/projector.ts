@@ -38,9 +38,37 @@ export interface IssueProcessRow {
   readonly parentSpanId: string | null;
   readonly issueIdentifier: string;
   readonly issueId: string | null;
+  /**
+   * VA-387: Linear issue title, attached at span-emit time so the
+   * detail pane can render a recognisable header without re-fetching
+   * from Linear. `null` for in-flight rows whose emit predates this
+   * field (or for projectors fed by an older runway).
+   */
+  readonly issueTitle: string | null;
+  /**
+   * VA-387: full set of Linear labels at fetch time. `readonly []`
+   * when the issue had no labels (vs. `null` would conflate "no
+   * labels" with "older projector"); historic rows still surface as
+   * an empty list.
+   */
+  readonly issueLabels: readonly string[];
   readonly branch: string | null;
   readonly outcomeKind: string | null;
   readonly outcomeDetail: string | null;
+  /**
+   * VA-387: extracted from `runway.pr.url` when the run finalised
+   * with `kind=opened`. Same value as `outcomeDetail` for the opened
+   * branch, but a separate column means the detail pane can render
+   * it as a typed GitHub link without sniffing the kind.
+   */
+  readonly prUrl: string | null;
+  /**
+   * VA-387: human-review reason — set when `kind=hitl` (planned or
+   * failure-routed). Same value as `outcomeDetail` for those cases;
+   * typed separately so a UI that wants "show me the reason iff
+   * this went to HITL" doesn't have to branch on kind.
+   */
+  readonly hitlReason: string | null;
   readonly startTimeUnixNano: string;
   readonly endTimeUnixNano: string;
   readonly statusCode: number | null;
@@ -169,9 +197,13 @@ function projectIssueProcess(span: OtlpSpan): IssueProcessRow | undefined {
     parentSpanId: span.parentSpanId ?? null,
     issueIdentifier: identifier,
     issueId: strAttr(m["runway.issue.id"]) ?? null,
+    issueTitle: strAttr(m["runway.issue.title"]) ?? null,
+    issueLabels: strArrayAttr(m["runway.issue.labels"]),
     branch: strAttr(m["runway.branch"]) ?? null,
     outcomeKind: strAttr(m["runway.outcome.kind"]) ?? null,
     outcomeDetail: strAttr(m["runway.outcome.detail"]) ?? null,
+    prUrl: strAttr(m["runway.pr.url"]) ?? null,
+    hitlReason: strAttr(m["runway.hitl.reason"]) ?? null,
     startTimeUnixNano: span.startTimeUnixNano,
     endTimeUnixNano: span.endTimeUnixNano,
     statusCode: span.status?.code ?? null,
@@ -204,15 +236,30 @@ function projectAgentIteration(span: OtlpSpan): AgentIterationRow | undefined {
   };
 }
 
-function strAttr(v: string | number | boolean | undefined): string | undefined {
+function strAttr(
+  v: string | number | boolean | readonly string[] | undefined,
+): string | undefined {
   return typeof v === "string" ? v : undefined;
 }
 
-function numAttr(v: string | number | boolean | undefined): number | null {
+function numAttr(
+  v: string | number | boolean | readonly string[] | undefined,
+): number | null {
   if (typeof v === "number") return v;
   if (typeof v === "string") {
     const n = Number(v);
     return Number.isFinite(n) ? n : null;
   }
   return null;
+}
+
+/**
+ * VA-387: decode an OTLP arrayValue attribute into a string array.
+ * Older spans (or spans from a runway that never set the attribute)
+ * become an empty list so callers don't have to null-guard.
+ */
+function strArrayAttr(
+  v: string | number | boolean | readonly string[] | undefined,
+): readonly string[] {
+  return Array.isArray(v) ? (v as readonly string[]) : [];
 }

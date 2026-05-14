@@ -64,19 +64,27 @@ export interface OtlpTracesPayload {
   readonly resourceSpans: readonly OtlpResourceSpans[];
 }
 
+export type AttrScalar = string | number | boolean | readonly string[];
+
 /**
  * Coerce an OTLP attribute value to a plain JS scalar. We collapse
  * the typed wire variants (`stringValue` / `intValue` / `boolValue` /
- * `doubleValue`) into one return path so callers downstream can
- * pattern-match without knowing the OTLP shape.
+ * `doubleValue` / `arrayValue`) into one return path so callers
+ * downstream can pattern-match without knowing the OTLP shape.
  *
  * `intValue` round-trips as a string to preserve int64 precision.
  * Callers that want a `number` (e.g. for counters under 2^53) should
  * `Number(...)` it themselves.
+ *
+ * VA-387: `arrayValue` collapses to a `readonly string[]` so the
+ * dashboard's label-style attributes (`runway.issue.labels`) survive
+ * the wire trip with their structure intact. Non-string array
+ * elements drop silently — projector callers only ever ask for
+ * string arrays today.
  */
 export function attrValue(
   attr: OtlpAttribute | undefined,
-): string | number | boolean | undefined {
+): AttrScalar | undefined {
   if (!attr) return undefined;
   const v = attr.value;
   if (v.stringValue !== undefined) return v.stringValue;
@@ -89,6 +97,13 @@ export function attrValue(
       ? v.intValue
       : v.intValue;
   }
+  if (v.arrayValue !== undefined) {
+    const items: string[] = [];
+    for (const inner of v.arrayValue.values) {
+      if (inner.stringValue !== undefined) items.push(inner.stringValue);
+    }
+    return items;
+  }
   return undefined;
 }
 
@@ -99,8 +114,8 @@ export function attrValue(
  */
 export function attrMap(
   attrs: readonly OtlpAttribute[] | undefined,
-): Record<string, string | number | boolean> {
-  const out: Record<string, string | number | boolean> = {};
+): Record<string, AttrScalar> {
+  const out: Record<string, AttrScalar> = {};
   if (!attrs) return out;
   for (const a of attrs) {
     const v = attrValue(a);

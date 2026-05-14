@@ -181,12 +181,14 @@ describe("VA-360 — Linear SDK response schemas", () => {
         identifier: "VA-1",
         title: "First",
         description: "an issue",
+        labels: [],
       },
       {
         id: "issue-2",
         identifier: "VA-2",
         title: "Second",
         description: "",
+        labels: [],
       },
     ]);
   });
