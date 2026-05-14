@@ -7,6 +7,7 @@ const issue: RunwayIssue = {
   identifier: "VA-412",
   title: "finalize emits the wrong magic word",
   description: "A description.",
+  labels: [],
 };
 
 describe("buildPrBody (VA-412)", () => {

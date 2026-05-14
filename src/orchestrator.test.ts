@@ -100,6 +100,7 @@ const issue: RunwayIssue = {
   identifier: "VA-312",
   title: "Test issue",
   description: "test",
+  labels: [],
 };
 
 beforeEach(() => {
@@ -142,9 +143,9 @@ describe("drainQueue --max semantics (VA-344)", () => {
     // it to Todo. Without VA-344 the loop would re-pick it forever.
     routeExeca({ revListCount: "0" });
 
-    const a: RunwayIssue = { id: "a", identifier: "VA-1", title: "a", description: "" };
-    const b: RunwayIssue = { id: "b", identifier: "VA-2", title: "b", description: "" };
-    const c: RunwayIssue = { id: "c", identifier: "VA-3", title: "c", description: "" };
+    const a: RunwayIssue = { id: "a", identifier: "VA-1", title: "a", description: "", labels: [] };
+    const b: RunwayIssue = { id: "b", identifier: "VA-2", title: "b", description: "", labels: [] };
+    const c: RunwayIssue = { id: "c", identifier: "VA-3", title: "c", description: "", labels: [] };
 
     sandcastleRunMock.mockRejectedValue(new Error("kapow"));
 

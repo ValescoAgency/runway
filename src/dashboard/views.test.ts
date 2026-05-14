@@ -18,9 +18,13 @@ function row(over: Partial<StoredIssueProcess> = {}): StoredIssueProcess {
     parentSpanId: null,
     issueIdentifier: "VA-1",
     issueId: null,
+    issueTitle: null,
+    issueLabels: [],
     branch: null,
     outcomeKind: "opened",
     outcomeDetail: "https://github.com/x/y/pull/1",
+    prUrl: "https://github.com/x/y/pull/1",
+    hitlReason: null,
     startTimeUnixNano: "0",
     endTimeUnixNano: "0",
     statusCode: null,
@@ -68,7 +72,7 @@ describe("escapeHtml (VA-386)", () => {
     expect(html).toContain("&lt;script&gt;alert");
   });
 
-  it("links each row to its detail page via /issue/<traceId>/<spanId>", () => {
+  it("links each row to its detail page via /issue-processes/<spanId> (VA-387)", () => {
     const html = renderListView([
       row({
         traceId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -76,9 +80,7 @@ describe("escapeHtml (VA-386)", () => {
         issueIdentifier: "VA-1",
       }),
     ]);
-    expect(html).toContain(
-      `/issue/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/2222222222222222`,
-    );
+    expect(html).toContain(`/issue-processes/2222222222222222`);
   });
 });
 
@@ -120,9 +122,13 @@ function detailVm(over: Partial<DetailViewModel> = {}): DetailViewModel {
     parentSpanId: null,
     issueIdentifier: "VA-1",
     issueId: null,
+    issueTitle: null,
+    issueLabels: [],
     branch: "agent/va-1",
     outcomeKind: "opened",
     outcomeDetail: "https://github.com/x/y/pull/1",
+    prUrl: "https://github.com/x/y/pull/1",
+    hitlReason: null,
     startTimeUnixNano: "0",
     endTimeUnixNano: "0",
     statusCode: null,
@@ -240,6 +246,41 @@ describe("renderDetailView (VA-389)", () => {
   it("renders an empty-state message when no iterations and no phase spans exist", () => {
     const html = renderDetailView(detailVm());
     expect(html).toContain("No phase spans recorded yet.");
+  });
+
+  it("renders the issue title, branch, and a clickable PR link for opened runs (VA-387)", () => {
+    const base = detailVm();
+    const html = renderDetailView({
+      ...base,
+      issueProcess: {
+        ...base.issueProcess,
+        issueTitle: "Slice 2 build",
+        branch: "agent/va-387",
+        prUrl: "https://github.com/x/y/pull/99",
+      },
+      iterations: [iter()],
+    });
+    expect(html).toContain("Slice 2 build");
+    expect(html).toContain("agent/va-387");
+    expect(html).toContain(`href="https://github.com/x/y/pull/99"`);
+  });
+
+  it("renders the HITL reason on a hitl run and omits the PR link (VA-387)", () => {
+    const base = detailVm();
+    const html = renderDetailView({
+      ...base,
+      issueProcess: {
+        ...base.issueProcess,
+        outcomeKind: "hitl",
+        outcomeDetail: "Needs human decision",
+        prUrl: null,
+        hitlReason: "Needs human decision",
+      },
+      iterations: [iter()],
+    });
+    expect(html).toContain("HITL reason");
+    expect(html).toContain("Needs human decision");
+    expect(html).not.toContain(`href="https://github.com`);
   });
 
   it("escapes XSS-shaped outcome details on the detail page", () => {

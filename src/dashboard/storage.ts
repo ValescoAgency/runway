@@ -88,6 +88,14 @@ export interface Storage {
     spanId: string,
   ): StoredIssueProcess | undefined;
   /**
+   * VA-387: look up an issue process by its span_id alone. The detail
+   * route at `/issue-processes/:id` keys on span_id so shareable URLs
+   * stay short. Span IDs are random 64-bit values; collisions are
+   * astronomically unlikely. If two rows somehow share a span_id the
+   * most recently inserted one wins.
+   */
+  getIssueProcessBySpanId(spanId: string): StoredIssueProcess | undefined;
+  /**
    * VA-389: iterations sorted ascending by `iteration_index` so the
    * detail pane can render them in execution order without a second
    * pass.
@@ -152,9 +160,13 @@ const SCHEMA = `
     parent_span_id TEXT,
     issue_identifier TEXT NOT NULL,
     issue_id TEXT,
+    issue_title TEXT,
+    issue_labels TEXT,
     branch TEXT,
     outcome_kind TEXT,
     outcome_detail TEXT,
+    pr_url TEXT,
+    hitl_reason TEXT,
     start_time_unix_nano TEXT NOT NULL,
     end_time_unix_nano TEXT NOT NULL,
     status_code INTEGER,
@@ -168,6 +180,9 @@ const SCHEMA = `
 
   CREATE INDEX IF NOT EXISTS idx_issue_processes_trace_id
     ON issue_processes(trace_id);
+
+  CREATE INDEX IF NOT EXISTS idx_issue_processes_span_id
+    ON issue_processes(span_id);
 
   CREATE TABLE IF NOT EXISTS raw_spans (
     trace_id TEXT NOT NULL,
@@ -334,9 +349,29 @@ export function createStorage(
 ): Storage {
   const db = new DatabaseSync(path);
   db.exec(SCHEMA);
+  // VA-387: idempotent column adds for DBs created against an older
+  // schema. `CREATE TABLE IF NOT EXISTS` won't migrate an existing
+  // table; SQLite has no `ADD COLUMN IF NOT EXISTS`, so we swallow
+  // the duplicate-column error individually. Runs BEFORE VA-399's
+  // view install — `evaluator_aggregates_v1` reads from
+  // `issue_processes`, so the columns it may query must exist first.
+  for (const sql of [
+    `ALTER TABLE issue_processes ADD COLUMN issue_title TEXT`,
+    `ALTER TABLE issue_processes ADD COLUMN issue_labels TEXT`,
+    `ALTER TABLE issue_processes ADD COLUMN pr_url TEXT`,
+    `ALTER TABLE issue_processes ADD COLUMN hitl_reason TEXT`,
+  ]) {
+    try {
+      db.exec(sql);
+    } catch {
+      // Column already present — fresh CREATE TABLE path, or a prior
+      // dashboard boot ran the same migration.
+    }
+  }
   // VA-399: install the evaluator-facing read-model view after the
-  // base tables exist, but before any prepared statement is created —
-  // a `SELECT FROM evaluator_aggregates_v1` would otherwise race the
+  // base tables exist (and after VA-387's column migrations above),
+  // but before any prepared statement is created — a
+  // `SELECT FROM evaluator_aggregates_v1` would otherwise race the
   // DDL on first use.
   db.exec(aggregatesViewDdl(opts.aggregateWindowDrains ?? DEFAULT_AGGREGATE_WINDOW));
 
@@ -359,16 +394,21 @@ export function createStorage(
   const insertIssueProcess = db.prepare(`
     INSERT INTO issue_processes (
       trace_id, span_id, parent_span_id, issue_identifier, issue_id,
-      branch, outcome_kind, outcome_detail,
+      issue_title, issue_labels, branch, outcome_kind, outcome_detail,
+      pr_url, hitl_reason,
       start_time_unix_nano, end_time_unix_nano, status_code, status_message
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (trace_id, span_id) DO UPDATE SET
       parent_span_id = excluded.parent_span_id,
       issue_identifier = excluded.issue_identifier,
       issue_id = excluded.issue_id,
+      issue_title = excluded.issue_title,
+      issue_labels = excluded.issue_labels,
       branch = excluded.branch,
       outcome_kind = excluded.outcome_kind,
       outcome_detail = excluded.outcome_detail,
+      pr_url = excluded.pr_url,
+      hitl_reason = excluded.hitl_reason,
       start_time_unix_nano = excluded.start_time_unix_nano,
       end_time_unix_nano = excluded.end_time_unix_nano,
       status_code = excluded.status_code,
@@ -399,23 +439,22 @@ export function createStorage(
 
   // Two list variants instead of one with conditional SQL — keeps
   // each prepared statement static.
-  const listAll = db.prepare(`
-    SELECT
+  const ISSUE_PROCESS_COLUMNS = `
       trace_id, span_id, parent_span_id, issue_identifier, issue_id,
-      branch, outcome_kind, outcome_detail,
+      issue_title, issue_labels, branch, outcome_kind, outcome_detail,
+      pr_url, hitl_reason,
       start_time_unix_nano, end_time_unix_nano, status_code, status_message,
       inserted_at
+  `;
+  const listAll = db.prepare(`
+    SELECT ${ISSUE_PROCESS_COLUMNS}
     FROM issue_processes
     ORDER BY inserted_at DESC, span_id DESC
     LIMIT ?
   `);
 
   const listByTrace = db.prepare(`
-    SELECT
-      trace_id, span_id, parent_span_id, issue_identifier, issue_id,
-      branch, outcome_kind, outcome_detail,
-      start_time_unix_nano, end_time_unix_nano, status_code, status_message,
-      inserted_at
+    SELECT ${ISSUE_PROCESS_COLUMNS}
     FROM issue_processes
     WHERE trace_id = ?
     ORDER BY inserted_at DESC, span_id DESC
@@ -423,13 +462,20 @@ export function createStorage(
   `);
 
   const getProcessStmt = db.prepare(`
-    SELECT
-      trace_id, span_id, parent_span_id, issue_identifier, issue_id,
-      branch, outcome_kind, outcome_detail,
-      start_time_unix_nano, end_time_unix_nano, status_code, status_message,
-      inserted_at
+    SELECT ${ISSUE_PROCESS_COLUMNS}
     FROM issue_processes
     WHERE trace_id = ? AND span_id = ?
+  `);
+
+  // VA-387: span_id is unique in practice (random 64-bit ids); the
+  // detail route at `/issue-processes/:id` keys on span_id alone so
+  // operators don't have to type the trace_id in URLs.
+  const getProcessBySpanStmt = db.prepare(`
+    SELECT ${ISSUE_PROCESS_COLUMNS}
+    FROM issue_processes
+    WHERE span_id = ?
+    ORDER BY inserted_at DESC
+    LIMIT 1
   `);
 
   const listIterations = db.prepare(`
@@ -468,9 +514,16 @@ export function createStorage(
       p.parentSpanId,
       p.issueIdentifier,
       p.issueId,
+      p.issueTitle,
+      // VA-387: labels round-trip as a JSON array string. Keeping them
+      // in one column avoids a label-many-to-many table for a feature
+      // that's read-only on the dashboard side.
+      p.issueLabels.length === 0 ? null : JSON.stringify(p.issueLabels),
       p.branch,
       p.outcomeKind,
       p.outcomeDetail,
+      p.prUrl,
+      p.hitlReason,
       p.startTimeUnixNano,
       p.endTimeUnixNano,
       asInt(p.statusCode),
@@ -510,6 +563,13 @@ export function createStorage(
     spanId: string,
   ): StoredIssueProcess | undefined => {
     const row = getProcessStmt.get(traceId, spanId);
+    return row ? rowToIssueProcess(row) : undefined;
+  };
+
+  const getIssueProcessBySpanId = (
+    spanId: string,
+  ): StoredIssueProcess | undefined => {
+    const row = getProcessBySpanStmt.get(spanId);
     return row ? rowToIssueProcess(row) : undefined;
   };
 
@@ -570,6 +630,7 @@ export function createStorage(
     saveRawSpan,
     listIssueProcesses,
     getIssueProcess,
+    getIssueProcessBySpanId,
     listAgentIterations,
     listPhaseSpans,
     listAggregates,
@@ -592,15 +653,36 @@ function rowToIssueProcess(row: unknown): StoredIssueProcess {
     parentSpanId: nullableStr(r.parent_span_id),
     issueIdentifier: String(r.issue_identifier ?? ""),
     issueId: nullableStr(r.issue_id),
+    issueTitle: nullableStr(r.issue_title),
+    issueLabels: parseLabels(r.issue_labels),
     branch: nullableStr(r.branch),
     outcomeKind: nullableStr(r.outcome_kind),
     outcomeDetail: nullableStr(r.outcome_detail),
+    prUrl: nullableStr(r.pr_url),
+    hitlReason: nullableStr(r.hitl_reason),
     startTimeUnixNano: String(r.start_time_unix_nano ?? ""),
     endTimeUnixNano: String(r.end_time_unix_nano ?? ""),
     statusCode: nullableNum(r.status_code),
     statusMessage: nullableStr(r.status_message),
     insertedAt: String(r.inserted_at ?? ""),
   };
+}
+
+/**
+ * VA-387: decode the JSON-encoded `issue_labels` column back into a
+ * string array. A row stored before the column existed (or one with
+ * NULL / malformed JSON) collapses to an empty list.
+ */
+function parseLabels(v: unknown): readonly string[] {
+  if (v === null || v === undefined) return [];
+  if (typeof v !== "string") return [];
+  try {
+    const parsed = JSON.parse(v) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((x): x is string => typeof x === "string");
+  } catch {
+    return [];
+  }
 }
 
 function rowToAgentIteration(row: unknown): StoredAgentIteration {

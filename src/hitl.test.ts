@@ -54,6 +54,7 @@ const issue: RunwayIssue = {
   identifier: "VA-312",
   title: "Test issue",
   description: "test",
+  labels: [],
 };
 
 // FailureRoutingDeps is the wider shape — it structurally satisfies
