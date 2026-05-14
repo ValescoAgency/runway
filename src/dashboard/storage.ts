@@ -35,6 +35,27 @@ export interface StoredAgentIteration extends AgentIterationRow {
 }
 
 /**
+ * VA-399: one row per issue-category from `evaluator_aggregates_v1`.
+ * Field semantics + versioning policy live in `read-model.md`. The
+ * field names mirror the SQL view's columns (snake_case → camelCase)
+ * so a SQL query and an HTTP response refer to the same things — IRA
+ * prompts reference these by name, and the dashboard UI consumes the
+ * exact same shape over `/api/aggregates`.
+ */
+export interface EvaluatorAggregate {
+  readonly category: string;
+  readonly sampleSize: number;
+  readonly medianIterationCount: number | null;
+  readonly p95IterationCount: number | null;
+  readonly medianWallTimeMs: number | null;
+  readonly p95WallTimeMs: number | null;
+  readonly reviewerRejectionRate: number;
+  readonly revertRate: number;
+  readonly hitlEscapeRate: number;
+  readonly infraErrorRate: number;
+}
+
+/**
  * VA-389: a generic phase-span row pulled out of `raw_spans` via
  * `json_extract`. The detail pane uses this to render the
  * implement / review / finalize timeline without each phase needing
@@ -86,7 +107,27 @@ export interface Storage {
     issueProcessSpanId: string,
     names: readonly string[],
   ): readonly PhaseSpan[];
+  /**
+   * VA-399: read the evaluator-facing aggregates view. The view
+   * computes over the rolling window passed to `createStorage`
+   * (defaulting to the last 30 drains). External evaluators can also
+   * `SELECT * FROM evaluator_aggregates_v1` directly against the
+   * SQLite file — this method is the convenience accessor for the
+   * dashboard UI and `/api/aggregates`.
+   */
+  listAggregates(): readonly EvaluatorAggregate[];
   close(): void;
+}
+
+export interface StorageOptions {
+  /**
+   * VA-399: rolling-window size for the evaluator aggregates view.
+   * Defaults to 30 drains; the dashboard process reads
+   * `DASHBOARD_AGGREGATE_WINDOW` and forwards it here. The view is
+   * recreated with this N on every `createStorage` call — restart
+   * the dashboard to change the window.
+   */
+  readonly aggregateWindowDrains?: number;
 }
 
 const SCHEMA = `
@@ -154,6 +195,130 @@ const SCHEMA = `
     ON agent_iterations(trace_id, issue_process_id, iteration_index);
 `;
 
+const DEFAULT_AGGREGATE_WINDOW = 30;
+
+/**
+ * VA-399: SQL VIEW that computes the evaluator-facing aggregates over
+ * the last N drains. N is interpolated at view-creation time because
+ * SQLite views can't take parameters — when the dashboard process
+ * starts with a different `DASHBOARD_AGGREGATE_WINDOW`, the view is
+ * dropped and recreated with the new LIMIT.
+ *
+ * Median uses the "average of the two middle values when N is even,
+ * the middle value when N is odd" convention; p95 uses the
+ * nearest-rank method (smallest observed value whose rank meets-or-
+ * exceeds 95%). See `read-model.md` for the field-by-field contract.
+ *
+ * `reviewer_rejection_rate` keys on the detail prefix emitted by
+ * `src/review.ts` ("Sub-agent review rejected: ..."). It's a subset
+ * of `hitl_escape_rate` — a review rejection routes to HITL, so both
+ * rates count the same row.
+ */
+function aggregatesViewDdl(windowDrains: number): string {
+  // windowDrains is the only spot we interpolate rather than
+  // parameter-bind (CREATE VIEW can't take params). Coerce to a
+  // positive integer so a hostile env var can't smuggle SQL through.
+  const n = Math.max(1, Math.floor(windowDrains));
+  return `
+    DROP VIEW IF EXISTS evaluator_aggregates_v1;
+    CREATE VIEW evaluator_aggregates_v1 AS
+    WITH recent_drains AS (
+      SELECT trace_id
+      FROM drains
+      ORDER BY CAST(start_time_unix_nano AS INTEGER) DESC
+      LIMIT ${n}
+    ),
+    process_rows AS (
+      SELECT
+        ip.trace_id,
+        ip.span_id,
+        ip.outcome_kind,
+        COALESCE(ip.outcome_detail, '') AS outcome_detail,
+        CASE
+          WHEN instr(ip.issue_identifier, '-') > 0
+            THEN substr(ip.issue_identifier, 1, instr(ip.issue_identifier, '-') - 1)
+          ELSE ip.issue_identifier
+        END AS category,
+        (CAST(ip.end_time_unix_nano AS INTEGER) - CAST(ip.start_time_unix_nano AS INTEGER)) / 1000000 AS wall_time_ms,
+        (
+          SELECT COUNT(*) FROM agent_iterations a
+          WHERE a.trace_id = ip.trace_id AND a.issue_process_id = ip.span_id
+        ) AS iteration_count
+      FROM issue_processes ip
+      WHERE ip.trace_id IN (SELECT trace_id FROM recent_drains)
+    ),
+    wt_ranked AS (
+      SELECT
+        category,
+        wall_time_ms,
+        ROW_NUMBER() OVER (PARTITION BY category ORDER BY wall_time_ms) AS rn,
+        COUNT(*) OVER (PARTITION BY category) AS cnt
+      FROM process_rows
+    ),
+    it_ranked AS (
+      SELECT
+        category,
+        iteration_count,
+        ROW_NUMBER() OVER (PARTITION BY category ORDER BY iteration_count) AS rn,
+        COUNT(*) OVER (PARTITION BY category) AS cnt
+      FROM process_rows
+    ),
+    wt_median AS (
+      SELECT category, AVG(wall_time_ms * 1.0) AS value
+      FROM wt_ranked
+      WHERE rn IN ((cnt + 1) / 2, (cnt / 2) + 1)
+      GROUP BY category
+    ),
+    wt_p95 AS (
+      SELECT category, MIN(wall_time_ms) AS value
+      FROM wt_ranked
+      WHERE rn >= (cnt * 95 + 99) / 100
+      GROUP BY category
+    ),
+    it_median AS (
+      SELECT category, AVG(iteration_count * 1.0) AS value
+      FROM it_ranked
+      WHERE rn IN ((cnt + 1) / 2, (cnt / 2) + 1)
+      GROUP BY category
+    ),
+    it_p95 AS (
+      SELECT category, MIN(iteration_count) AS value
+      FROM it_ranked
+      WHERE rn >= (cnt * 95 + 99) / 100
+      GROUP BY category
+    ),
+    rates AS (
+      SELECT
+        category,
+        COUNT(*) AS sample_size,
+        AVG(CASE WHEN outcome_kind = 'hitl' AND outcome_detail LIKE 'Sub-agent review rejected%'
+                 THEN 1.0 ELSE 0.0 END) AS reviewer_rejection_rate,
+        AVG(CASE WHEN outcome_kind = 'reverted' THEN 1.0 ELSE 0.0 END) AS revert_rate,
+        AVG(CASE WHEN outcome_kind = 'hitl' THEN 1.0 ELSE 0.0 END) AS hitl_escape_rate,
+        AVG(CASE WHEN outcome_kind = 'errored' THEN 1.0 ELSE 0.0 END) AS infra_error_rate
+      FROM process_rows
+      GROUP BY category
+    )
+    SELECT
+      r.category                AS category,
+      r.sample_size             AS sample_size,
+      itm.value                 AS median_iteration_count,
+      itp.value                 AS p95_iteration_count,
+      wtm.value                 AS median_wall_time_ms,
+      wtp.value                 AS p95_wall_time_ms,
+      r.reviewer_rejection_rate AS reviewer_rejection_rate,
+      r.revert_rate             AS revert_rate,
+      r.hitl_escape_rate        AS hitl_escape_rate,
+      r.infra_error_rate        AS infra_error_rate
+    FROM rates r
+    LEFT JOIN wt_median wtm ON wtm.category = r.category
+    LEFT JOIN wt_p95    wtp ON wtp.category = r.category
+    LEFT JOIN it_median itm ON itm.category = r.category
+    LEFT JOIN it_p95    itp ON itp.category = r.category
+    ORDER BY r.category;
+  `;
+}
+
 /**
  * Open (or create) a SQLite database at `path` and return a typed
  * `Storage` handle. Pass `:memory:` for tests — the in-memory db
@@ -163,9 +328,17 @@ const SCHEMA = `
  * OTel SDK retrying a flush) don't blow up the receiver — last writer
  * wins on (trace_id, span_id).
  */
-export function createStorage(path: string): Storage {
+export function createStorage(
+  path: string,
+  opts: StorageOptions = {},
+): Storage {
   const db = new DatabaseSync(path);
   db.exec(SCHEMA);
+  // VA-399: install the evaluator-facing read-model view after the
+  // base tables exist, but before any prepared statement is created —
+  // a `SELECT FROM evaluator_aggregates_v1` would otherwise race the
+  // DDL on first use.
+  db.exec(aggregatesViewDdl(opts.aggregateWindowDrains ?? DEFAULT_AGGREGATE_WINDOW));
 
   const insertDrain = db.prepare(`
     INSERT INTO drains (
@@ -268,6 +441,10 @@ export function createStorage(path: string): Storage {
     WHERE trace_id = ? AND issue_process_id = ?
     ORDER BY iteration_index ASC
   `);
+
+  const selectAggregates = db.prepare(
+    `SELECT * FROM evaluator_aggregates_v1`,
+  );
 
   const saveDrain = (d: DrainRow): void => {
     insertDrain.run(
@@ -379,6 +556,9 @@ export function createStorage(path: string): Storage {
     return rows.map(rowToPhaseSpan);
   };
 
+  const listAggregates = (): readonly EvaluatorAggregate[] =>
+    selectAggregates.all().map(rowToAggregate);
+
   const close = (): void => {
     db.close();
   };
@@ -392,6 +572,7 @@ export function createStorage(path: string): Storage {
     getIssueProcess,
     listAgentIterations,
     listPhaseSpans,
+    listAggregates,
     close,
   };
 }
@@ -458,4 +639,20 @@ function nullableNum(v: unknown): number | null {
   if (v === null || v === undefined) return null;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
+}
+
+function rowToAggregate(row: unknown): EvaluatorAggregate {
+  const r = row as Record<string, unknown>;
+  return {
+    category: String(r.category ?? ""),
+    sampleSize: Number(r.sample_size ?? 0),
+    medianIterationCount: nullableNum(r.median_iteration_count),
+    p95IterationCount: nullableNum(r.p95_iteration_count),
+    medianWallTimeMs: nullableNum(r.median_wall_time_ms),
+    p95WallTimeMs: nullableNum(r.p95_wall_time_ms),
+    reviewerRejectionRate: Number(r.reviewer_rejection_rate ?? 0),
+    revertRate: Number(r.revert_rate ?? 0),
+    hitlEscapeRate: Number(r.hitl_escape_rate ?? 0),
+    infraErrorRate: Number(r.infra_error_rate ?? 0),
+  };
 }
