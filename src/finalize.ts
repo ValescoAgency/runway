@@ -49,7 +49,10 @@ export const finalize = (
     return { kind: "opened", detail: prUrl };
   });
 
-function buildPrBody(issue: RunwayIssue): string {
+// VA-412: `Closes` (not `Refs`) is the Linear GitHub-integration magic
+// word that auto-transitions the issue to Done on PR merge. `Refs`
+// only attaches the PR to the issue and leaves it stuck In Progress.
+export function buildPrBody(issue: RunwayIssue): string {
   return [
     `Runway-generated PR for **${issue.identifier} — ${issue.title}**.`,
     "",
@@ -59,6 +62,6 @@ function buildPrBody(issue: RunwayIssue): string {
     "",
     issue.description || "(no description)",
     "",
-    `Refs ${issue.identifier}`,
+    `Closes ${issue.identifier}`,
   ].join("\n");
 }
