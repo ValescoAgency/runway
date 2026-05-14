@@ -1,4 +1,4 @@
-import { LinearClient } from "@linear/sdk";
+import { Issue, LinearClient } from "@linear/sdk";
 import {
   Data,
   Effect,
@@ -36,6 +36,17 @@ const IssueLabelNodeSchema = Schema.Struct({
 const ProjectNodeSchema = Schema.Struct({
   id: Schema.String,
 });
+// VA-394: minimal shape needed to ask "is this blocker still active?"
+// — we only read the relation's `type` (filtering for `blocks`) and
+// the related issue's workflow state `type`. Schemas stay narrow so
+// the validation cost per candidate stays small.
+const IssueRelationNodeSchema = Schema.Struct({
+  id: Schema.String,
+  type: Schema.String,
+});
+const WorkflowStateTypeNodeSchema = Schema.Struct({
+  type: Schema.String,
+});
 // VA-383: comments fetched for surfacing prior-attempt review feedback
 // to the implementer. `user` is nullable on Linear's side (system /
 // integration comments can lack an author); we map a missing user to
@@ -64,6 +75,57 @@ const decodeIssueLabelNode = Schema.decodeUnknownSync(IssueLabelNodeSchema);
 const decodeProjectNode = Schema.decodeUnknownSync(ProjectNodeSchema);
 const decodeCommentNode = Schema.decodeUnknownSync(CommentNodeSchema);
 const decodeViewer = Schema.decodeUnknownSync(ViewerSchema);
+const decodeIssueRelationNode = Schema.decodeUnknownSync(IssueRelationNodeSchema);
+const decodeWorkflowStateTypeNode = Schema.decodeUnknownSync(
+  WorkflowStateTypeNodeSchema,
+);
+
+// VA-394: Linear workflow state `type` values that mean "the blocker
+// has resolved." Anything else (`triage`, `backlog`, `unstarted`,
+// `started`) still gates the blocked issue from runway pickup.
+const TERMINAL_STATE_TYPES = new Set(["completed", "canceled"]);
+const isTerminalStateType = (type: string): boolean =>
+  TERMINAL_STATE_TYPES.has(type);
+
+/**
+ * VA-394: returns true when `issue` carries `hitlLabel`. Runway writes
+ * this label on HITL escapes, and triage may apply it to flag
+ * human-only work — either way the contract is "do not pick up." Uses
+ * the SDK's chained `labels()` call rather than asking for labels
+ * inline at the candidate-fetch site so the schema for `IssueNode`
+ * stays narrow.
+ */
+async function hasHitlLabel(issue: Issue, hitlLabel: string): Promise<boolean> {
+  const labels = await issue.labels();
+  for (const raw of labels.nodes) {
+    if (decodeIssueLabelNode(raw).name === hitlLabel) return true;
+  }
+  return false;
+}
+
+/**
+ * VA-394: returns true when `issue` has at least one `inverseRelations`
+ * record of type `blocks` whose blocker is in a non-terminal workflow
+ * state. Other relation types (`duplicate`, `related`) do not gate
+ * pickup. A blocker with a missing or undecodable state is treated as
+ * inactive (best-effort: drift in one relation should not stop the
+ * queue), but the decoder still throws `ParseError` on outright
+ * malformed relation nodes — caught upstream as `LinearSchemaError`.
+ */
+async function hasActiveBlocker(issue: Issue): Promise<boolean> {
+  const relations = await issue.inverseRelations();
+  for (const rawRel of relations.nodes) {
+    const rel = decodeIssueRelationNode(rawRel);
+    if (rel.type !== "blocks") continue;
+    const blocker = await rawRel.issue;
+    if (!blocker) continue;
+    const blockerState = await blocker.state;
+    if (!blockerState) continue;
+    const stateType = decodeWorkflowStateTypeNode(blockerState).type;
+    if (!isTerminalStateType(stateType)) return true;
+  }
+  return false;
+}
 
 /**
  * Trimmed-down view of a Linear issue — just what runway's loop needs.
@@ -379,15 +441,28 @@ export function createLinearGateway(
             // VA-360: validate every issue node through the schema —
             // a single drifted issue surfaces as `LinearSchemaError`
             // instead of a downstream `cannot read property X`.
-            return issues.nodes.map((raw) => {
+            //
+            // VA-394: per-candidate eligibility — skip issues carrying
+            // `config.hitlLabel` (triage's "human-only" marker, also
+            // applied by runway itself on prior HITL escapes), and
+            // skip issues with at least one active `blocks` relation
+            // pointing at them. The candidate set is the Todo queue,
+            // typically a handful of issues; the N+1 SDK calls per
+            // candidate go through the rate limiter and the retry
+            // policy alongside everything else.
+            const eligible: RunwayIssue[] = [];
+            for (const raw of issues.nodes) {
               const i = decodeIssueNode(raw);
-              return {
+              if (await hasHitlLabel(raw, config.hitlLabel)) continue;
+              if (await hasActiveBlocker(raw)) continue;
+              eligible.push({
                 id: i.id,
                 identifier: i.identifier,
                 title: i.title,
                 description: i.description ?? "",
-              };
-            }) as readonly RunwayIssue[];
+              });
+            }
+            return eligible as readonly RunwayIssue[];
           },
           catch: (err) => classifyLinearError(err, "fetchReady"),
         }),
