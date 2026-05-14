@@ -160,6 +160,99 @@ export const hasCommits = (
   );
 
 /**
+ * VA-419: outcome of a rebase-onto-base attempt at finalize time.
+ *
+ *   ok       — fast-forward or clean replay; the agent branch ref now
+ *              points at the rebased commits and is safe to push.
+ *   conflict — git rebase exited non-zero. We capture the unmerged
+ *              file list (best-effort) and call `git rebase --abort`
+ *              before returning so the working tree is restored.
+ */
+export type RebaseResult =
+  | { readonly kind: "ok" }
+  | { readonly kind: "conflict"; readonly conflictedFiles: readonly string[] };
+
+/**
+ * VA-419: fetch the latest `origin/<baseBranch>` and rebase the agent
+ * branch onto it. Closes the upstream-conflict-after-approval gap —
+ * without this step, a PR opened off `agent/<id>` after another PR
+ * merged to base mid-drain can land in `CONFLICTING` state on
+ * creation.
+ *
+ * Layout: this runs in the host repo (`repoPath`), not in a sandcastle
+ * worktree. The agent branch is a local ref; `git rebase <upstream>
+ * <branch>` checks it out before replaying commits. Host cwd HEAD is
+ * left wherever the rebase put it (typically on the agent branch on
+ * success, or restored by `--abort` on conflict) — finalize's push
+ * only cares about the ref, not the working-tree HEAD.
+ *
+ * The fetch step may fail (network blip, gh auth expired). We let
+ * that error bubble — finalize routes it through the existing
+ * processIssue failure path. A non-zero rebase exit is treated as
+ * "conflict" regardless of cause, since the safe response is the
+ * same: abort and route to HITL.
+ */
+export const rebaseOntoBase = (
+  repoPath: string,
+  baseBranch: string,
+  branch: string,
+): Effect.Effect<RebaseResult, { readonly message: string }, never> =>
+  Effect.gen(function* () {
+    yield* runExecaScoped(
+      "git",
+      ["fetch", "origin", baseBranch],
+      { cwd: repoPath },
+      (err) => ({
+        message: err instanceof Error ? err.message : String(err),
+      }),
+    );
+
+    const rebase = yield* runExecaScoped(
+      "git",
+      ["rebase", `origin/${baseBranch}`, branch],
+      { cwd: repoPath, reject: false },
+      (err) => ({
+        message: err instanceof Error ? err.message : String(err),
+      }),
+    );
+    if (rebase.exitCode === 0) {
+      return { kind: "ok" } as const;
+    }
+
+    // Collect the unmerged file list before aborting — `--diff-filter=U`
+    // matches only files git left in conflict state.
+    const conflictedFiles = yield* runExecaScoped(
+      "git",
+      ["diff", "--name-only", "--diff-filter=U"],
+      { cwd: repoPath, reject: false },
+      (err) => ({
+        message: err instanceof Error ? err.message : String(err),
+      }),
+    ).pipe(
+      Effect.map((res) => {
+        const raw = res.stdout;
+        const out = typeof raw === "string" ? raw : "";
+        return out
+          .split("\n")
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0);
+      }),
+      Effect.catchAll(() => Effect.succeed([] as string[])),
+    );
+
+    yield* runExecaScoped(
+      "git",
+      ["rebase", "--abort"],
+      { cwd: repoPath, reject: false },
+      (err) => ({
+        message: err instanceof Error ? err.message : String(err),
+      }),
+    ).pipe(Effect.catchAll(() => Effect.succeed(undefined)));
+
+    return { kind: "conflict", conflictedFiles } as const;
+  });
+
+/**
  * VA-366: prune an agent/<issue> branch from a prior failed attempt
  * so the next worktree creation forks from current `base` HEAD
  * instead of reusing a stale tip.

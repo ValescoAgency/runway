@@ -111,7 +111,9 @@ beforeEach(() => {
 // Default `execa` mock router. detectBaseBranch's symbolic-ref call
 // returns `origin/main`; rev-list returns whatever the test sets;
 // diff/log return empty (review path doesn't inspect their contents
-// beyond rendering them into a prompt template).
+// beyond rendering them into a prompt template); fetch + rebase
+// (VA-419) default to clean replay so the finalize-time rebase
+// passthrough doesn't change the outcomes of pre-existing tests.
 function routeExeca(opts: { revListCount: string }): void {
   execaMock.mockImplementation((bin: string, args: readonly string[]) => {
     if (bin !== "git") {
@@ -126,6 +128,11 @@ function routeExeca(opts: { revListCount: string }): void {
     if (args[0] === "diff" || args[0] === "log") {
       // The orchestrator captures the diff + commit log to render the
       // review prompt; tests don't care about the actual contents.
+      return Promise.resolve({ exitCode: 0, stdout: "" });
+    }
+    if (args[0] === "fetch" || args[0] === "rebase") {
+      // VA-419: clean rebase by default. Tests covering the conflict
+      // path build their own execa impl.
       return Promise.resolve({ exitCode: 0, stdout: "" });
     }
     return Promise.reject(new Error(`unexpected git args: ${args.join(" ")}`));
@@ -479,6 +486,153 @@ describe("drainQueue iteration memory (VA-349)", () => {
 // ---------------------------------------------------------------------------
 // Tests — VA-346 base-branch threading
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Tests — VA-419 rebase-onto-base before opening the PR
+// ---------------------------------------------------------------------------
+
+describe("drainQueue finalize-time rebase (VA-419)", () => {
+  it("clean rebase passes through to push + PR open as before", async () => {
+    // Default routeExeca returns exit 0 for fetch + rebase, so this
+    // reproduces the pre-VA-419 "happy path" outcome. The extra git
+    // calls don't change the final result.
+    routeExeca({ revListCount: "1" });
+    sandcastleRunMock
+      .mockResolvedValueOnce({
+        stdout: "impl done\nIMPL: DONE",
+        commits: [{ sha: "abc" }],
+      })
+      .mockResolvedValueOnce({
+        stdout: "REVIEW: APPROVED",
+        commits: [],
+      });
+
+    const linear = makeLinear();
+    linear.fetchReady
+      .mockReturnValueOnce(Effect.succeed([issue]))
+      .mockReturnValueOnce(Effect.succeed([]));
+
+    const github = makeGithub();
+    const result = await drainQueue({
+      config,
+      linear: asLinear(linear),
+      github,
+      cwd: "/tmp/repo",
+    });
+
+    expect(result).toMatchObject({
+      attempts: 1,
+      opened: 1,
+      hitl: 0,
+      errored: 0,
+    });
+    // The fetch + rebase calls were issued.
+    const gitVerbs = execaMock.mock.calls
+      .filter((c) => c[0] === "git")
+      .map((c) => (c[1] as readonly string[])[0]);
+    expect(gitVerbs).toContain("fetch");
+    expect(gitVerbs).toContain("rebase");
+    // PR was opened — push and pr create both fired.
+    expect(github.pushBranch).toHaveBeenCalled();
+    expect(github.openPullRequest).toHaveBeenCalled();
+  });
+
+  it("rebase conflict after APPROVED → HITL with base-branch + file list; PR is NOT opened", async () => {
+    // Custom execa impl: fetch ok, rebase exits non-zero, diff
+    // surfaces the unmerged files, abort succeeds.
+    execaMock.mockImplementation((bin: string, args: readonly string[]) => {
+      if (bin !== "git") {
+        return Promise.reject(new Error(`unexpected binary: ${bin}`));
+      }
+      if (args[0] === "symbolic-ref") {
+        return Promise.resolve({ exitCode: 0, stdout: "origin/main\n" });
+      }
+      if (args[0] === "rev-list") {
+        return Promise.resolve({ exitCode: 0, stdout: "3" });
+      }
+      if (args[0] === "diff" && args[1] === "--name-only") {
+        return Promise.resolve({
+          exitCode: 0,
+          stdout:
+            "src/dashboard/storage.ts\nsrc/dashboard/storage.test.ts\n",
+        });
+      }
+      if (args[0] === "diff" || args[0] === "log") {
+        return Promise.resolve({ exitCode: 0, stdout: "" });
+      }
+      if (args[0] === "fetch") {
+        return Promise.resolve({ exitCode: 0, stdout: "" });
+      }
+      if (args[0] === "rebase") {
+        if (args[1] === "--abort") {
+          return Promise.resolve({ exitCode: 0, stdout: "" });
+        }
+        // origin/<base> <branch> rebase invocation — conflict.
+        return Promise.resolve({ exitCode: 1, stdout: "" });
+      }
+      return Promise.reject(
+        new Error(`unexpected git args: ${args.join(" ")}`),
+      );
+    });
+
+    sandcastleRunMock
+      .mockResolvedValueOnce({
+        stdout: "impl done\nIMPL: DONE",
+        commits: [{ sha: "abc" }],
+      })
+      .mockResolvedValueOnce({
+        stdout: "REVIEW: APPROVED",
+        commits: [],
+      });
+
+    const linear = makeLinear();
+    linear.fetchReady
+      .mockReturnValueOnce(Effect.succeed([issue]))
+      .mockReturnValueOnce(Effect.succeed([]));
+
+    const github = makeGithub();
+    const result = await drainQueue({
+      config,
+      linear: asLinear(linear),
+      github,
+      cwd: "/tmp/repo",
+    });
+
+    // Routed to HITL — not opened, not errored. The drain spent its
+    // attempt and counted one HITL outcome.
+    expect(result).toMatchObject({
+      attempts: 1,
+      opened: 0,
+      hitl: 1,
+      errored: 0,
+    });
+
+    // Push and PR create were NOT invoked — the rebase failure
+    // short-circuited finalize before any GitHub side-effect.
+    expect(github.pushBranch).not.toHaveBeenCalled();
+    expect(github.openPullRequest).not.toHaveBeenCalled();
+
+    // HITL plumbing: needs-human label applied, comment names the base
+    // branch + conflicted files + quotes the APPROVED verdict.
+    expect(linear.applyLabel).toHaveBeenCalledWith("issue-123", "needs-human");
+    const commentBodies = linear.comment.mock.calls.map((c) => String(c[1]));
+    const hitlComment = commentBodies.find((b) =>
+      /flagged for human review/.test(b),
+    );
+    expect(hitlComment).toBeDefined();
+    expect(hitlComment).toMatch(/Upstream base `main` advanced/);
+    expect(hitlComment).toMatch(/src\/dashboard\/storage\.ts/);
+    expect(hitlComment).toMatch(/src\/dashboard\/storage\.test\.ts/);
+    expect(hitlComment).toMatch(/Review was APPROVED before the rebase/);
+    expect(hitlComment).toMatch(/REVIEW: APPROVED/);
+
+    // `git rebase --abort` ran — pre-rebase state was restored.
+    const gitCalls = execaMock.mock.calls
+      .filter((c) => c[0] === "git")
+      .map((c) => (c[1] as readonly string[]).join(" "));
+    expect(gitCalls).toContain("rebase --abort");
+  });
+});
 
 describe("drainQueue base-branch resolution (VA-346)", () => {
   it("uses RUNWAY_BASE_BRANCH override and skips origin/HEAD detection", async () => {
