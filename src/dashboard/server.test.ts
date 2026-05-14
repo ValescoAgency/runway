@@ -227,3 +227,43 @@ describe("dashboard HTTP server — detail view (VA-389)", () => {
     expect(res.status).toBe(404);
   });
 });
+
+// VA-399: the evaluator-facing aggregates view is queryable both by an
+// external evaluator (sqlite SELECT) and the dashboard UI / HTTP
+// clients (GET /api/aggregates). This test asserts the HTTP shape — the
+// SQL contract is covered in storage.test.ts.
+describe("dashboard HTTP server — /api/aggregates (VA-399)", () => {
+  it("returns the aggregates view as JSON keyed by view name", async () => {
+    // Drive the view through a single processIssue + drain so the
+    // server-level wiring (storage.listAggregates → JSON shape) is
+    // exercised end-to-end.
+    await fetch(`${base}/v1/traces`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(sampleTracesPayload),
+    });
+    const res = await fetch(`${base}/api/aggregates`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    const body = (await res.json()) as {
+      view: string;
+      rows: Array<{
+        category: string;
+        sampleSize: number;
+        hitlEscapeRate: number;
+      }>;
+    };
+    expect(body.view).toBe("evaluator_aggregates_v1");
+    expect(body.rows).toHaveLength(1);
+    expect(body.rows[0]?.category).toBe("VA");
+    expect(body.rows[0]?.sampleSize).toBe(1);
+  });
+
+  it("returns an empty rows array when no drains have landed yet", async () => {
+    const res = await fetch(`${base}/api/aggregates`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { view: string; rows: unknown[] };
+    expect(body.view).toBe("evaluator_aggregates_v1");
+    expect(body.rows).toEqual([]);
+  });
+});

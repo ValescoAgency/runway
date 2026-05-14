@@ -357,3 +357,260 @@ describe("createStorage — listPhaseSpans (VA-389)", () => {
     ).toEqual([]);
   });
 });
+
+// VA-399: evaluator_aggregates_v1 — the IRA-facing read-model.
+// Fixtures are intentionally tiny (single-digit row counts) so a
+// future reader can verify each expected value by mental arithmetic.
+describe("createStorage — evaluator aggregates view (VA-399)", () => {
+  // Build a drain whose trace_id namespaces both itself + the child
+  // issue processes that belong to it. Time strings are 19-digit nanos
+  // (ordering by `CAST(start_time AS INTEGER)` only matters relative
+  // to other drains, so we use round numbers).
+  function seedDrain(
+    s: Storage,
+    traceId: string,
+    startNano: string,
+  ): void {
+    s.saveDrain({
+      traceId,
+      spanId: traceId.slice(0, 16),
+      startTimeUnixNano: startNano,
+      endTimeUnixNano: startNano,
+      attempts: 1,
+      opened: 0,
+      hitl: 0,
+      errored: 0,
+      statusCode: 1,
+      statusMessage: null,
+    });
+  }
+
+  // Issue process whose wall-time is `wallMs` ms (start = 0, end =
+  // wallMs * 1e6 nanos). `iterations` controls how many
+  // agent_iterations rows we insert as children.
+  function seedProcess(
+    s: Storage,
+    args: {
+      traceId: string;
+      spanId: string;
+      identifier: string;
+      outcomeKind: string | null;
+      outcomeDetail?: string | null;
+      wallMs: number;
+      iterations: number;
+    },
+  ): void {
+    const startNano = "1000000000000000000";
+    // Hand-computed: 1e18 + wallMs * 1e6 = end-time
+    const endNano = (BigInt(startNano) + BigInt(args.wallMs) * 1_000_000n).toString();
+    s.saveIssueProcess({
+      traceId: args.traceId,
+      spanId: args.spanId,
+      parentSpanId: args.traceId.slice(0, 16),
+      issueIdentifier: args.identifier,
+      issueId: null,
+      branch: null,
+      outcomeKind: args.outcomeKind,
+      outcomeDetail: args.outcomeDetail ?? null,
+      startTimeUnixNano: startNano,
+      endTimeUnixNano: endNano,
+      statusCode: 1,
+      statusMessage: null,
+    });
+    for (let i = 1; i <= args.iterations; i += 1) {
+      // Iter spanIds must be unique per (trace, process) — otherwise
+      // the PK upsert silently reassigns iters between processes and
+      // skews the iteration_count subquery. Build the iter id from
+      // the full process span id + iteration index.
+      s.saveAgentIteration({
+        traceId: args.traceId,
+        spanId: `${args.spanId}_it${i.toString().padStart(2, "0")}`,
+        issueProcessSpanId: args.spanId,
+        iterationIndex: i,
+        startTimeUnixNano: startNano,
+        endTimeUnixNano: endNano,
+        sandcastleRunId: null,
+        exitStatus: "done",
+      });
+    }
+  }
+
+  it("computes hand-verifiable medians, p95s, and outcome rates per issue-category", () => {
+    // Single drain — every process lands in the rolling window.
+    const trace = "ffffffffffffffffffffffffffffffff";
+    seedDrain(storage, trace, "1000000000000000000");
+
+    // Category VA: 5 processes. Wall times {1000, 2000, 3000, 4000, 5000} ms.
+    // Iteration counts {1, 2, 3, 4, 5}. Outcomes mixed: 3 opened, 2 hitl
+    // (one of which is the reviewer-rejection variant).
+    // Hand-computed expectations (N=5):
+    //   median wall_ms = 3000 (middle of sorted list)
+    //   p95 wall_ms     = 5000 (nearest-rank: ceil(5*0.95)=5 → 5th value)
+    //   median iter_ct  = 3
+    //   p95 iter_ct     = 5
+    //   reviewer_rejection_rate = 1/5 = 0.2
+    //   revert_rate             = 0/5 = 0
+    //   hitl_escape_rate        = 2/5 = 0.4
+    //   infra_error_rate        = 0/5 = 0
+    const vaCases = [
+      { wallMs: 1000, iter: 1, outcome: "opened", detail: null },
+      { wallMs: 2000, iter: 2, outcome: "opened", detail: null },
+      { wallMs: 3000, iter: 3, outcome: "opened", detail: null },
+      {
+        wallMs: 4000,
+        iter: 4,
+        outcome: "hitl",
+        detail: "Sub-agent review rejected: needs more tests",
+      },
+      { wallMs: 5000, iter: 5, outcome: "hitl", detail: "Max iterations" },
+    ] as const;
+    vaCases.forEach((c, i) => {
+      seedProcess(storage, {
+        traceId: trace,
+        spanId: `vavavavavavava${i.toString().padStart(2, "0")}`,
+        identifier: `VA-${100 + i}`,
+        outcomeKind: c.outcome,
+        outcomeDetail: c.detail,
+        wallMs: c.wallMs,
+        iterations: c.iter,
+      });
+    });
+
+    // Category ENG: 4 processes — even-N median forces averaging the
+    // two middle values. Wall times {100, 200, 300, 400}; iterations
+    // {2, 2, 4, 4}.
+    //   median wall_ms = (200 + 300) / 2 = 250
+    //   p95 wall_ms     = 400 (ceil(4*0.95)=4 → 4th value)
+    //   median iter_ct  = (2 + 4) / 2 = 3
+    //   p95 iter_ct     = 4
+    //   revert_rate     = 1/4 = 0.25
+    //   infra_error_rate = 1/4 = 0.25
+    //   hitl_escape_rate = 0/4 = 0
+    const engCases = [
+      { wallMs: 100, iter: 2, outcome: "opened", detail: null },
+      { wallMs: 200, iter: 2, outcome: "opened", detail: null },
+      { wallMs: 300, iter: 4, outcome: "reverted", detail: null },
+      { wallMs: 400, iter: 4, outcome: "errored", detail: null },
+    ] as const;
+    engCases.forEach((c, i) => {
+      seedProcess(storage, {
+        traceId: trace,
+        spanId: `engengengengen${i.toString().padStart(2, "0")}`,
+        identifier: `ENG-${100 + i}`,
+        outcomeKind: c.outcome,
+        outcomeDetail: c.detail,
+        wallMs: c.wallMs,
+        iterations: c.iter,
+      });
+    });
+
+    const rows = storage.listAggregates();
+    expect(rows.map((r) => r.category)).toEqual(["ENG", "VA"]);
+
+    const eng = rows.find((r) => r.category === "ENG");
+    const va = rows.find((r) => r.category === "VA");
+
+    expect(va).toMatchObject({
+      sampleSize: 5,
+      medianWallTimeMs: 3000,
+      p95WallTimeMs: 5000,
+      medianIterationCount: 3,
+      p95IterationCount: 5,
+      reviewerRejectionRate: 0.2,
+      revertRate: 0,
+      hitlEscapeRate: 0.4,
+      infraErrorRate: 0,
+    });
+    expect(eng).toMatchObject({
+      sampleSize: 4,
+      medianWallTimeMs: 250,
+      p95WallTimeMs: 400,
+      medianIterationCount: 3,
+      p95IterationCount: 4,
+      reviewerRejectionRate: 0,
+      revertRate: 0.25,
+      hitlEscapeRate: 0,
+      infraErrorRate: 0.25,
+    });
+  });
+
+  it("excludes drains outside the rolling window so the view honours its LIMIT", () => {
+    // Override DEFAULT_AGGREGATE_WINDOW to 1 — only the most-recent
+    // drain's processes should contribute. The older drain's process
+    // (which would otherwise dominate) must drop out.
+    storage.close();
+    const tight = createStorage(":memory:", { aggregateWindowDrains: 1 });
+    try {
+      const oldTrace = "11111111111111111111111111111111";
+      const newTrace = "22222222222222222222222222222222";
+      seedDrain(tight, oldTrace, "1000000000000000000");
+      seedDrain(tight, newTrace, "2000000000000000000");
+
+      // Old drain: process whose wall-time would skew the median if
+      // it weren't filtered out.
+      seedProcess(tight, {
+        traceId: oldTrace,
+        spanId: "oldoldoldold0001",
+        identifier: "VA-1",
+        outcomeKind: "opened",
+        wallMs: 999_999,
+        iterations: 99,
+      });
+      // New drain: single process inside the window.
+      seedProcess(tight, {
+        traceId: newTrace,
+        spanId: "newnewnewnew0001",
+        identifier: "VA-2",
+        outcomeKind: "opened",
+        wallMs: 500,
+        iterations: 2,
+      });
+
+      const rows = tight.listAggregates();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        category: "VA",
+        sampleSize: 1,
+        medianWallTimeMs: 500,
+        p95WallTimeMs: 500,
+        medianIterationCount: 2,
+        p95IterationCount: 2,
+      });
+    } finally {
+      tight.close();
+      // Re-open the outer-suite storage so afterEach's close() doesn't
+      // double-free the in-memory db we already closed above.
+      storage = createStorage(":memory:");
+    }
+  });
+
+  it("returns an empty list when the event store has no drains yet", () => {
+    expect(storage.listAggregates()).toEqual([]);
+  });
+
+  it("treats an issue identifier with no dash as its own category", () => {
+    const trace = "33333333333333333333333333333333";
+    seedDrain(storage, trace, "1000000000000000000");
+    seedProcess(storage, {
+      traceId: trace,
+      spanId: "nodashnodash0001",
+      identifier: "loose-string-no-team-prefix-by-design",
+      outcomeKind: "opened",
+      wallMs: 1000,
+      iterations: 1,
+    });
+    seedProcess(storage, {
+      traceId: trace,
+      spanId: "nodashnodash0002",
+      identifier: "OPS",
+      outcomeKind: "opened",
+      wallMs: 1000,
+      iterations: 1,
+    });
+
+    const rows = storage.listAggregates();
+    // "loose-string-..." has a dash so its category is "loose".
+    // "OPS" has no dash so its category is the full string.
+    expect(rows.map((r) => r.category).sort()).toEqual(["OPS", "loose"]);
+  });
+});

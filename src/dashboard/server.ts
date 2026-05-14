@@ -118,6 +118,11 @@ async function handle(
     }
   }
 
+  if (method === "GET" && (url === "/api/aggregates" || url.startsWith("/api/aggregates?"))) {
+    handleAggregates(res, storage);
+    return;
+  }
+
   if (method === "GET" && url === "/healthz") {
     res.writeHead(200, { "content-type": "text/plain" });
     res.end("ok");
@@ -223,6 +228,19 @@ function handleDetailView(
   res.end(html);
 }
 
+/**
+ * VA-399: JSON snapshot of the evaluator-facing aggregates read-model.
+ * The shape mirrors `EvaluatorAggregate` (snake_case → camelCase) so
+ * IRA prompts and the dashboard UI can reference the same field names
+ * regardless of access path. See `read-model.md` for the field
+ * contract + versioning policy.
+ */
+function handleAggregates(res: ServerResponse, storage: Storage): void {
+  const rows = storage.listAggregates();
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end(JSON.stringify({ view: "evaluator_aggregates_v1", rows }));
+}
+
 async function readBody(req: IncomingMessage): Promise<string | undefined> {
   const chunks: Buffer[] = [];
   let total = 0;
@@ -265,8 +283,17 @@ export async function main(): Promise<void> {
   const sqlitePath = process.env.SQLITE_PATH ?? "/data/runway.sqlite";
   const otlpPort = parsePort("OTLP_PORT", "4318");
   const dashboardPort = parsePort("DASHBOARD_PORT", "3001");
+  // VA-399: rolling-window size for the evaluator aggregates view.
+  // Defaults to 30 drains; operators bump it for longer-baseline IRA
+  // comparisons. Missing/invalid → fall through to the storage layer's
+  // default rather than crashing the dashboard at boot.
+  const aggregateWindow = parsePositiveInt(
+    process.env.DASHBOARD_AGGREGATE_WINDOW,
+  );
 
-  const storage = createStorage(sqlitePath);
+  const storage = createStorage(sqlitePath, {
+    aggregateWindowDrains: aggregateWindow,
+  });
   const otlp = await startServer({ storage, port: otlpPort });
   const dashboard =
     dashboardPort === otlpPort
@@ -295,6 +322,12 @@ function parsePort(envName: string, fallback: string): number {
     throw new Error(`invalid ${envName}: "${raw}"`);
   }
   return n;
+}
+
+function parsePositiveInt(raw: string | undefined): number | undefined {
+  if (!raw) return undefined;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
 // Run as a script when executed directly (e.g. inside the Docker
