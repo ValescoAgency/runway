@@ -4,6 +4,29 @@ All notable changes to runway are documented here. Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); breaking
 changes bump the major.
 
+## 0.7.0 — 2026-05-14
+
+Closes the **reject → comment → retry feedback loop** that was silently broken: when the sandcastle review agent rejected an issue and HITL posted the rejection reason as a Linear comment, the next runway pickup of that issue did not fetch those comments and the implementer would silently re-bug. One feat ([PR #56](https://github.com/ValescoAgency/runway/pull/56), VA-383) plus a dep-freshening pass — every dep ≥2 days old at publish time got bumped, including four majors (`@linear/sdk` 41→84, `typescript` 5→6, `zod` 3→4, `@types/node` 22→25). All 183 tests pass under the bumped tree.
+
+### Added
+
+- **Prior-attempt review feedback surfaced to the impl agent** ([PR #56](https://github.com/ValescoAgency/runway/pull/56), VA-383). `LinearGateway` gains `fetchComments(issueId)` and `viewer()`. The orchestrator resolves the viewer once per drain to seed the default comment-author allowlist, then per-issue fetches comments **before** posting "Runway picked up …" so the agent doesn't see its own bookkeeping. The new `formatPriorFeedback(comments, allowlist)` helper (exported from `src/prompts.ts`) filters by author **and** strips known runway bookkeeping prefixes (`Runway picked up`, `Runway opened a PR`, `Runway hit a startup failure`, `Note: could not apply`), then renders a `# Review feedback from prior attempts` block injected via the new `{{PRIOR_REVIEW_FEEDBACK}}` slot in `prompts/implement.md`. Block injects on every iteration of a run, not just iteration 1 — drift in iteration 3 still needs the original rejection context.
+- **`RUNWAY_COMMENT_AUTHOR_ALLOWLIST` env var** ([PR #56](https://github.com/ValescoAgency/runway/pull/56), VA-383). Comma-separated Linear user names whose comments get surfaced. Unset → defaults to the Linear user the API key authenticates as (covers the solo-dev case where reviewer agent and repo owner share an account). Set this when the reviewer agent runs under a distinct service-account identity.
+
+### Internal — dep bumps (no behavior change)
+
+- `@linear/sdk` 41 → 84. 43-major-version jump caught up in one shot; typecheck against v84's TS types is clean for every call runway makes.
+- `typescript` 5 → 6. Effect + Schema type machinery absorbs most of the strictness changes; codebase compiles unchanged.
+- `zod` 3 → 4. Only used in `src/policy.ts` for the policy-file schema (basic `z.object`/`z.array`/`z.string` surface); none of v4's breaking changes touch it.
+- `@types/node` 22 → 25. Engine pin remains `>=22`; types-only.
+- Caret-range bumps: `vitest` 4.1.5→4.1.6, `@commitlint/cli` + `config-conventional` 21.0.0→21.0.1, `@opentelemetry/semantic-conventions` 1.40.0→1.41.1, `@types/node` 22.19.18→22.19.19 (later superseded by the major bump).
+- Skipped: `@opentelemetry/exporter-trace-otlp-http` 0.217→0.218 (0.x minor = effectively major; published 2026-05-13, only 1 day old at release time, below the 2-day stability threshold this repo applies for proactive bumps).
+
+### Internal — release stats
+
+- **6 commits since 0.6.0** (1 feat + 5 chore-dep).
+- All 33 test files, 183 specs pass under every intermediate dep state.
+
 ## 0.6.0 — 2026-05-12
 
 Architectural decomposition release. The five-candidate architecture punch list (VA-361 → VA-365, plus follow-up VA-367) all land, bringing `commands/` to a uniformly thin wiring layer and pushing domain logic into focused modules in `src/`. One new public flag, one bug fix, and the agent default model bumps to Claude Opus 4.7. Seven PRs ([#47](https://github.com/ValescoAgency/runway/pull/47) → [#54](https://github.com/ValescoAgency/runway/pull/54)) plus three direct-master fixes (VA-368, VA-369 — paper-trail filed retroactively).
