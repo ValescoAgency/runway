@@ -12,8 +12,14 @@ You are an autonomous coding agent working on a single Linear issue.
 
 # Repository context
 
-You are operating inside a clean checkout of the target repository on a
-fresh branch named `agent/{{ISSUE_IDENTIFIER}}`. Branch off `main`.
+You are operating on the branch `agent/{{ISSUE_IDENTIFIER}}` based off
+`main`. The branch is clean on a first attempt. **On a retry it may
+already carry commits from a prior attempt that review rejected** —
+the rejection reasons then appear in the *Review feedback from prior
+attempts* section above. Your job is to produce a final state that
+addresses every blocker in that feedback, replacing the existing
+commits if they would re-introduce a rejected design. Do not treat
+pre-existing commits as authoritative.
 
 # What done looks like
 
