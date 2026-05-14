@@ -39,6 +39,7 @@ const baseConfig = {
   hitlLabel: "needs-human",
   maxIterations: 5,
   implTurns: 3,
+  reviewRetries: 1,
 } as const;
 
 beforeEach(() => {

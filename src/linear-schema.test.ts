@@ -41,6 +41,7 @@ const config = {
   hitlLabel: "ready-for-human",
   maxIterations: 5,
   implTurns: 3,
+  reviewRetries: 1,
 } as const;
 
 beforeEach(() => {

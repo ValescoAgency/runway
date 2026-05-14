@@ -113,4 +113,38 @@ describe("parseRunArgs", () => {
       );
     });
   });
+
+  describe("--review-retries (VA-418)", () => {
+    it("parses --review-retries with a separate value", () => {
+      expect(parseRunArgs(["--review-retries", "2"])).toEqual({
+        reviewRetries: 2,
+      });
+    });
+
+    it("parses --review-retries=value (inline form)", () => {
+      expect(parseRunArgs(["--review-retries=3"])).toEqual({ reviewRetries: 3 });
+    });
+
+    it("accepts --review-retries=0 (kill-switch)", () => {
+      expect(parseRunArgs(["--review-retries=0"])).toEqual({ reviewRetries: 0 });
+    });
+
+    it("rejects a non-numeric value", () => {
+      expect(() => parseRunArgs(["--review-retries", "lots"])).toThrow(
+        /--review-retries must be a non-negative integer/,
+      );
+    });
+
+    it("rejects a negative value", () => {
+      expect(() => parseRunArgs(["--review-retries", "-1"])).toThrow(
+        /--review-retries must be a non-negative integer/,
+      );
+    });
+
+    it("rejects --review-retries with no value", () => {
+      expect(() => parseRunArgs(["--review-retries"])).toThrow(
+        /--review-retries requires a number/,
+      );
+    });
+  });
 });

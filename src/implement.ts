@@ -32,6 +32,14 @@ export interface ImplementDeps {
    * in which case the run continues, per VA-383's never-block AC).
    */
   readonly priorFeedback: string;
+  /**
+   * VA-418: formatted "Reviewer feedback from this run" block. Empty
+   * string on the first impl pass; populated by the orchestrator on
+   * a retry after the previous review pass emitted
+   * `REVIEW: REJECTED-RETRY — <reason>`. Kept independent of
+   * `priorFeedback` so the agent reads it as the higher-trust signal.
+   */
+  readonly inRunReviewerFeedback?: string;
 }
 
 /**
@@ -97,6 +105,7 @@ export const runImplementLoop = (
 ): Effect.Effect<ImplementOutcome, { readonly message: string }, never> =>
   Effect.gen(function* () {
     const { config, cwd, baseBranch, policy, priorFeedback } = deps;
+    const inRunReviewerFeedback = deps.inRunReviewerFeedback ?? "";
     const maxIters = Math.max(1, config.maxIterations);
     let prevSummary = "";
     let implementResult: SandcastleRunResult | undefined;
@@ -114,6 +123,11 @@ export const runImplementLoop = (
           // and iteration N+1, since the implementer keeps drifting
           // toward the same code paths until corrected.
           priorReviewFeedback: priorFeedback,
+          // VA-418: in-run rejection feedback (empty on first impl
+          // pass, populated on a review-rejection retry). Independent
+          // slot from `priorReviewFeedback` so the agent reads it as
+          // the higher-trust signal.
+          inRunReviewerFeedback,
           // VA-417: pass the actual base branch so the prompt
           // renders the real name (`main`, `master`, etc.) rather
           // than a hardcoded default.

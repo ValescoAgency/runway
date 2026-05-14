@@ -25,35 +25,51 @@ export interface ReviewDeps {
 /**
  * What the review pass hands back to the composer.
  *
- * `approved` — proceed to finalize (push + PR).
- * `hitl`     — rejected by the sub-agent, OR missing marker (likely
- *              crashed / truncated). The composer enacts HITL.
+ * `approved`        — proceed to finalize (push + PR).
+ * `rejected-retry`  — VA-418: reviewer flagged a mechanically-fixable
+ *                    rejection. Composer should hand the rejection
+ *                    reason back to the impl agent and re-run review
+ *                    (bounded by `RUNWAY_REVIEW_RETRIES`).
+ * `rejected-hitl`   — VA-418: reviewer flagged a rejection that needs
+ *                    human judgment (wrong direction, ambiguous spec).
+ *                    Composer should escalate immediately — no more
+ *                    impl attempts this drain.
+ * `hitl`            — missing marker (likely crashed / truncated). The
+ *                    composer enacts HITL with a distinct reason so the
+ *                    operator can tell crash from rejection.
  */
 export type ReviewOutcome =
   | { readonly kind: "approved" }
+  | { readonly kind: "rejected-retry"; readonly reason: string }
+  | { readonly kind: "rejected-hitl"; readonly reason: string }
   | { readonly kind: "hitl"; readonly reason: string };
 
-// VA-353: review verdict marker. Global flag because sandcastle
-// appends wrapper output ("Agent stopped", "Capturing session",
-// "Reached max iterations (1).", "Run complete: …") AFTER the agent's
-// final message — so the marker is rarely the last line. We scan
-// every line-start match and keep the LAST one, which is the most
-// recent agent verdict. Standalone-line: ^…$ with /m anchors prevent
-// mid-prose matches like "the reviewer should output REVIEW: APPROVED
-// when…".
+// VA-353 / VA-418: review verdict marker. Global flag because
+// sandcastle appends wrapper output ("Agent stopped", "Capturing
+// session", "Reached max iterations (1).", "Run complete: …") AFTER
+// the agent's final message — so the marker is rarely the last line.
+// We scan every line-start match and keep the LAST one, which is the
+// most recent agent verdict. Standalone-line: ^…$ with /m anchors
+// prevent mid-prose matches like "the reviewer should output REVIEW:
+// APPROVED when…".
+//
+// VA-418 extended the verdict alphabet from {APPROVED, REJECTED} to
+// {APPROVED, REJECTED, REJECTED-RETRY, REJECTED-HITL}. Plain
+// `REJECTED` (the legacy marker) still parses and maps to
+// `rejected-retry` so existing prompts continue to drive the retry
+// flow without an update.
 const REVIEW_VERDICT_RE =
-  /^REVIEW:\s*(APPROVED|REJECTED)(?:\s+—\s+(.*))?$/gm;
+  /^REVIEW:\s*(APPROVED|REJECTED-RETRY|REJECTED-HITL|REJECTED)(?:\s+—\s+(.*))?$/gm;
 
-// VA-360: review verdict ADT with explicit `missing` instead of
-// silently bucketing "no marker found" as rejected. A schema doesn't
-// help here — the regex IS the parser, there's no upstream
-// structured shape to validate. The substantive change is to make
-// "missing" a distinct outcome so the composer can route a truncated
-// / crashed review pass to HITL with the right detail line instead
-// of pretending the agent rejected the work.
+// VA-360 / VA-418: review verdict ADT with explicit `missing` instead
+// of silently bucketing "no marker found" as rejected, and a split
+// between `rejected-retry` and `rejected-hitl` so the composer can
+// route accordingly. A schema doesn't help here — the regex IS the
+// parser, there's no upstream structured shape to validate.
 export type ParsedVerdict =
   | { readonly kind: "approved"; readonly reason: string }
-  | { readonly kind: "rejected"; readonly reason: string }
+  | { readonly kind: "rejected-retry"; readonly reason: string }
+  | { readonly kind: "rejected-hitl"; readonly reason: string }
   | { readonly kind: "missing"; readonly reason: string };
 
 /**
@@ -83,10 +99,13 @@ export function parseReviewVerdict(result: unknown): ParsedVerdict {
     };
   }
   if (last[1] === "APPROVED") return { kind: "approved", reason: "" };
-  return {
-    kind: "rejected",
-    reason: last[2]?.trim() || "no reason given",
-  };
+  const reason = last[2]?.trim() || "no reason given";
+  // VA-418: REJECTED-HITL escalates immediately; REJECTED-RETRY (and
+  // the legacy bare REJECTED, for graceful degradation) flows into
+  // the bounded retry loop. Default to the more forgiving path on
+  // ambiguity — the retry budget caps the blast radius.
+  if (last[1] === "REJECTED-HITL") return { kind: "rejected-hitl", reason };
+  return { kind: "rejected-retry", reason };
 }
 
 export const runReviewPass = (
@@ -112,11 +131,15 @@ export const runReviewPass = (
     }).pipe(Effect.withSpan("review"));
 
     const verdict = parseReviewVerdict(reviewResult);
-    if (verdict.kind === "rejected") {
-      return {
-        kind: "hitl",
-        reason: `Sub-agent review rejected: ${verdict.reason}`,
-      };
+    // VA-418: split rejection into two outcomes so the composer can
+    // route mechanically-fixable rejections back to the impl agent
+    // (within the configured retry budget) and only escalate to HITL
+    // when the reviewer explicitly asks for human judgment.
+    if (verdict.kind === "rejected-retry") {
+      return { kind: "rejected-retry", reason: verdict.reason };
+    }
+    if (verdict.kind === "rejected-hitl") {
+      return { kind: "rejected-hitl", reason: verdict.reason };
     }
     if (verdict.kind === "missing") {
       // VA-360: a review pass that didn't emit any marker is

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  formatInRunReviewerFeedback,
   formatPriorFeedback,
   renderImplementPrompt,
   renderReviewPrompt,
@@ -146,6 +147,86 @@ describe("renderImplementPrompt (VA-361)", () => {
     });
     expect(out).toContain("based off\n`main`");
     expect(out).not.toContain("{{BASE_BRANCH}}");
+  });
+
+  it("substitutes inRunReviewerFeedback into the {{IN_RUN_REVIEWER_FEEDBACK}} slot (VA-418)", async () => {
+    const feedback = formatInRunReviewerFeedback([
+      "normalize both timestamps to SQLite ISO-8601 before the lex compare",
+    ]);
+    const out = await renderImplementPrompt({
+      issue,
+      policy: policyWithPaths,
+      previousIterations: "",
+      priorReviewFeedback: "",
+      inRunReviewerFeedback: feedback,
+    });
+    expect(out).toContain("Reviewer feedback from this run");
+    expect(out).toContain("normalize both timestamps to SQLite ISO-8601");
+    expect(out).not.toContain("{{IN_RUN_REVIEWER_FEEDBACK}}");
+  });
+
+  it("leaves no {{IN_RUN_REVIEWER_FEEDBACK}} placeholder when feedback is empty (VA-418)", async () => {
+    const out = await renderImplementPrompt({
+      issue,
+      policy: policyWithPaths,
+      previousIterations: "",
+      priorReviewFeedback: "",
+    });
+    expect(out).not.toContain("{{IN_RUN_REVIEWER_FEEDBACK}}");
+    // The implement.md prose references the in-run section by name
+    // ("If a section titled `Reviewer feedback from this run` is
+    // present above…"). With no in-run feedback the section header
+    // (the literal `# Reviewer feedback from this run`) must be
+    // absent, even though the back-reference in the prose remains.
+    expect(out).not.toContain("# Reviewer feedback from this run");
+  });
+
+  it("renders both PRIOR_REVIEW_FEEDBACK and IN_RUN_REVIEWER_FEEDBACK independently when both are present (VA-418)", async () => {
+    const prior =
+      "# Review feedback from prior attempts\n\nCross-drain rejection: tests missing.";
+    const inRun = formatInRunReviewerFeedback([
+      "add a URL scheme guard before the <a href={url}> render",
+    ]);
+    const out = await renderImplementPrompt({
+      issue,
+      policy: policyWithPaths,
+      previousIterations: "",
+      priorReviewFeedback: prior,
+      inRunReviewerFeedback: inRun,
+    });
+    expect(out).toContain("Review feedback from prior attempts");
+    expect(out).toContain("Cross-drain rejection");
+    expect(out).toContain("Reviewer feedback from this run");
+    expect(out).toContain("add a URL scheme guard");
+  });
+});
+
+describe("formatInRunReviewerFeedback (VA-418)", () => {
+  it("returns an empty string when no rejections are present", () => {
+    expect(formatInRunReviewerFeedback([])).toBe("");
+  });
+
+  it("renders a single rejection under the in-run header", () => {
+    const out = formatInRunReviewerFeedback([
+      "add a URL scheme guard before rendering <a href={url}>",
+    ]);
+    expect(out).toContain("# Reviewer feedback from this run");
+    expect(out).toContain("YOUR work this run");
+    expect(out).toContain("add a URL scheme guard before rendering <a href={url}>");
+  });
+
+  it("orders multiple rejections most-recent-last, numbered for the agent's reference", () => {
+    const out = formatInRunReviewerFeedback([
+      "first rejection — fix the timestamp comparison",
+      "second rejection — also normalize the cache key",
+    ]);
+    const firstIdx = out.indexOf("first rejection");
+    const secondIdx = out.indexOf("second rejection");
+    expect(firstIdx).toBeGreaterThan(-1);
+    expect(secondIdx).toBeGreaterThan(-1);
+    expect(firstIdx).toBeLessThan(secondIdx);
+    expect(out).toMatch(/^1\.\s/m);
+    expect(out).toMatch(/^2\.\s/m);
   });
 });
 

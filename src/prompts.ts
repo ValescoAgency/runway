@@ -39,6 +39,18 @@ export async function renderImplementPrompt(args: {
    */
   priorReviewFeedback: string;
   /**
+   * VA-418: in-run rejection feedback. Populated by the orchestrator
+   * via `formatInRunReviewerFeedback` when a previous review pass in
+   * THIS drain emitted `REVIEW: REJECTED-RETRY — <reason>`. Kept
+   * separate from `priorReviewFeedback` (VA-383, cross-drain Linear
+   * comments) so the agent reads in-run feedback as the higher-trust
+   * signal — it's the reviewer's actual verdict on the diff the agent
+   * just produced, not stale guidance from a prior runway invocation.
+   * Empty string on the first attempt and when no in-run rejection
+   * has fired yet.
+   */
+  inRunReviewerFeedback?: string;
+  /**
    * VA-417: the repo's actual base branch (resolved from
    * `config.baseBranch` or auto-detected from `origin/HEAD` at
    * orchestrator startup). Substituted into the prompt so the agent
@@ -94,6 +106,7 @@ function implementVars(args: {
   policy: Policy;
   previousIterations: string;
   priorReviewFeedback: string;
+  inRunReviewerFeedback?: string;
   baseBranch?: string;
 }): Record<string, string> {
   return {
@@ -102,6 +115,12 @@ function implementVars(args: {
     ISSUE_DESCRIPTION: args.issue.description || "(no description)",
     PREVIOUS_ITERATIONS: args.previousIterations,
     PRIOR_REVIEW_FEEDBACK: args.priorReviewFeedback,
+    // VA-418: empty string when the orchestrator has no in-run
+    // rejection to surface (the common case — first attempt, or a
+    // run with retries disabled). The `{{IN_RUN_REVIEWER_FEEDBACK}}`
+    // slot expands to empty and the section header disappears from
+    // the rendered prompt.
+    IN_RUN_REVIEWER_FEEDBACK: args.inRunReviewerFeedback ?? "",
     POLICY_FORBIDDEN_BULLET: renderForbiddenPathsBullet(args.policy),
     // VA-417: fall back to "main" if the caller didn't pass one, so
     // older test fixtures keep working. Production always passes the
@@ -193,6 +212,44 @@ export function formatPriorFeedback(
     "in your final message.",
     "",
     entries.join("\n\n"),
+    "",
+  ].join("\n");
+}
+
+/**
+ * VA-418: format the reviewer's in-run rejection text into the block
+ * the implement prompt renders into `{{IN_RUN_REVIEWER_FEEDBACK}}`.
+ * Higher-trust framing than VA-383's cross-drain feedback — this is
+ * the reviewer's verdict on the diff the agent JUST produced in this
+ * drain, not stale guidance from a prior runway invocation.
+ *
+ * `rejections` is the chronological list of rejection reasons from
+ * every prior review pass in the current drain. The most recent
+ * rejection is the load-bearing one; earlier rejections are included
+ * so the agent can see what it has already tried + been told to fix.
+ *
+ * Returns the empty string when there are no rejections to surface —
+ * the slot expands to empty and the section disappears from the
+ * rendered prompt.
+ */
+export function formatInRunReviewerFeedback(
+  rejections: readonly string[],
+): string {
+  if (rejections.length === 0) return "";
+  const numbered = rejections.map((r, i) =>
+    `${i + 1}. ${r.trim()}`,
+  );
+  return [
+    "# Reviewer feedback from this run",
+    "",
+    "The previous iteration of this drain produced commits that review",
+    "rejected. Every blocker below is from review of YOUR work this run —",
+    "the reviewer judged each fix to be mechanical (no human judgment",
+    "required). Address every blocker before signaling `IMPL: DONE` again.",
+    "",
+    "Rejections so far this drain (most recent last):",
+    "",
+    numbered.join("\n"),
     "",
   ].join("\n");
 }
