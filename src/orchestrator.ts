@@ -204,8 +204,39 @@ export const drainQueue = (
 
       const branch = `agent/${issue.identifier.toLowerCase()}`;
 
-      const processed = yield* processIssue(issue, runDeps).pipe(
-        Effect.either,
+      // VA-386: the dashboard projector reads the final outcome from
+      // the processIssue span's attributes. Compute it inside the
+      // span scope (so `annotateCurrentSpan` targets `processIssue`,
+      // not `drainQueue`) and route afterwards.
+      const resolved = yield* Effect.gen(function* () {
+        const processed = yield* processIssue(issue, runDeps).pipe(
+          Effect.either,
+        );
+        if (processed._tag === "Right") {
+          const result = processed.right;
+          yield* Effect.annotateCurrentSpan({
+            "runway.outcome.kind": result.kind,
+            "runway.outcome.detail": result.detail,
+          });
+          return { errored: false, outcome: result };
+        }
+        const failureOutcome = yield* handleProcessFailure(
+          processed.left,
+          issue,
+          runDeps,
+          branch,
+        );
+        yield* Effect.annotateCurrentSpan({
+          "runway.outcome.kind": failureOutcome.kind,
+          "runway.outcome.detail": failureOutcome.detail,
+          // True when the issue process exited via the failure path
+          // — distinguishes "planned HITL" (kind=hitl, errored=false)
+          // from "crashed and routed to HITL" (kind=hitl,
+          // errored=true) on the dashboard row.
+          "runway.outcome.errored": true,
+        });
+        return { errored: true, outcome: failureOutcome };
+      }).pipe(
         Effect.withSpan("processIssue", {
           attributes: {
             "runway.issue.identifier": issue.identifier,
@@ -219,32 +250,29 @@ export const drainQueue = (
         }),
       );
 
-      if (processed._tag === "Right") {
-        const result = processed.right;
-        if (result.kind === "opened") opened += 1;
-        if (result.kind === "hitl") hitl += 1;
-        outcomes.push({
-          identifier: issue.identifier,
-          kind: result.kind,
-          detail: result.detail,
-        });
-      } else {
+      if (resolved.errored) {
         errored += 1;
-        const failureOutcome = yield* handleProcessFailure(
-          processed.left,
-          issue,
-          runDeps,
-          branch,
-        );
-        outcomes.push({
-          identifier: issue.identifier,
-          kind: failureOutcome.kind,
-          detail: failureOutcome.detail,
-        });
+      } else {
+        if (resolved.outcome.kind === "opened") opened += 1;
+        if (resolved.outcome.kind === "hitl") hitl += 1;
       }
+      outcomes.push({
+        identifier: issue.identifier,
+        kind: resolved.outcome.kind,
+        detail: resolved.outcome.detail,
+      });
     }
 
     yield* printExitSummary(outcomes);
+
+    // VA-386: counter attributes on the drain span so the dashboard's
+    // drain row carries the same totals as runway's exit summary.
+    yield* Effect.annotateCurrentSpan({
+      "runway.drain.attempts": attempts,
+      "runway.drain.opened": opened,
+      "runway.drain.hitl": hitl,
+      "runway.drain.errored": errored,
+    });
 
     return {
       attempts,

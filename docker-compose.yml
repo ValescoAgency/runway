@@ -1,0 +1,46 @@
+# VA-386 (dashboard slice 1): runs the always-on runway collector +
+# dashboard locally. `docker compose up` brings up one service:
+#
+#   collector  — receives OTLP HTTP from `runway run`, projects spans
+#                into SQLite, and serves the dashboard at /.
+#
+# Wire your shell up with:
+#
+#   export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+#
+# …then run `runway run`. Each drain appears on http://localhost:3001/.
+# The data volume persists across container restarts, so history
+# survives a `docker compose restart`.
+
+services:
+  collector:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    container_name: runway-collector
+    restart: unless-stopped
+    environment:
+      OTLP_PORT: ${OTLP_PORT:-4318}
+      DASHBOARD_PORT: ${DASHBOARD_PORT:-3001}
+      SQLITE_PATH: /data/runway.sqlite
+    ports:
+      # OTLP HTTP endpoint — `runway run` posts /v1/traces here.
+      # Host and container side use the same value so the server's
+      # listener (driven by OTLP_PORT inside the container) lines up
+      # with the host port without further override.
+      - "${OTLP_PORT:-4318}:${OTLP_PORT:-4318}"
+      # Dashboard UI — operator opens this in a browser.
+      - "${DASHBOARD_PORT:-3001}:${DASHBOARD_PORT:-3001}"
+    volumes:
+      - runway-data:/data
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "node -e \"fetch('http://127.0.0.1:'+process.env.DASHBOARD_PORT+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  runway-data:
