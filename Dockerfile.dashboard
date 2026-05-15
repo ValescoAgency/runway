@@ -38,6 +38,12 @@ RUN mkdir -p /data
 ENV SQLITE_PATH=/data/runway.sqlite
 ENV OTLP_PORT=4318
 ENV DASHBOARD_PORT=3001
+# VA-385: server.ts defaults to 127.0.0.1 (loopback) so stand-alone
+# `node dist/dashboard/server.js` is safe-by-default. Inside Docker
+# the listener has to bind 0.0.0.0 so Docker's port-forward (published
+# via docker-compose) can reach it. docker-compose then re-gates the
+# host port to 127.0.0.1 via the `127.0.0.1:` prefix on `ports:`.
+ENV DASHBOARD_HOST=0.0.0.0
 EXPOSE 4318 3001
 
 CMD ["node", "dist/dashboard/server.js"]
