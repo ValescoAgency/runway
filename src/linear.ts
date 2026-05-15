@@ -376,6 +376,19 @@ export interface LinearGateway {
 export function createLinearGateway(
   config: Config,
   limiter: RateLimiter.RateLimiter | null = null,
+  opts: {
+    /**
+     * VA-421: predicate the gateway uses to decide whether an
+     * In-Progress candidate has a real agent branch pushed to origin.
+     * Injected so `linear.ts` stays testable without git; production
+     * wires `(branch) => Effect.runPromise(remoteRefExists(cwd,
+     * branch))` from `commands/run.ts`. When omitted, `fetchReady`
+     * keeps its pre-VA-421 behavior (Todo only) — used by every unit
+     * test and tolerated as a fallback when the caller hasn't been
+     * updated yet.
+     */
+    readonly remoteAgentBranchExists?: (branch: string) => Promise<boolean>;
+  } = {},
 ): LinearGateway {
   const client = new LinearClient({ apiKey: Redacted.value(config.linearApiKey) });
   const gate = <A>(
@@ -451,18 +464,44 @@ export function createLinearGateway(
             const projectId = config.linearProject
               ? await findProjectId(config.linearProject)
               : null;
-            const issues = await client.issues({
-              filter: {
-                team: { id: { eq: teamId } },
-                state: { id: { eq: readyStateId } },
-                ...(projectId ? { project: { id: { eq: projectId } } } : {}),
-              },
+            // VA-421: optionally accept In-Progress issues whose
+            // `agent/<id>` branch hasn't been pushed to origin yet.
+            // Linear's GitHub integration auto-transitions issues to
+            // In-Progress on unrelated PR-body mentions, which used
+            // to silently drop them from the drain queue. The
+            // git-side check is the authoritative signal that no
+            // successful drain attempt is in flight.
+            const inProgressStateId = opts.remoteAgentBranchExists
+              ? await findStateId(teamId, config.inProgressStatus)
+              : null;
+            const issuesFilter = (stateId: string) => ({
+              team: { id: { eq: teamId } },
+              state: { id: { eq: stateId } },
+              ...(projectId ? { project: { id: { eq: projectId } } } : {}),
+            });
+            const todoBatch = await client.issues({
+              filter: issuesFilter(readyStateId),
               // VA-420: order doesn't matter at the SDK call — Linear's
               // `IssueOrderBy` enum doesn't expose `priority`, and the
               // SDK type for this argument hides the ASC/DESC direction
               // anyway. We re-sort the candidate set in JS below.
               orderBy: "createdAt" as never,
             });
+            const inProgressBatch = inProgressStateId
+              ? await client.issues({
+                  filter: issuesFilter(inProgressStateId),
+                  orderBy: "createdAt" as never,
+                })
+              : { nodes: [] as typeof todoBatch.nodes };
+            const tagged = [
+              ...todoBatch.nodes.map(
+                (raw) => ({ raw, kind: "todo" as const }),
+              ),
+              ...inProgressBatch.nodes.map(
+                (raw) => ({ raw, kind: "inProgress" as const }),
+              ),
+            ];
+            const issues = { nodes: tagged };
             // VA-420: drain by Linear priority first, then by createdAt
             // within a priority bucket. Linear's priority encoding is
             // non-monotonic — `1 = Urgent, 2 = High, 3 = Medium,
@@ -471,12 +510,12 @@ export function createLinearGateway(
             // (operator intuition: Urgent first, unprioritised last).
             // Within a bucket, oldest-first restores the FIFO intent.
             const candidates = [...issues.nodes].sort((a, b) => {
-              const pa = a.priority === 0 ? Infinity : a.priority;
-              const pb = b.priority === 0 ? Infinity : b.priority;
+              const pa = a.raw.priority === 0 ? Infinity : a.raw.priority;
+              const pb = b.raw.priority === 0 ? Infinity : b.raw.priority;
               if (pa !== pb) return pa - pb;
               return (
-                new Date(a.createdAt).getTime() -
-                new Date(b.createdAt).getTime()
+                new Date(a.raw.createdAt).getTime() -
+                new Date(b.raw.createdAt).getTime()
               );
             });
             // VA-360: validate every issue node through the schema —
@@ -492,11 +531,21 @@ export function createLinearGateway(
             // candidate go through the rate limiter and the retry
             // policy alongside everything else.
             const eligible: RunwayIssue[] = [];
-            for (const raw of candidates) {
+            for (const { raw, kind } of candidates) {
               const i = decodeIssueNode(raw);
               const labels = await fetchIssueLabelNames(raw);
               if (labels.includes(config.hitlLabel)) continue;
               if (await hasActiveBlocker(raw)) continue;
+              // VA-421: In-Progress candidates pass only if no
+              // `agent/<id>` ref exists on origin — that's the
+              // authoritative "no drain attempt in flight" signal,
+              // immune to Linear's auto-transitions. Todo candidates
+              // skip this check (no behavior change for the common
+              // path).
+              if (kind === "inProgress" && opts.remoteAgentBranchExists) {
+                const branch = `agent/${i.identifier.toLowerCase()}`;
+                if (await opts.remoteAgentBranchExists(branch)) continue;
+              }
               eligible.push({
                 id: i.id,
                 identifier: i.identifier,

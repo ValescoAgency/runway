@@ -130,6 +130,40 @@ export const captureCommitLog = (
   );
 
 /**
+ * VA-421: Whether a branch ref exists on `origin`. Used by
+ * `fetchReady` to distinguish "an agent branch has been pushed (real
+ * work in flight, leave alone)" from "Linear auto-transitioned an
+ * issue to In-Progress without any work actually starting (drain
+ * it)". `git ls-remote --heads origin <branch>` is the cheapest
+ * authoritative check — one round-trip, no clone needed, SSH
+ * multiplexing usually caches the connection.
+ *
+ * Non-zero exit (network error, no remote configured, auth failure)
+ * surfaces as an Effect failure so the caller can route it through
+ * the usual error path rather than silently falling back to "doesn't
+ * exist" — operator should fix the env, not have runway quietly
+ * misclassify candidates.
+ */
+export const remoteRefExists = (
+  repoPath: string,
+  branch: string,
+): Effect.Effect<boolean, { readonly message: string }, never> =>
+  runExecaScoped(
+    "git",
+    ["ls-remote", "--heads", "origin", branch],
+    { cwd: repoPath },
+    (err) => ({
+      message: err instanceof Error ? err.message : String(err),
+    }),
+  ).pipe(
+    Effect.map((res) => {
+      const raw = res.stdout;
+      const out = typeof raw === "string" ? raw : "";
+      return out.trim().length > 0;
+    }),
+  );
+
+/**
  * VA-358: Whether the agent branch has any commits beyond `base`.
  * Used by failure-routing to distinguish "agent crashed mid-run,
  * after producing real work" (→ HITL) from "agent crashed during

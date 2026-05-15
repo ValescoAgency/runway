@@ -2,6 +2,7 @@ import { Effect, Layer, Logger, RateLimiter } from "effect";
 import { ConfigLive, ConfigTag } from "../config.js";
 import { createLinearGateway } from "../linear.js";
 import { createGithubGateway } from "../github.js";
+import { remoteRefExists } from "../git.js";
 import {
   assertSandcastleInitialised,
   drainQueue,
@@ -148,7 +149,14 @@ ENVIRONMENT
                               and targets with PRs). Detected from
                               origin/HEAD when unset.
   RUNWAY_READY_STATUS         default "Todo"
-  RUNWAY_IN_PROGRESS_STATUS   default "In Progress"
+  RUNWAY_IN_PROGRESS_STATUS   default "In Progress" — also the
+                              auxiliary drain bucket (VA-421): runway
+                              accepts issues in this status when no
+                              agent/<id> branch exists on origin, so
+                              Linear's GitHub auto-transitions (e.g.
+                              an unrelated PR mentioning the issue in
+                              its body) can't silently drop the issue
+                              from the queue.
   RUNWAY_IN_REVIEW_STATUS     default "In Review"
   RUNWAY_HITL_LABEL           default "ready-for-human"
   RUNWAY_MAX_ITERATIONS       default 5  — outer impl re-prompt loop
@@ -212,7 +220,15 @@ export async function runCommand(argv: readonly string[]): Promise<void> {
       limit: 30,
       interval: "1 minute",
     });
-    const linear = createLinearGateway(config, linearLimiter);
+    // VA-421: inject a git-side predicate so `fetchReady` can accept
+    // In-Progress issues whose `agent/<id>` branch hasn't yet been
+    // pushed to origin. Closes the Linear-auto-transition loophole
+    // where an unrelated PR-body mention silently drops an issue from
+    // the drain queue.
+    const linear = createLinearGateway(config, linearLimiter, {
+      remoteAgentBranchExists: (branch) =>
+        Effect.runPromise(remoteRefExists(cwd, branch)),
+    });
     const github = createGithubGateway();
     return yield* drainQueue(
       { config, linear, github, cwd },

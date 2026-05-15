@@ -11,6 +11,7 @@ const {
   hasCommits,
   pruneStaleAgentBranch,
   rebaseOntoBase,
+  remoteRefExists,
 } = await import("./git.js");
 
 // VA-358: detectBaseBranch is now an Effect. Tests run it via
@@ -115,6 +116,34 @@ describe("hasCommits (VA-358)", () => {
   it("fails the Effect when execa itself throws (e.g., git binary missing)", async () => {
     execaMock.mockRejectedValueOnce(new Error("git not installed"));
     await expect(runHc()).rejects.toThrow(/git not installed/);
+  });
+});
+
+describe("remoteRefExists (VA-421)", () => {
+  const runRre = (branch = "agent/va-417") =>
+    Effect.runPromise(remoteRefExists("/tmp/repo", branch));
+
+  it("returns true when ls-remote prints a matching ref line", async () => {
+    execaMock.mockResolvedValueOnce({
+      exitCode: 0,
+      stdout: "abc123\trefs/heads/agent/va-417\n",
+    });
+    await expect(runRre()).resolves.toBe(true);
+    expect(execaMock).toHaveBeenCalledWith(
+      "git",
+      ["ls-remote", "--heads", "origin", "agent/va-417"],
+      expect.objectContaining({ cwd: "/tmp/repo" }),
+    );
+  });
+
+  it("returns false when ls-remote prints nothing (no matching ref)", async () => {
+    execaMock.mockResolvedValueOnce({ exitCode: 0, stdout: "" });
+    await expect(runRre()).resolves.toBe(false);
+  });
+
+  it("fails the Effect when execa rejects (network down, auth failure, no remote)", async () => {
+    execaMock.mockRejectedValueOnce(new Error("could not resolve host"));
+    await expect(runRre()).rejects.toThrow(/could not resolve host/);
   });
 });
 
