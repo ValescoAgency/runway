@@ -224,4 +224,18 @@ export async function runCommand(argv: readonly string[]): Promise<void> {
   console.log(
     `[runway] done — attempts=${result.attempts} opened=${result.opened} hitl=${result.hitl} errored=${result.errored}`,
   );
+  // Single-line, parser-friendly completion marker. Background
+  // watchers (Claude Code's `run_in_background` bash task, CI,
+  // scripts) can grep for `[runway:exit]` instead of guessing
+  // whether the drain is still in flight.
+  console.log(
+    `[runway:exit] status=success attempts=${result.attempts} opened=${result.opened} hitl=${result.hitl} errored=${result.errored}`,
+  );
+  // Hard exit so any lingering handle (OTel BatchSpanProcessor's
+  // interval when OTEL_EXPORTER_OTLP_ENDPOINT is set, a Docker
+  // stream Sandcastle left open, etc.) can't keep the process — and
+  // the background task that launched it — alive after the drain is
+  // logically done. By this point `Effect.scoped` has already torn
+  // down its finalizers.
+  process.exit(0);
 }
