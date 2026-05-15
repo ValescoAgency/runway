@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type {
+  LinearSnapshotRow,
   PhaseSpan,
   StoredAgentIteration,
   StoredIssueProcess,
@@ -142,6 +143,115 @@ function detailVm(over: Partial<DetailViewModel> = {}): DetailViewModel {
     ...over,
   };
 }
+
+// VA-390: list view weaves in optional Linear-side data. When the
+// dashboard runs without LINEAR_API_KEY, the queue section is hidden
+// and per-row status badges fall back to the snapshot-at-emit value
+// (the existing outcome cell, with no extra Linear-status badge).
+describe("renderListView — Linear sync surfaces (VA-390)", () => {
+  function snapshot(
+    over: Partial<LinearSnapshotRow> & Pick<LinearSnapshotRow, "issueIdentifier">,
+  ): LinearSnapshotRow {
+    return {
+      snapshotAt: "2026-05-15T00:00:00Z",
+      status: "In Review",
+      title: "Snapshot title",
+      labels: [],
+      queuePosition: null,
+      ...over,
+    };
+  }
+
+  it("renders a Todo queue (next up) section above the issue-process list when linearEnabled", () => {
+    const html = renderListView({
+      rows: [row()],
+      linearEnabled: true,
+      todoQueue: [
+        snapshot({
+          issueIdentifier: "VA-77",
+          status: "Todo",
+          title: "Set up the thing",
+          labels: ["bug", "p1"],
+          queuePosition: 0,
+        }),
+      ],
+      snapshotsByIdentifier: new Map(),
+    });
+    expect(html).toContain("Todo queue (next up)");
+    expect(html).toContain("VA-77");
+    expect(html).toContain("Set up the thing");
+    expect(html).toContain("bug, p1");
+  });
+
+  it("renders an empty-state row inside the queue section when the queue is empty", () => {
+    const html = renderListView({
+      rows: [row()],
+      linearEnabled: true,
+      todoQueue: [],
+      snapshotsByIdentifier: new Map(),
+    });
+    expect(html).toContain("Todo queue (next up)");
+    expect(html).toContain("Linear Todo queue is empty");
+  });
+
+  it("hides the queue section entirely when linearEnabled is false (LINEAR_API_KEY absent)", () => {
+    const html = renderListView({
+      rows: [row()],
+      linearEnabled: false,
+      todoQueue: [],
+      snapshotsByIdentifier: new Map(),
+    });
+    expect(html).not.toContain("Todo queue (next up)");
+    expect(html).not.toContain("Linear Todo queue is empty");
+  });
+
+  it("overlays a Linear status badge on rows whose identifier has a snapshot", () => {
+    const r = row({ issueIdentifier: "VA-1" });
+    const html = renderListView({
+      rows: [r],
+      linearEnabled: true,
+      todoQueue: [],
+      snapshotsByIdentifier: new Map([
+        ["VA-1", snapshot({ issueIdentifier: "VA-1", status: "In Review" })],
+      ]),
+    });
+    expect(html).toContain(`class="status-badge"`);
+    expect(html).toContain("In Review");
+  });
+
+  it("omits the Linear status badge when no snapshot exists for the row's identifier", () => {
+    const r = row({ issueIdentifier: "VA-1" });
+    const html = renderListView({
+      rows: [r],
+      linearEnabled: true,
+      todoQueue: [],
+      snapshotsByIdentifier: new Map(),
+    });
+    expect(html).not.toContain(`class="status-badge"`);
+  });
+
+  it("falls back to the snapshot-at-emit outcome value when linearEnabled is false", () => {
+    // Graceful degradation: the row still renders its outcomeKind, and
+    // the Linear status badge column is absent because the dashboard
+    // doesn't ship per-row Linear state when the poller isn't running.
+    const html = renderListView({
+      rows: [row({ issueIdentifier: "VA-9", outcomeKind: "hitl" })],
+      linearEnabled: false,
+      todoQueue: [],
+      snapshotsByIdentifier: new Map(),
+    });
+    expect(html).toContain("hitl");
+    expect(html).not.toContain(`class="status-badge"`);
+  });
+
+  it("accepts the legacy renderListView(rows) signature for back-compat", () => {
+    // Tests / older call sites pass `readonly StoredIssueProcess[]`
+    // directly; the new view model overload preserves that path.
+    const html = renderListView([row({ issueIdentifier: "VA-back" })]);
+    expect(html).toContain("VA-back");
+    expect(html).not.toContain("Todo queue (next up)");
+  });
+});
 
 describe("renderDetailView (VA-389)", () => {
   it("renders the issue identifier and outcome in the header", () => {

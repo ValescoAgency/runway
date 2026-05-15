@@ -1,4 +1,5 @@
 import type {
+  LinearSnapshotRow,
   PhaseSpan,
   StoredAgentIteration,
   StoredIssueProcess,
@@ -36,13 +37,44 @@ const SHARED_STYLE = `
     .detail { color: #d4d4d8; }
     .muted { color: #9ca3af; }
     code { background: #1f2937; padding: 1px 6px; border-radius: 3px; }
+    .status-badge { display: inline-block; margin-left: 8px;
+                    padding: 1px 6px; border-radius: 3px; font-size: 11px;
+                    background: #1f2937; color: #9ca3af; }
+    .queue-note { color: #9ca3af; font-size: 12px; margin: 0 0 16px; }
 `;
 
-export function renderListView(rows: readonly StoredIssueProcess[]): string {
+/**
+ * VA-390 (dashboard slice 6): optional Linear-side data the list view
+ * weaves in when `LINEAR_API_KEY` is configured. When absent, the
+ * server passes `linearEnabled: false` and the queue preview is
+ * hidden + the per-row status badge falls back to the snapshot-at-
+ * emit value (i.e. just the existing outcome cell with no extra
+ * Linear-status decoration).
+ */
+export interface ListViewModel {
+  readonly rows: readonly StoredIssueProcess[];
+  readonly linearEnabled: boolean;
+  readonly todoQueue: readonly LinearSnapshotRow[];
+  /** Latest Linear snapshot keyed by issue_identifier. Empty when sync disabled. */
+  readonly snapshotsByIdentifier: ReadonlyMap<string, LinearSnapshotRow>;
+}
+
+export function renderListView(input: ListViewModel | readonly StoredIssueProcess[]): string {
+  const vm: ListViewModel = Array.isArray(input)
+    ? {
+        rows: input as readonly StoredIssueProcess[],
+        linearEnabled: false,
+        todoQueue: [],
+        snapshotsByIdentifier: new Map(),
+      }
+    : (input as ListViewModel);
+
   const tableBody =
-    rows.length === 0
+    vm.rows.length === 0
       ? `<tr><td colspan="4" class="empty">No issue processes yet. Run <code>runway run</code> with <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> pointing here to populate.</td></tr>`
-      : rows.map(renderRow).join("");
+      : vm.rows.map((r) => renderRow(r, vm.snapshotsByIdentifier)).join("");
+
+  const queueSection = vm.linearEnabled ? renderTodoQueue(vm.todoQueue) : "";
 
   return `<!doctype html>
 <html lang="en">
@@ -53,6 +85,8 @@ export function renderListView(rows: readonly StoredIssueProcess[]): string {
 </head>
 <body>
   <h1>runway · issue processes</h1>
+  ${queueSection}
+  <h2>Recent runs</h2>
   <table>
     <thead>
       <tr>
@@ -68,13 +102,61 @@ export function renderListView(rows: readonly StoredIssueProcess[]): string {
 </html>`;
 }
 
-function renderRow(r: StoredIssueProcess): string {
+/**
+ * VA-390: "Todo queue (next up)" section. Rendered above the
+ * issue-process list when `LINEAR_API_KEY` is set; hidden entirely
+ * when it isn't. An empty queue still renders the section heading
+ * with an empty-state row so the operator knows the poller ran and
+ * found nothing to pick up.
+ */
+function renderTodoQueue(queue: readonly LinearSnapshotRow[]): string {
+  const body =
+    queue.length === 0
+      ? `<tr><td colspan="3" class="empty">Linear Todo queue is empty.</td></tr>`
+      : queue.map(renderQueueRow).join("");
+  return `<h2>Todo queue (next up)</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Issue</th>
+        <th>Title</th>
+        <th>Labels</th>
+      </tr>
+    </thead>
+    <tbody>${body}</tbody>
+  </table>`;
+}
+
+function renderQueueRow(s: LinearSnapshotRow): string {
+  const labels = s.labels.length === 0 ? "" : s.labels.join(", ");
+  return `<tr>
+    <td class="id">${escapeHtml(s.issueIdentifier)}</td>
+    <td class="detail">${escapeHtml(s.title)}</td>
+    <td class="muted">${escapeHtml(labels)}</td>
+  </tr>`;
+}
+
+function renderRow(
+  r: StoredIssueProcess,
+  snapshots: ReadonlyMap<string, LinearSnapshotRow>,
+): string {
   const kind = r.outcomeKind ?? "pending";
   const outcomeCls = `outcome outcome-${escapeHtml(kind)}`;
   // VA-387: canonical detail link uses the span_id alone.
   const href = `/issue-processes/${encodeURIComponent(r.spanId)}`;
+  // VA-390: overlay the Linear status badge when the poller has a
+  // fresher snapshot for this identifier. "Fresher" is the only thing
+  // the snapshot guarantees — it was recorded after the row's emit by
+  // construction (the poller runs continuously and the emit captured
+  // the run's terminal state, not Linear's). When absent (sync off
+  // or issue not yet snapshotted) the row degrades to the existing
+  // outcome cell with no badge.
+  const snapshot = snapshots.get(r.issueIdentifier);
+  const statusBadge = snapshot
+    ? `<span class="status-badge">${escapeHtml(snapshot.status)}</span>`
+    : "";
   return `<tr>
-    <td class="id"><a href="${escapeHtml(href)}">${escapeHtml(r.issueIdentifier)}</a></td>
+    <td class="id"><a href="${escapeHtml(href)}">${escapeHtml(r.issueIdentifier)}</a>${statusBadge}</td>
     <td class="${outcomeCls}">${escapeHtml(kind)}</td>
     <td class="detail">${escapeHtml(r.outcomeDetail ?? "")}</td>
     <td>${escapeHtml(r.insertedAt)}</td>

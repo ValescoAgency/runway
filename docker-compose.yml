@@ -23,6 +23,15 @@ services:
       OTLP_PORT: ${OTLP_PORT:-4318}
       DASHBOARD_PORT: ${DASHBOARD_PORT:-3001}
       SQLITE_PATH: /data/runway.sqlite
+      # VA-390: Linear sync is opt-in. When LINEAR_API_KEY is set the
+      # dashboard polls Linear every LINEAR_POLL_INTERVAL_SECONDS
+      # (default 300) to populate the "Todo queue (next up)" preview
+      # and per-row status badges. Absent → those surfaces stay hidden
+      # and the dashboard behaves exactly as in earlier slices.
+      LINEAR_API_KEY: ${LINEAR_API_KEY:-}
+      LINEAR_POLL_INTERVAL_SECONDS: ${LINEAR_POLL_INTERVAL_SECONDS:-300}
+      RUNWAY_LINEAR_TEAM: ${RUNWAY_LINEAR_TEAM:-VA}
+      RUNWAY_READY_STATUS: ${RUNWAY_READY_STATUS:-Todo}
     ports:
       # VA-385: bind host-side to 127.0.0.1 only. The dashboard's
       # security commitment is loopback-only; without the explicit

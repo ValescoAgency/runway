@@ -71,6 +71,25 @@ export interface PhaseSpan {
   readonly endTimeUnixNano: string;
 }
 
+/**
+ * VA-390 (dashboard slice 6): one row per Linear issue snapshotted by
+ * the poller. `snapshot_at` is when the poller observed the value;
+ * `queue_position` is non-null when the issue was returned by
+ * `getTodoQueue` (ordered as Linear would pick them up next), and
+ * `null` when the row came from `refreshStatus` on a recently-touched
+ * issue. PK on `issue_identifier` keeps it to one row per issue —
+ * subsequent polls upsert, last writer wins.
+ */
+export interface LinearSnapshotRow {
+  readonly issueIdentifier: string;
+  readonly snapshotAt: string;
+  readonly status: string;
+  readonly title: string;
+  readonly labels: readonly string[];
+  /** Non-null when the issue is in the Todo queue at last poll. */
+  readonly queuePosition: number | null;
+}
+
 export interface Storage {
   saveDrain(d: DrainRow): void;
   saveIssueProcess(p: IssueProcessRow): void;
@@ -124,6 +143,31 @@ export interface Storage {
    * dashboard UI and `/api/aggregates`.
    */
   listAggregates(): readonly EvaluatorAggregate[];
+  /**
+   * VA-390: upsert a Linear-side snapshot. Driven by the poller's
+   * `getTodoQueue` / `refreshStatus` calls. PK is `issue_identifier`,
+   * so re-polling the same issue overwrites the prior row.
+   */
+  saveLinearSnapshot(s: LinearSnapshotRow): void;
+  /**
+   * VA-390: clear the `queue_position` column for every row. Called
+   * by the poller before saving a fresh Todo queue, so issues that
+   * dropped out of Todo since the last poll stop appearing in the
+   * "Todo queue (next up)" section.
+   */
+  clearLinearQueuePositions(): void;
+  /**
+   * VA-390: snapshots for issues currently in the Todo queue
+   * (`queue_position IS NOT NULL`), ordered by `queue_position ASC`
+   * so the dashboard renders them in pickup order.
+   */
+  listLinearTodoQueue(): readonly LinearSnapshotRow[];
+  /**
+   * VA-390: snapshots keyed by `issue_identifier`. The dashboard list
+   * view calls this once and overlays per-row status badges without
+   * an N+1 round-trip.
+   */
+  listLinearSnapshots(): readonly LinearSnapshotRow[];
   close(): void;
 }
 
@@ -208,6 +252,18 @@ const SCHEMA = `
 
   CREATE INDEX IF NOT EXISTS idx_agent_iterations_issue_process
     ON agent_iterations(trace_id, issue_process_id, iteration_index);
+
+  CREATE TABLE IF NOT EXISTS linear_snapshots (
+    issue_identifier TEXT PRIMARY KEY,
+    snapshot_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    title TEXT NOT NULL,
+    labels_json TEXT,
+    queue_position INTEGER
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_linear_snapshots_queue_position
+    ON linear_snapshots(queue_position);
 `;
 
 const DEFAULT_AGGREGATE_WINDOW = 30;
@@ -492,6 +548,34 @@ export function createStorage(
     `SELECT * FROM evaluator_aggregates_v1`,
   );
 
+  const upsertLinearSnapshot = db.prepare(`
+    INSERT INTO linear_snapshots (
+      issue_identifier, snapshot_at, status, title, labels_json, queue_position
+    ) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT (issue_identifier) DO UPDATE SET
+      snapshot_at = excluded.snapshot_at,
+      status = excluded.status,
+      title = excluded.title,
+      labels_json = excluded.labels_json,
+      queue_position = excluded.queue_position
+  `);
+
+  const clearQueuePositionsStmt = db.prepare(
+    `UPDATE linear_snapshots SET queue_position = NULL`,
+  );
+
+  const listTodoQueueStmt = db.prepare(`
+    SELECT issue_identifier, snapshot_at, status, title, labels_json, queue_position
+    FROM linear_snapshots
+    WHERE queue_position IS NOT NULL
+    ORDER BY queue_position ASC
+  `);
+
+  const listAllSnapshotsStmt = db.prepare(`
+    SELECT issue_identifier, snapshot_at, status, title, labels_json, queue_position
+    FROM linear_snapshots
+  `);
+
   const saveDrain = (d: DrainRow): void => {
     insertDrain.run(
       d.traceId,
@@ -619,6 +703,27 @@ export function createStorage(
   const listAggregates = (): readonly EvaluatorAggregate[] =>
     selectAggregates.all().map(rowToAggregate);
 
+  const saveLinearSnapshot = (s: LinearSnapshotRow): void => {
+    upsertLinearSnapshot.run(
+      s.issueIdentifier,
+      s.snapshotAt,
+      s.status,
+      s.title,
+      s.labels.length === 0 ? null : JSON.stringify(s.labels),
+      s.queuePosition,
+    );
+  };
+
+  const clearLinearQueuePositions = (): void => {
+    clearQueuePositionsStmt.run();
+  };
+
+  const listLinearTodoQueue = (): readonly LinearSnapshotRow[] =>
+    listTodoQueueStmt.all().map(rowToLinearSnapshot);
+
+  const listLinearSnapshots = (): readonly LinearSnapshotRow[] =>
+    listAllSnapshotsStmt.all().map(rowToLinearSnapshot);
+
   const close = (): void => {
     db.close();
   };
@@ -634,6 +739,10 @@ export function createStorage(
     listAgentIterations,
     listPhaseSpans,
     listAggregates,
+    saveLinearSnapshot,
+    clearLinearQueuePositions,
+    listLinearTodoQueue,
+    listLinearSnapshots,
     close,
   };
 }
@@ -721,6 +830,18 @@ function nullableNum(v: unknown): number | null {
   if (v === null || v === undefined) return null;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
+}
+
+function rowToLinearSnapshot(row: unknown): LinearSnapshotRow {
+  const r = row as Record<string, unknown>;
+  return {
+    issueIdentifier: String(r.issue_identifier ?? ""),
+    snapshotAt: String(r.snapshot_at ?? ""),
+    status: String(r.status ?? ""),
+    title: String(r.title ?? ""),
+    labels: parseLabels(r.labels_json),
+    queuePosition: nullableNum(r.queue_position),
+  };
 }
 
 function rowToAggregate(row: unknown): EvaluatorAggregate {
