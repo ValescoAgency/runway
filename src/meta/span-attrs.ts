@@ -44,7 +44,7 @@ export function codingAgentReportSpanAttrs(
     };
   }
   const report = result.report;
-  return {
+  const base: SpanAttrs = {
     "runway.impl.report.template_version": report.template_version,
     "runway.impl.report.verdict": report.verdict,
     "runway.impl.report.verdict_reason": report.verdict_reason,
@@ -65,6 +65,19 @@ export function codingAgentReportSpanAttrs(
     // it through JSON-as-string without ever inspecting the body.
     "runway.impl.report.payload": JSON.stringify(report),
   };
+  // VA-401: telemetry is orchestrator-stamped (model, tool-call
+  // count, wall-time); a report without it just means the
+  // orchestrator hasn't augmented yet. The IRA reads these as
+  // typed attributes; the read-model needs the wall-time as a
+  // first-class column to grade run efficiency.
+  if (report.telemetry) {
+    base["runway.impl.report.telemetry.model"] = report.telemetry.model;
+    base["runway.impl.report.telemetry.tool_call_count"] =
+      report.telemetry.tool_call_count;
+    base["runway.impl.report.telemetry.wall_time_ms"] =
+      report.telemetry.wall_time_ms;
+  }
+  return base;
 }
 
 export function reviewerReportSpanAttrs(

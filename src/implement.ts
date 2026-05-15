@@ -6,6 +6,7 @@ import { captureCommitLog } from "./git.js";
 import type { RunwayIssue } from "./linear.js";
 import { codingAgentReportSpanAttrs } from "./meta/span-attrs.js";
 import {
+  augmentCodingAgentReport,
   parseCodingAgentReport,
   type CodingAgentReport,
   type ReportParseResult,
@@ -73,6 +74,15 @@ type ImplVerdict =
 // captured for BLOCKED.
 const IMPL_VERDICT_RE = /^IMPL:\s*(DONE|BLOCKED|CONTINUE)(?:\s+—\s+(.*))?$/gm;
 const IMPL_COMPLETION_SIGNALS = ["IMPL: DONE", "IMPL: BLOCKED"] as const;
+
+/**
+ * VA-401: the Claude model runway uses to drive the impl agent. Lifted
+ * to a module-level constant so the report's telemetry slot has a
+ * single source of truth — the orchestrator stamps it post-parse, and
+ * the IRA's "did we pay the right model price for this run?" axis
+ * grades against the same string.
+ */
+const IMPL_AGENT_MODEL = "claude-opus-4-7";
 
 /**
  * Pulls the last `IMPL:` marker line out of the agent's output. The
@@ -156,8 +166,13 @@ export const runImplementLoop = (
       // to the per-run output (raw stdout, etc.) without needing to
       // rebuild the name from issue identifier + iteration.
       implementResult = yield* Effect.gen(function* () {
+        // VA-401: wall-time is one of the auto-populated telemetry
+        // fields. Captured around the sandcastle call so it reflects
+        // the agent's actual work duration, not the surrounding
+        // bookkeeping.
+        const startMs = Date.now();
         const result = yield* runSandcastle({
-          agent: claudeCode("claude-opus-4-7"),
+          agent: claudeCode(IMPL_AGENT_MODEL),
           sandbox: docker({ env: dockerEnv(config) }),
           cwd,
           prompt: implementPrompt,
@@ -166,18 +181,35 @@ export const runImplementLoop = (
           completionSignal: [...IMPL_COMPLETION_SIGNALS],
           name: sandcastleRunId,
         });
+        const wallTimeMs = Date.now() - startMs;
         const verdict = parseImplVerdict(result);
         // VA-401: capture the structured Coding Agent Report
-        // immediately on agent exit, before review fires. Annotated
-        // onto the iteration span so the dashboard's span projector
-        // (and a future IRA pass) sees the report even when review
-        // or finalize crashes downstream. Parse errors are recorded
-        // as typed attributes — never throw at the iteration
-        // boundary, the orchestration must continue. The latest
-        // iteration's report also bubbles up to `processIssue` (set
-        // outside this span scope, below) so the parent span carries
-        // the authoritative final-state copy.
-        const report = parseCodingAgentReport(stringifyResult(result));
+        // immediately on agent exit, before review fires. The
+        // iteration span (`impl-iter-N`) is the **durable source**
+        // for the report — it ends as soon as this gen exits (when
+        // sandcastle returns), so the OTel BatchSpanProcessor queues
+        // it for export BEFORE the reviewer pass starts. The
+        // dashboard / IRA read from the iteration span (or, after
+        // VA-402 lands, the `meta_reviews` row composed from it),
+        // not from the still-open `processIssue` parent. Parse
+        // errors are recorded as typed `error.kind` attributes —
+        // orchestration must continue regardless of report shape.
+        const parsed = parseCodingAgentReport(stringifyResult(result));
+        // Augment with orchestrator-stamped telemetry before
+        // projecting to span attrs. Agents don't know wall-time or
+        // their own model name; runway does. `tool_call_count` is a
+        // proxy from sandcastle's iteration count — the inner-loop
+        // turns the agent actually consumed.
+        const report: ReportParseResult<CodingAgentReport> = parsed.ok
+          ? {
+              ok: true,
+              report: augmentCodingAgentReport(parsed.report, {
+                model: IMPL_AGENT_MODEL,
+                tool_call_count: sandcastleToolCallCount(result),
+                wall_time_ms: wallTimeMs,
+              }),
+            }
+          : parsed;
         lastReport = report;
         yield* Effect.annotateCurrentSpan({
           "runway.iteration.exit_status": verdict.kind,
@@ -213,19 +245,22 @@ export const runImplementLoop = (
     // safe because maxIters >= 1.
     const finalResult = implementResult!;
 
-    // VA-401: bubble the final iteration's report up to the parent
-    // `processIssue` span. We're outside every `impl-iter-N` scope
-    // here but still inside `processIssue` (the orchestrator wraps
-    // the whole composer with `Effect.withSpan("processIssue", …)`),
-    // so `annotateCurrentSpan` lands on the parent — matching the
-    // PRD's "extend the VA-387 span enrichment to include the report
-    // fields" mechanism. A `missing-block` error (e.g. agent never
-    // emitted the JSON block) lands as the error tag, so the
-    // dashboard can render the shape-drift failure mode without
-    // confusing it with "no agent ran."
-    if (lastReport) {
-      yield* Effect.annotateCurrentSpan(codingAgentReportSpanAttrs(lastReport));
-    }
+    // VA-401: the Coding Agent Report lives on the **iteration span**
+    // (`impl-iter-N`), which has ended by the time we reach this
+    // point — so it's already in the OTel batch processor's export
+    // queue. We intentionally do NOT re-annotate it on the still-open
+    // `processIssue` parent: that span doesn't end until the whole
+    // composer (impl → review → finalize) finishes, so a parent-level
+    // attribute wouldn't be durable across a reviewer/finalize crash.
+    // The dashboard / IRA read the report from the iteration span (or
+    // from the `meta_reviews` table once VA-402 lands), then join up
+    // to `processIssue` via `agent_iterations.issue_process_id`.
+    //
+    // Reference suppressed-unused-vars: `lastReport` is kept as a
+    // local because the future VA-402 pass will need it surfaced via
+    // `ImplementOutcome` to avoid re-parsing. The current orchestrator
+    // doesn't read it back out, so we just acknowledge it.
+    void lastReport;
 
     // VA-350: BLOCKED short-circuits straight to HITL — no reviewer
     // pass for a self-declared blocker.
@@ -299,4 +334,18 @@ function buildIterationSummary(args: {
 function tailOfMessage(stdout: string, maxChars = 2000): string {
   if (stdout.length <= maxChars) return stdout;
   return `…(earlier output truncated)\n${stdout.slice(-maxChars)}`;
+}
+
+/**
+ * VA-401: best-effort tool-call count from a sandcastle result. The
+ * sandcastle SDK exposes `iterations: { output, text }[]` — one entry
+ * per inner-loop turn the agent took. Each turn typically issues one
+ * or more tool calls; we use the iteration count as a portable proxy
+ * (sandcastle doesn't surface a per-tool-call counter). Reports `0`
+ * for shapes that don't carry the field — better to under-report than
+ * fabricate.
+ */
+function sandcastleToolCallCount(result: SandcastleRunResult): number {
+  const r = result as { iterations?: readonly unknown[] };
+  return Array.isArray(r.iterations) ? r.iterations.length : 0;
 }

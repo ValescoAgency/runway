@@ -73,6 +73,23 @@ export type PerAcSelfCheck = z.infer<typeof PerAcSelfCheckSchema>;
 export const CODING_AGENT_REPORT_VERSION = "1.0.0";
 export const CODING_AGENT_REPORT_FENCE_TAG = "runway-agent-report";
 
+/**
+ * Telemetry block in every Coding Agent Report — orchestrator-stamped
+ * post-parse rather than agent-emitted. The agent has no reliable way
+ * to know wall-time or its own model name, so we leave the slot
+ * optional in the on-wire shape and `augmentCodingAgentReport` (in
+ * the orchestrator) fills it in before the report is persisted to
+ * spans / Linear / `meta_reviews`. The IRA reads telemetry alongside
+ * the agent-emitted fields when grading the run.
+ */
+const CodingAgentTelemetrySchema = z.object({
+  model: z.string(),
+  tool_call_count: z.number().nonnegative(),
+  wall_time_ms: z.number().nonnegative(),
+});
+
+export type CodingAgentTelemetry = z.infer<typeof CodingAgentTelemetrySchema>;
+
 const CodingAgentReportSchema = z.object({
   template_version: z.string(),
   issue_identifier: z.string().min(1),
@@ -81,8 +98,18 @@ const CodingAgentReportSchema = z.object({
   tests_added_or_modified: z.array(z.string()),
   per_ac_self_check: z.array(PerAcSelfCheckSchema),
   risks_unknowns: z.array(z.string()),
-  verdict: z.enum(["DONE", "BLOCKED", "CONTINUE"]),
+  // PRD verdict alphabet — note that this is the *report* verdict
+  // (the agent's view of their work product), distinct from the
+  // `IMPL:` marker that drives orchestrator control flow. Mapping:
+  //   IMPL: DONE      → DONE     (work is complete)
+  //   IMPL: BLOCKED   → BLOCKED  (cannot proceed without human input)
+  //   IMPL: CONTINUE  → PARTIAL  (made progress; not complete this iter)
+  // The agent emits both — the prompt spells out the mapping so they
+  // stay in sync. A divergence between marker and verdict is itself
+  // a signal the IRA can grade on.
+  verdict: z.enum(["DONE", "BLOCKED", "PARTIAL"]),
   verdict_reason: z.string(),
+  telemetry: CodingAgentTelemetrySchema.optional(),
 });
 
 export type CodingAgentReport = z.infer<typeof CodingAgentReportSchema>;
@@ -95,6 +122,20 @@ export function parseCodingAgentReport(
     schema: CodingAgentReportSchema,
     expectedMajor: parseMajor(CODING_AGENT_REPORT_VERSION),
   });
+}
+
+/**
+ * Orchestrator-side helper: stamp telemetry onto a parsed report
+ * before it's projected into span attributes. Keeping the schema
+ * field optional + an explicit augment seam means the on-wire
+ * agent output stays small (agents only emit what they actually
+ * know) and the durable record always has the runway-known facts.
+ */
+export function augmentCodingAgentReport(
+  report: CodingAgentReport,
+  telemetry: CodingAgentTelemetry,
+): CodingAgentReport {
+  return { ...report, telemetry };
 }
 
 // ---------------------------------------------------------------------------
@@ -119,7 +160,17 @@ const ReviewerReportSchema = z.object({
   per_ac_validation: z.array(PerAcValidationSchema),
   code_quality_concerns: z.array(z.string()),
   test_adequacy_concerns: z.array(z.string()),
-  verdict: z.enum(["APPROVED", "REJECTED-RETRY", "REJECTED-HITL"]),
+  // PRD verdict alphabet — the *report* verdict (the reviewer's
+  // judgment of the diff), distinct from the `REVIEW:` marker that
+  // drives orchestrator control flow. Mapping:
+  //   REVIEW: APPROVED        → APPROVE  (ship it)
+  //   REVIEW: REJECTED-RETRY  → REJECT   (mechanically fixable)
+  //   REVIEW: REJECTED-HITL   → HITL     (needs human judgment)
+  // The reviewer emits both. The IRA grades on the report verdict;
+  // the orchestrator routes on the marker. A marker / verdict
+  // mismatch is a parseable signal of reviewer disagreement with
+  // their own contract.
+  verdict: z.enum(["APPROVE", "REJECT", "HITL"]),
   verdict_reason: z.string(),
   // Guidance is optional — only required (by convention) on rejection,
   // but a reviewer that wants to leave forward-looking notes on an

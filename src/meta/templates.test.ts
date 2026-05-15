@@ -46,6 +46,7 @@ const VALID_AGENT_REPORT = {
     },
   ],
   risks_unknowns: ["None observed."],
+  // PRD verdict alphabet: DONE / BLOCKED / PARTIAL.
   verdict: "DONE",
   verdict_reason: "All ACs pass on this iteration.",
 };
@@ -63,7 +64,8 @@ const VALID_REVIEWER_REPORT = {
   ],
   code_quality_concerns: [],
   test_adequacy_concerns: [],
-  verdict: "APPROVED",
+  // PRD verdict alphabet: APPROVE / REJECT / HITL.
+  verdict: "APPROVE",
   verdict_reason: "Schema gates are correct.",
 };
 
@@ -145,7 +147,7 @@ describe("parseCodingAgentReport (VA-401)", () => {
       JSON.stringify({
         ...VALID_AGENT_REPORT,
         approach: "DRAFT iteration 1",
-        verdict: "CONTINUE",
+        verdict: "PARTIAL",
       }),
     );
     const finalReport = wrapAgent(
@@ -162,6 +164,69 @@ describe("parseCodingAgentReport (VA-401)", () => {
     expect(result.report.approach).toBe("FINAL iteration 2");
     expect(result.report.verdict).toBe("DONE");
   });
+
+  it("accepts PARTIAL as the PRD-spec verdict (not the legacy CONTINUE marker name)", () => {
+    // PRD VA-400 explicitly defines the report verdict alphabet as
+    // DONE / BLOCKED / PARTIAL. CONTINUE is the orchestrator-control
+    // marker name; the report verdict is the work-quality signal the
+    // IRA grades on. They must NOT collapse — the marker / verdict
+    // mapping lives in the prompt, not the schema.
+    const stdout = wrapAgent(
+      JSON.stringify({ ...VALID_AGENT_REPORT, verdict: "PARTIAL" }),
+    );
+    const result = parseCodingAgentReport(stdout);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.verdict).toBe("PARTIAL");
+  });
+
+  it("rejects the legacy CONTINUE marker name in the report verdict", () => {
+    // Loud failure on the wrong vocabulary — if the agent emits the
+    // marker name instead of the PRD verdict name, the IRA would
+    // mis-grade the run. Better to surface the contract violation
+    // than silently accept.
+    const stdout = wrapAgent(
+      JSON.stringify({ ...VALID_AGENT_REPORT, verdict: "CONTINUE" }),
+    );
+    const result = parseCodingAgentReport(stdout);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.kind).toBe("schema-mismatch");
+  });
+
+  it("accepts an optional orchestrator-stamped telemetry block", () => {
+    // Telemetry is auto-populated by the orchestrator after the
+    // agent emits the report — the schema makes it optional so the
+    // agent's wire output doesn't need to fabricate values it can't
+    // know (wall-time, model name, tool-call count).
+    const stdout = wrapAgent(
+      JSON.stringify({
+        ...VALID_AGENT_REPORT,
+        telemetry: {
+          model: "claude-opus-4-7",
+          tool_call_count: 12,
+          wall_time_ms: 45000,
+        },
+      }),
+    );
+    const result = parseCodingAgentReport(stdout);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.telemetry?.model).toBe("claude-opus-4-7");
+    expect(result.report.telemetry?.tool_call_count).toBe(12);
+    expect(result.report.telemetry?.wall_time_ms).toBe(45000);
+  });
+
+  it("parses without telemetry when the agent emits the report unaugmented", () => {
+    // Default flow: the agent emits no telemetry, the orchestrator
+    // augments after parsing. The schema must accept the bare form.
+    const result = parseCodingAgentReport(
+      wrapAgent(JSON.stringify(VALID_AGENT_REPORT)),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.telemetry).toBeUndefined();
+  });
 });
 
 describe("parseReviewerReport (VA-401)", () => {
@@ -175,8 +240,37 @@ describe("parseReviewerReport (VA-401)", () => {
     const result = parseReviewerReport(stdout);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(result.report.verdict).toBe("APPROVED");
+    expect(result.report.verdict).toBe("APPROVE");
     expect(result.report.per_ac_validation).toHaveLength(1);
+  });
+
+  it("rejects the legacy REVIEW: marker name in the report verdict", () => {
+    // PRD verdict alphabet is APPROVE / REJECT / HITL. APPROVED (the
+    // marker name) must NOT parse — the IRA grades on the report
+    // verdict and would mis-classify if the schema silently coerced.
+    const stdout = wrapReviewer(
+      JSON.stringify({ ...VALID_REVIEWER_REPORT, verdict: "APPROVED" }),
+    );
+    const result = parseReviewerReport(stdout);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.kind).toBe("schema-mismatch");
+  });
+
+  it("accepts REJECT and HITL as PRD-spec verdicts", () => {
+    for (const verdict of ["REJECT", "HITL"] as const) {
+      const stdout = wrapReviewer(
+        JSON.stringify({
+          ...VALID_REVIEWER_REPORT,
+          verdict,
+          guidance_to_coding_agent: "fix the thing",
+        }),
+      );
+      const result = parseReviewerReport(stdout);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.report.verdict).toBe(verdict);
+    }
   });
 
   it("returns missing-block when the fenced block is absent", () => {
@@ -215,7 +309,7 @@ describe("parseReviewerReport (VA-401)", () => {
     expect(result.ok).toBe(true);
   });
 
-  it("returns schema-mismatch for an unknown verdict enum", () => {
+  it("returns schema-mismatch for an unknown verdict enum value", () => {
     const stdout = wrapReviewer(
       JSON.stringify({ ...VALID_REVIEWER_REPORT, verdict: "MAYBE" }),
     );

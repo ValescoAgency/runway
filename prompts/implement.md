@@ -106,10 +106,22 @@ Field rules:
   you couldn't verify locally, fields the reviewer should pay
   attention to. Empty array if there are none.
 - `verdict` is `DONE` (all five "done" criteria pass), `BLOCKED` (you
-  can't proceed without human input), or `CONTINUE` (made progress
-  but more work remains for the next iteration). The `verdict` and
-  the `IMPL:` marker below MUST agree.
+  can't proceed without human input), or `PARTIAL` (you made progress
+  but the work isn't done this iteration). The report verdict and
+  the `IMPL:` marker below MUST follow this exact mapping:
+
+      report verdict  ↔  IMPL: marker
+      DONE            ↔  IMPL: DONE
+      BLOCKED         ↔  IMPL: BLOCKED — <reason>
+      PARTIAL         ↔  IMPL: CONTINUE
+
+  The marker drives runway's orchestration; the report verdict is
+  what the retrospective evaluator grades on. They are two views of
+  the same iteration — diverging is a contract violation.
 - `verdict_reason` is a single line. For BLOCKED, name the blocker.
+- Telemetry (model, tool-call count, wall-time) is auto-populated by
+  runway after your report is parsed — **do not emit a `telemetry`
+  field yourself**, runway stamps it.
 
 The block is parsed mechanically — emit valid JSON, use straight
 quotes, and keep the opening/closing fence on their own lines.

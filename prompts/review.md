@@ -57,9 +57,9 @@ The block has this exact shape:
   ],
   "code_quality_concerns": ["<each: one short sentence>"],
   "test_adequacy_concerns": ["<each: one short sentence>"],
-  "verdict": "APPROVED",
+  "verdict": "APPROVE",
   "verdict_reason": "<one line: why this verdict>",
-  "guidance_to_coding_agent": "<one line on REJECT; omit on APPROVE>"
+  "guidance_to_coding_agent": "<one line on REJECT/HITL; omit on APPROVE>"
 }
 ```
 ````
@@ -76,10 +76,20 @@ Field rules:
   agent over-claimed.
 - `code_quality_concerns` and `test_adequacy_concerns` are short
   bullets — empty arrays are honest if you have none.
-- `verdict` is `APPROVED`, `REJECTED-RETRY`, or `REJECTED-HITL`.
-- `guidance_to_coding_agent` is required for rejections (give the
-  agent a concrete next step) and omitted for approvals.
-- The `verdict` field and the `REVIEW:` marker below MUST agree.
+- `verdict` is `APPROVE` (ship it), `REJECT` (mechanically fixable
+  rejection), or `HITL` (rejection that needs human judgment). The
+  report verdict and the `REVIEW:` marker below MUST follow this
+  exact mapping:
+
+      report verdict  ↔  REVIEW: marker
+      APPROVE         ↔  REVIEW: APPROVED
+      REJECT          ↔  REVIEW: REJECTED-RETRY — <one-line fix>
+      HITL            ↔  REVIEW: REJECTED-HITL  — <one-line judgment>
+
+  The marker drives runway's orchestration; the report verdict is
+  what the retrospective evaluator grades on.
+- `guidance_to_coding_agent` is required for `REJECT` / `HITL` (give
+  the agent a concrete next step) and omitted on `APPROVE`.
 
 The block is parsed mechanically — emit valid JSON, use straight
 quotes, and keep the opening/closing fence on their own lines.

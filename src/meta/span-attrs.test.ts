@@ -82,8 +82,10 @@ const validReviewerReport: ReviewerReport = {
   ],
   code_quality_concerns: ["nit"],
   test_adequacy_concerns: [],
-  verdict: "REJECTED-RETRY",
+  // PRD verdict alphabet: APPROVE / REJECT / HITL.
+  verdict: "REJECT",
   verdict_reason: "two ACs failed",
+  guidance_to_coding_agent: "address ac two and ac three",
 };
 
 const okReviewer: ReportParseResult<ReviewerReport> = {
@@ -141,6 +143,37 @@ describe("codingAgentReportSpanAttrs (VA-401)", () => {
     expect(attrs["runway.impl.report.error.kind"]).toBe("missing-block");
     expect(attrs["runway.impl.report.payload"]).toBeUndefined();
   });
+
+  it("projects orchestrator-stamped telemetry into typed attrs when present", () => {
+    // Telemetry is the IRA's first-class signal for "did this run cost
+    // the right amount of wall-time / model spend?" — lifted out of
+    // the JSON payload so SQL queries don't need json_extract on every
+    // row.
+    const augmented: ReportParseResult<CodingAgentReport> = {
+      ok: true,
+      report: {
+        ...validAgentReport,
+        telemetry: {
+          model: "claude-opus-4-7",
+          tool_call_count: 17,
+          wall_time_ms: 62000,
+        },
+      },
+    };
+    const attrs = codingAgentReportSpanAttrs(augmented);
+    expect(attrs["runway.impl.report.telemetry.model"]).toBe(
+      "claude-opus-4-7",
+    );
+    expect(attrs["runway.impl.report.telemetry.tool_call_count"]).toBe(17);
+    expect(attrs["runway.impl.report.telemetry.wall_time_ms"]).toBe(62000);
+  });
+
+  it("omits telemetry attrs when the report has no telemetry block (pre-augment)", () => {
+    const attrs = codingAgentReportSpanAttrs(okAgent);
+    expect(attrs["runway.impl.report.telemetry.model"]).toBeUndefined();
+    expect(attrs["runway.impl.report.telemetry.tool_call_count"]).toBeUndefined();
+    expect(attrs["runway.impl.report.telemetry.wall_time_ms"]).toBeUndefined();
+  });
 });
 
 describe("reviewerReportSpanAttrs (VA-401)", () => {
@@ -149,7 +182,7 @@ describe("reviewerReportSpanAttrs (VA-401)", () => {
     expect(attrs["runway.review.report.template_version"]).toBe(
       REVIEWER_REPORT_VERSION,
     );
-    expect(attrs["runway.review.report.verdict"]).toBe("REJECTED-RETRY");
+    expect(attrs["runway.review.report.verdict"]).toBe("REJECT");
     expect(attrs["runway.review.report.ac_count"]).toBe(3);
     // Two of the three per-AC entries have agent_claim !== my_verdict.
     // This is the load-bearing signal for "did the reviewer catch
