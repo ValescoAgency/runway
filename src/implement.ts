@@ -4,6 +4,12 @@ import { Effect } from "effect";
 import type { Config } from "./config.js";
 import { captureCommitLog } from "./git.js";
 import type { RunwayIssue } from "./linear.js";
+import { codingAgentReportSpanAttrs } from "./meta/span-attrs.js";
+import {
+  parseCodingAgentReport,
+  type CodingAgentReport,
+  type ReportParseResult,
+} from "./meta/templates.js";
 import type { Policy } from "./policy.js";
 import { renderImplementPrompt } from "./prompts.js";
 import {
@@ -110,6 +116,13 @@ export const runImplementLoop = (
     let prevSummary = "";
     let implementResult: SandcastleRunResult | undefined;
     let implVerdict: ImplVerdict = { kind: "missing" };
+    // VA-401: the FINAL iteration's report is what the IRA (and the
+    // dashboard's processIssue detail pane) reads as authoritative.
+    // We accumulate it inside the loop and bubble it up to the
+    // processIssue span at exit, so the report survives a downstream
+    // reviewer / finalize crash regardless of which iteration
+    // produced it.
+    let lastReport: ReportParseResult<CodingAgentReport> | undefined;
 
     for (let iter = 1; iter <= maxIters; iter += 1) {
       const implementPrompt = yield* Effect.promise(() =>
@@ -154,9 +167,22 @@ export const runImplementLoop = (
           name: sandcastleRunId,
         });
         const verdict = parseImplVerdict(result);
+        // VA-401: capture the structured Coding Agent Report
+        // immediately on agent exit, before review fires. Annotated
+        // onto the iteration span so the dashboard's span projector
+        // (and a future IRA pass) sees the report even when review
+        // or finalize crashes downstream. Parse errors are recorded
+        // as typed attributes — never throw at the iteration
+        // boundary, the orchestration must continue. The latest
+        // iteration's report also bubbles up to `processIssue` (set
+        // outside this span scope, below) so the parent span carries
+        // the authoritative final-state copy.
+        const report = parseCodingAgentReport(stringifyResult(result));
+        lastReport = report;
         yield* Effect.annotateCurrentSpan({
           "runway.iteration.exit_status": verdict.kind,
           "runway.iteration.sandcastle_run_id": sandcastleRunId,
+          ...codingAgentReportSpanAttrs(report),
         });
         return result;
       }).pipe(
@@ -186,6 +212,20 @@ export const runImplementLoop = (
     // implementResult is set after the first iteration. The `!` is
     // safe because maxIters >= 1.
     const finalResult = implementResult!;
+
+    // VA-401: bubble the final iteration's report up to the parent
+    // `processIssue` span. We're outside every `impl-iter-N` scope
+    // here but still inside `processIssue` (the orchestrator wraps
+    // the whole composer with `Effect.withSpan("processIssue", …)`),
+    // so `annotateCurrentSpan` lands on the parent — matching the
+    // PRD's "extend the VA-387 span enrichment to include the report
+    // fields" mechanism. A `missing-block` error (e.g. agent never
+    // emitted the JSON block) lands as the error tag, so the
+    // dashboard can render the shape-drift failure mode without
+    // confusing it with "no agent ran."
+    if (lastReport) {
+      yield* Effect.annotateCurrentSpan(codingAgentReportSpanAttrs(lastReport));
+    }
 
     // VA-350: BLOCKED short-circuits straight to HITL — no reviewer
     // pass for a self-declared blocker.

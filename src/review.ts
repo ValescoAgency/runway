@@ -4,6 +4,12 @@ import { Effect } from "effect";
 import type { Config } from "./config.js";
 import { captureCommitLog, captureDiff } from "./git.js";
 import type { RunwayIssue } from "./linear.js";
+import { reviewerReportSpanAttrs } from "./meta/span-attrs.js";
+import {
+  parseReviewerReport,
+  type ReportParseResult,
+  type ReviewerReport,
+} from "./meta/templates.js";
 import { renderReviewPrompt } from "./prompts.js";
 import {
   dockerEnv,
@@ -120,15 +126,36 @@ export const runReviewPass = (
     const reviewPrompt = yield* Effect.promise(() =>
       renderReviewPrompt({ issue, diff, commits: commitLog }),
     );
-    const reviewResult = yield* runSandcastle({
-      agent: claudeCode("claude-opus-4-7"),
-      sandbox: docker({ env: dockerEnv(config) }),
-      cwd,
-      prompt: reviewPrompt,
-      branchStrategy: { type: "head" },
-      maxIterations: 1,
-      name: `review-${issue.identifier}`,
+    // VA-401: parse the Reviewer Report in the outer scope so we can
+    // (a) annotate it on the `review` span (inner) and (b) bubble it
+    // up to the parent `processIssue` span (after the inner scope
+    // exits) — matching the PRD's "extend the VA-387 span enrichment
+    // to include the report fields" mechanism.
+    let reviewerReport: ReportParseResult<ReviewerReport> | undefined;
+    const reviewResult = yield* Effect.gen(function* () {
+      const result = yield* runSandcastle({
+        agent: claudeCode("claude-opus-4-7"),
+        sandbox: docker({ env: dockerEnv(config) }),
+        cwd,
+        prompt: reviewPrompt,
+        branchStrategy: { type: "head" },
+        maxIterations: 1,
+        name: `review-${issue.identifier}`,
+      });
+      const report = parseReviewerReport(stringifyResult(result));
+      reviewerReport = report;
+      yield* Effect.annotateCurrentSpan(reviewerReportSpanAttrs(report));
+      return result;
     }).pipe(Effect.withSpan("review"));
+
+    // Bubble the final Reviewer Report onto `processIssue` so the
+    // detail pane (and the IRA's Run Review pass) reads it without
+    // joining child spans. Parse errors land here too — the
+    // dashboard then shows reviewer template drift on the same row
+    // as agent template drift.
+    if (reviewerReport) {
+      yield* Effect.annotateCurrentSpan(reviewerReportSpanAttrs(reviewerReport));
+    }
 
     const verdict = parseReviewVerdict(reviewResult);
     // VA-418: split rejection into two outcomes so the composer can
