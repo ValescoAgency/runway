@@ -20,8 +20,16 @@ WORKDIR /app
 RUN npm install -g pnpm@11.1.1
 COPY package.json pnpm-lock.yaml ./
 # `--frozen-lockfile` guarantees we install exactly what was resolved
-# at commit time.
-RUN pnpm install --frozen-lockfile
+# at commit time. `--ignore-scripts` skips:
+#   - the repo's `prepare` script (runs `lefthook install`, which
+#     needs `.git` — not in the build context) and
+#   - every dependency's postinstall script — pnpm 11 errors out on
+#     unapproved build scripts (ERR_PNPM_IGNORED_BUILDS), and the
+#     approval list lives in pnpm-workspace.yaml which isn't copied
+#     here. We have no native dependencies that need install-time
+#     compilation, so skipping is safe and avoids dragging the
+#     workspace file into the build stage.
+RUN pnpm install --frozen-lockfile --ignore-scripts
 
 COPY tsconfig.json tsconfig.build.json ./
 COPY src ./src
