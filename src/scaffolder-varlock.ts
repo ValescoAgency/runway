@@ -68,6 +68,19 @@ export async function applyVarlockLayer(
     console.log(`  ✓ patched ${dockerfilePath} (varlock + op CLI + claude shim)`);
   }
 
+  // 2b. VA-413: vendor the claude shim into .sandcastle/ so the
+  // Dockerfile's `COPY .sandcastle/runway-claude-shim …` resolves
+  // during the docker build. The shim wraps each `claude` invocation
+  // in `varlock run`, and — when the four RUNWAY_SIGNING_* env vars
+  // are populated — bootstraps SSH-signed agent commits.
+  const shimSrc = readFileSync(
+    join(TEMPLATES_DIR, "claude-shim.sh"),
+    "utf8",
+  );
+  const shimDest = join(cwd, ".sandcastle", "runway-claude-shim");
+  writeFileSync(shimDest, shimSrc, { mode: 0o755 });
+  console.log(`  ✓ wrote .sandcastle/runway-claude-shim (claude wrapper + signing bootstrap)`);
+
   // 3. Drop .sandcastle/.env and .env.example.
   for (const f of [".sandcastle/.env", ".sandcastle/.env.example"]) {
     const p = join(cwd, f);
