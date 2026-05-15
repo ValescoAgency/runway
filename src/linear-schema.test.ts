@@ -148,10 +148,11 @@ describe("VA-360 — Linear SDK response schemas", () => {
     workflowStatesMock.mockResolvedValueOnce({
       nodes: [{ id: "state-todo", name: "Todo" }],
     });
-    // VA-394: `fetchReady` now calls `.labels()` and
-    // `.inverseRelations()` on each candidate to apply eligibility
-    // filters — the happy path needs to mock them returning empty
-    // sets so the candidate passes the filters unchanged.
+    // VA-394 + VA-425: `fetchReady` calls `.labels()`,
+    // `.inverseRelations()`, and `.children()` on each candidate to
+    // apply eligibility filters — the happy path needs to mock them
+    // returning empty sets so the candidate passes the filters
+    // unchanged.
     const emptyConnection = () => Promise.resolve({ nodes: [] });
     issuesMock.mockResolvedValueOnce({
       nodes: [
@@ -164,6 +165,7 @@ describe("VA-360 — Linear SDK response schemas", () => {
           createdAt: "2026-01-01T00:00:00.000Z",
           labels: emptyConnection,
           inverseRelations: emptyConnection,
+          children: emptyConnection,
         },
         {
           id: "issue-2",
@@ -174,6 +176,7 @@ describe("VA-360 — Linear SDK response schemas", () => {
           createdAt: "2026-01-02T00:00:00.000Z",
           labels: emptyConnection,
           inverseRelations: emptyConnection,
+          children: emptyConnection,
         },
       ],
     });

@@ -70,6 +70,9 @@ interface FakeIssueArgs {
   // exercising the "no explicit priority" path.
   readonly priority?: number;
   readonly createdAt?: string;
+  // VA-425: number of child sub-issues on this candidate. Default 0
+  // so existing tests stay on the "leaf issue" path.
+  readonly childCount?: number;
 }
 
 function fakeIssue(args: FakeIssueArgs) {
@@ -98,6 +101,12 @@ function fakeIssue(args: FakeIssueArgs) {
               : Promise.resolve({
                   state: Promise.resolve({ type: rel.blockerStateType }),
                 }),
+        })),
+      }),
+    children: () =>
+      Promise.resolve({
+        nodes: Array.from({ length: args.childCount ?? 0 }, (_, i) => ({
+          id: `child-${args.id}-${i}`,
         })),
       }),
   };
@@ -498,5 +507,107 @@ describe("VA-421 — fetchReady accepts In-Progress when no remote agent branch"
     expect(result.map((i) => i.identifier)).toEqual(["VA-800"]);
     // Sanity: only one issues() call was made — no In-Progress bucket.
     expect(issuesMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+// VA-425: parent PRDs / umbrella tickets that have child sub-issues
+// describe scope across multiple deliverables; the right unit of agent
+// work is the child. `fetchReady` skips parents so the agent doesn't
+// latch onto one user story and falsely close the umbrella.
+describe("VA-425 — fetchReady skips parent issues with children", () => {
+  it("includes an issue with no children (the common case)", async () => {
+    stubTeamAndState();
+    issuesMock.mockResolvedValueOnce({
+      nodes: [
+        fakeIssue({
+          id: "issue-leaf",
+          identifier: "VA-LEAF",
+          title: "self-contained ticket",
+          childCount: 0,
+        }),
+      ],
+    });
+
+    const gateway = createLinearGateway(baseConfig);
+    const result = await Effect.runPromise(gateway.fetchReady());
+
+    expect(result.map((i) => i.identifier)).toEqual(["VA-LEAF"]);
+  });
+
+  it("skips an issue with one or more children (parent PRD)", async () => {
+    stubTeamAndState();
+    issuesMock.mockResolvedValueOnce({
+      nodes: [
+        fakeIssue({
+          id: "issue-prd",
+          identifier: "VA-PRD",
+          title: "umbrella PRD with sub-issues",
+          childCount: 6,
+        }),
+        fakeIssue({
+          id: "issue-leaf",
+          identifier: "VA-LEAF",
+          title: "self-contained sibling",
+          childCount: 0,
+        }),
+      ],
+    });
+
+    const gateway = createLinearGateway(baseConfig);
+    const result = await Effect.runPromise(gateway.fetchReady());
+
+    expect(result.map((i) => i.identifier)).toEqual(["VA-LEAF"]);
+  });
+
+  it("includes child issues themselves (a child with no children of its own is eligible)", async () => {
+    stubTeamAndState();
+    issuesMock.mockResolvedValueOnce({
+      nodes: [
+        fakeIssue({
+          id: "issue-child",
+          identifier: "VA-CHILD",
+          title: "leaf slice under a PRD",
+          childCount: 0,
+        }),
+      ],
+    });
+
+    const gateway = createLinearGateway(baseConfig);
+    const result = await Effect.runPromise(gateway.fetchReady());
+
+    expect(result.map((i) => i.identifier)).toEqual(["VA-CHILD"]);
+  });
+
+  it("VA-421 interaction: skips an In-Progress parent with children regardless of remote agent branch state", async () => {
+    teamsMock.mockResolvedValueOnce({ nodes: [{ id: "team-1", key: "VA" }] });
+    workflowStatesMock.mockResolvedValueOnce({
+      nodes: [{ id: "state-todo", name: "Todo" }],
+    });
+    workflowStatesMock.mockResolvedValueOnce({
+      nodes: [{ id: "state-inprog", name: "In Progress" }],
+    });
+    issuesMock.mockResolvedValueOnce({ nodes: [] });
+    issuesMock.mockResolvedValueOnce({
+      nodes: [
+        fakeIssue({
+          id: "issue-ip-parent",
+          identifier: "VA-PARENT",
+          title: "in-progress PRD with children",
+          childCount: 3,
+        }),
+      ],
+    });
+
+    // Predicate would say "no agent branch — accept it" — but the
+    // child-skip rule fires first and the issue is skipped anyway.
+    const remoteAgentBranchExists = vi.fn().mockResolvedValue(false);
+    const gateway = createLinearGateway(baseConfig, null, {
+      remoteAgentBranchExists,
+    });
+    const result = await Effect.runPromise(gateway.fetchReady());
+
+    expect(result).toEqual([]);
+    // Child-skip short-circuits before the git probe runs.
+    expect(remoteAgentBranchExists).not.toHaveBeenCalled();
   });
 });

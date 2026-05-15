@@ -268,6 +268,13 @@ Runway picks up issues that are:
 - (optionally) in project `RUNWAY_LINEAR_PROJECT` (override per-run
   with `runway run --project=<id-or-slug-or-name>`; unset = team-wide)
 - in workflow state `RUNWAY_READY_STATUS` (default `Todo`)
+- not carrying `RUNWAY_HITL_LABEL` (default `ready-for-human`)
+- not blocked by a non-terminal `blocks` relation
+- **without any child sub-issues** — parent PRDs and umbrella tickets
+  are skipped. The right unit of agent work is the leaf ticket, not
+  the parent that spans it. If your ticket's scope is bigger than one
+  PR, file children for the individual deliverables and let runway
+  pick those up instead.
 
 It transitions them through:
 

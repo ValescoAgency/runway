@@ -119,6 +119,24 @@ async function fetchIssueLabelNames(issue: Issue): Promise<readonly string[]> {
 }
 
 /**
+ * VA-425: returns true when `issue` has one or more child sub-issues.
+ * Parent PRDs / umbrella tickets describe scope across multiple
+ * deliverables; the right unit of agent work is the child, not the
+ * parent. Skipping parents keeps the agent from latching onto a
+ * single user story and falsely closing the umbrella issue.
+ *
+ * "Non-trivial" in the name means simply "has any child" — Linear
+ * doesn't model "draft" or "abandoned" children separately, so
+ * `nodes.length > 0` is the signal. Children themselves remain
+ * drain-eligible on their own merits (this check only runs against
+ * candidates already on the queue).
+ */
+async function hasChildIssues(issue: Issue): Promise<boolean> {
+  const children = await issue.children();
+  return children.nodes.length > 0;
+}
+
+/**
  * VA-394: returns true when `issue` has at least one `inverseRelations`
  * record of type `blocks` whose blocker is in a non-terminal workflow
  * state. Other relation types (`duplicate`, `related`) do not gate
@@ -536,6 +554,17 @@ export function createLinearGateway(
               const labels = await fetchIssueLabelNames(raw);
               if (labels.includes(config.hitlLabel)) continue;
               if (await hasActiveBlocker(raw)) continue;
+              // VA-425: parents (issues with one or more sub-issues)
+              // are PRDs / umbrella tickets — agents should pick up
+              // the children, not the parent. Skipped regardless of
+              // workflow state, since In-Progress parents in particular
+              // are the failure mode that motivated this check.
+              if (await hasChildIssues(raw)) {
+                console.debug(
+                  `[runway] fetchReady: skipping ${i.identifier} — has child sub-issues (PRD / umbrella ticket)`,
+                );
+                continue;
+              }
               // VA-421: In-Progress candidates pass only if no
               // `agent/<id>` ref exists on origin — that's the
               // authoritative "no drain attempt in flight" signal,
