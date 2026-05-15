@@ -4,6 +4,32 @@ All notable changes to runway are documented here. Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); breaking
 changes bump the major.
 
+## 0.10.0 — 2026-05-14
+
+Minor release. Seven PRs since 0.9.0, weighted toward orchestrator resilience under retry and the dashboard's first observability slices. Drains that previously stalled on rebase-conflicts at PR-creation time, mis-ordered queues, stale agent branches on HITL retry, or hung Node processes after the work was logically done now self-resolve. The dashboard read-model and per-issue detail pane move from "drain trace exists in SQLite" to "operator can actually inspect a run."
+
+### Added
+
+- **In-run review-rejection retry loop** ([PR #80](https://github.com/ValescoAgency/runway/pull/80), VA-418). Reviewer can now signal `REVIEW: REJECTED-RETRY — <reason>` for mechanically fixable issues. Runway re-runs the impl agent with the rejection threaded into `{{IN_RUN_REVIEWER_FEEDBACK}}` and re-runs review, up to `--review-retries` (default 1, env `RUNWAY_REVIEW_RETRIES`). `REJECTED-HITL` still routes straight to a human. Closes the previous "one strike, you're out" reviewer behavior that wasted impl effort on cosmetically wrong but recoverable diffs.
+- **Pre-PR rebase onto base branch** ([PR #78](https://github.com/ValescoAgency/runway/pull/78), VA-419). `finalize` now runs `git fetch origin <base>` and `git rebase origin/<base>` before `git push`, so PRs open on a fast-forward and avoid the "GitHub thinks this needs a rebase" badge on the very first view. On rebase conflict, the issue is routed to HITL with the conflicted-file list — the reviewer's prior verdict is preserved so the operator sees that the diff was good before the conflict surfaced.
+- **Dashboard: per-issue detail pane + processIssue span enrichment** ([PR #75](https://github.com/ValescoAgency/runway/pull/75), VA-387). The `processIssue` OTel span now carries `runway.outcome.kind`, `runway.outcome.detail`, `runway.pr.url` (on opened outcomes), `runway.hitl.reason` (on planned + failure-routed HITL), plus `runway.outcome.errored` to distinguish planned HITL from crash-routed HITL on the dashboard row. The detail pane renders these as structured fields with deep links into GitHub and Linear.
+- **Dashboard: evaluator-facing aggregates read-model** ([PR #74](https://github.com/ValescoAgency/runway/pull/74), VA-399). Rolling-window aggregates over drains and issue processes — counts, outcome distributions, retry rates — exposed as SQL views the IRA Run Review pipeline will query directly. Underpins future rolling-norms grading (VA-405) without requiring per-pass recomputation.
+
+### Fixed
+
+- **`runway run` no longer hangs after the drain completes** ([PR #85](https://github.com/ValescoAgency/runway/pull/85), VA-422). `runCommand` now emits a parser-friendly completion marker (`[runway:exit] status=success attempts=N opened=N hitl=N errored=N`) and `process.exit(0)` after the existing summary. The hard exit kills any lingering handle — OTel `BatchSpanProcessor`'s interval when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, a Docker stream Sandcastle left open — that previously stranded background `runway run` invocations (Claude Code background tasks, CI steps) past the work's actual completion. The failure path in `cli.ts` mirrors the marker on stderr (`[runway:exit] status=failure`).
+- **Stale agent branch reset on HITL retry** ([PR #83](https://github.com/ValescoAgency/runway/pull/83), VA-417). When an issue is HITL-flagged and later re-routed back to the queue, runway now resets `agent/<id>` to `origin/<base>` once at drain-pickup time, before the retry loop begins. Closes the failure mode where iteration 2 of the in-run retry loop would otherwise inherit iteration 1's rejected commits and conclude "the work is already done."
+- **`fetchReady` queue ordering — priority DESC, then createdAt ASC** ([PR #81](https://github.com/ValescoAgency/runway/pull/81), VA-420). Linear's priority encoding is non-monotonic (1=Urgent, 2=High, 3=Medium, 4=Low, 0=No-priority). The previous sort treated 0 as below 4 lexically but Urgent as below No-priority numerically — the result was Urgent issues sometimes draining after Low ones. The new sort orders strictly by descending semantic priority, with `createdAt` ascending as the tiebreaker so older Urgent issues drain first.
+
+### Closed without separate work
+
+- **VA-384** (applyLabel filter excludes workspace-scoped labels) — already resolved in master under VA-416's commit in 0.9.0 (`src/linear.ts:553-572`). Closed as duplicate during release prep; no code change needed.
+
+### Internal — release stats
+
+- **7 PRs since 0.9.0** (4 features + 3 fixes).
+- All 39 test files, 312 specs pass.
+
 ## 0.9.0 — 2026-05-14
 
 Minor release. Drops Node 22 support in favor of Node 24, bumps the agent runtime container to pnpm 11.1.1, and patches the impl-agent prompt so it no longer treats yesterday's rejected commits as authoritative on retry. Two PRs since 0.8.1.
