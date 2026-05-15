@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
-import type { OtlpSpan, OtlpTracesPayload } from "./otlp.js";
-import { projectPayload } from "./projector.js";
+import type {
+  OtlpLogRecord,
+  OtlpLogsPayload,
+  OtlpSpan,
+  OtlpTracesPayload,
+} from "./otlp.js";
+import { projectLogs, projectPayload } from "./projector.js";
 
 // VA-386: projector is the pure boundary between OTLP wire format and
 // the typed runway rows the dashboard renders. Hand-built fixtures
@@ -473,5 +478,168 @@ describe("projectPayload — impl-iter-N (VA-389)", () => {
       ]),
     );
     expect(out.agentIterations).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// VA-388 — projectLogs
+// ---------------------------------------------------------------------------
+
+function logRecord(over: Partial<OtlpLogRecord> = {}): OtlpLogRecord {
+  return {
+    timeUnixNano: "1715000000500000000",
+    severityText: "INFO",
+    body: { stringValue: "agent picked up issue" },
+    attributes: [
+      { key: "issue", value: { stringValue: "VA-388" } },
+      { key: "branch", value: { stringValue: "agent/va-388" } },
+    ],
+    traceId: "0123456789abcdef0123456789abcdef",
+    spanId: "0123456789abcdef",
+    ...over,
+  };
+}
+
+function logsPayload(records: readonly OtlpLogRecord[]): OtlpLogsPayload {
+  return {
+    resourceLogs: [
+      {
+        resource: {
+          attributes: [
+            { key: "service.name", value: { stringValue: "runway" } },
+          ],
+        },
+        scopeLogs: [
+          {
+            scope: { name: "@effect/opentelemetry" },
+            logRecords: records,
+          },
+        ],
+      },
+    ],
+  };
+}
+
+describe("projectLogs — VA-388", () => {
+  it("projects a log record into the typed row shape with attributes flattened to strings", () => {
+    const rows = projectLogs(logsPayload([logRecord()]));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toEqual({
+      traceId: "0123456789abcdef0123456789abcdef",
+      spanId: "0123456789abcdef",
+      timestampUnixNano: "1715000000500000000",
+      level: "INFO",
+      message: "agent picked up issue",
+      attributes: { issue: "VA-388", branch: "agent/va-388" },
+    });
+  });
+
+  it("falls back to observedTimeUnixNano when timeUnixNano is missing", () => {
+    const rows = projectLogs(
+      logsPayload([
+        {
+          ...logRecord(),
+          timeUnixNano: undefined,
+          observedTimeUnixNano: "1715000000600000000",
+        },
+      ]),
+    );
+    expect(rows[0]?.timestampUnixNano).toBe("1715000000600000000");
+  });
+
+  it("drops records without a trace_id — stray library logs have nowhere to land on the dashboard", () => {
+    const rows = projectLogs(
+      logsPayload([
+        { ...logRecord(), traceId: undefined },
+        { ...logRecord(), traceId: "" },
+        logRecord(),
+      ]),
+    );
+    expect(rows).toHaveLength(1);
+  });
+
+  it("drops records without any timestamp (we won't fabricate one)", () => {
+    const rows = projectLogs(
+      logsPayload([
+        {
+          ...logRecord(),
+          timeUnixNano: undefined,
+          observedTimeUnixNano: undefined,
+        },
+      ]),
+    );
+    expect(rows).toEqual([]);
+  });
+
+  it("maps severityNumber to a coarse label when severityText is absent", () => {
+    const probe = (n: number): string =>
+      projectLogs(
+        logsPayload([
+          { ...logRecord(), severityText: undefined, severityNumber: n },
+        ]),
+      )[0]?.level ?? "";
+
+    expect(probe(5)).toBe("DEBUG");
+    expect(probe(9)).toBe("INFO");
+    expect(probe(13)).toBe("WARN");
+    expect(probe(17)).toBe("ERROR");
+    expect(probe(21)).toBe("FATAL");
+    expect(probe(0)).toBe("UNSET");
+  });
+
+  it("upper-cases the severityText when present (defends against lower-case 'info' from custom loggers)", () => {
+    const rows = projectLogs(
+      logsPayload([{ ...logRecord(), severityText: "info" }]),
+    );
+    expect(rows[0]?.level).toBe("INFO");
+  });
+
+  it("flattens an array-valued attribute into a comma-joined string", () => {
+    const rows = projectLogs(
+      logsPayload([
+        {
+          ...logRecord(),
+          attributes: [
+            {
+              key: "issue.labels",
+              value: {
+                arrayValue: {
+                  values: [
+                    { stringValue: "bug" },
+                    { stringValue: "backend" },
+                  ],
+                },
+              },
+            },
+          ],
+        },
+      ]),
+    );
+    expect(rows[0]?.attributes).toEqual({ "issue.labels": "bug, backend" });
+  });
+
+  it("collects records across multiple resource / scope groups", () => {
+    const rows = projectLogs({
+      resourceLogs: [
+        {
+          scopeLogs: [
+            {
+              logRecords: [logRecord({ body: { stringValue: "first" } })],
+            },
+            {
+              logRecords: [logRecord({ body: { stringValue: "second" } })],
+            },
+          ],
+        },
+        {
+          scopeLogs: [
+            {
+              logRecords: [logRecord({ body: { stringValue: "third" } })],
+            },
+          ],
+        },
+      ],
+    });
+    expect(rows.map((r) => r.message)).toEqual(["first", "second", "third"]);
   });
 });

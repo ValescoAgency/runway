@@ -3,6 +3,7 @@ import type {
   PhaseSpan,
   StoredAgentIteration,
   StoredIssueProcess,
+  StoredLogRecord,
 } from "./storage.js";
 
 /**
@@ -171,6 +172,14 @@ export interface DetailViewModel {
   readonly issueProcess: StoredIssueProcess;
   readonly iterations: readonly StoredAgentIteration[];
   readonly phaseSpans: readonly PhaseSpan[];
+  /**
+   * VA-388: log records correlated to this trace (every record sharing
+   * the trace_id, regardless of which span emitted it). Ordered
+   * ascending by `timestampUnixNano` so the Logs section reads
+   * chronologically. Empty when nothing has flowed through OTLP yet
+   * (the section is omitted in that case).
+   */
+  readonly logs?: readonly StoredLogRecord[];
 }
 
 interface PhaseRow {
@@ -192,6 +201,7 @@ export function renderDetailView(vm: DetailViewModel): string {
   const phases = computePhases(vm);
   const phaseTimeline = renderPhaseTimeline(phases);
   const phaseTable = renderPhaseTable(phases, vm.iterations);
+  const logsSection = renderLogsSection(vm.logs ?? []);
 
   const ip = vm.issueProcess;
   const kind = ip.outcomeKind ?? "pending";
@@ -235,6 +245,18 @@ export function renderDetailView(vm: DetailViewModel): string {
     .iter-status-blocked  { color: #f87171; }
     .iter-status-continue { color: #facc15; }
     .iter-status-missing  { color: #9ca3af; }
+    .logs { font-size: 12px; }
+    .logs td { vertical-align: top; }
+    .logs td.log-ts { color: #9ca3af; white-space: nowrap; }
+    .logs td.log-level { width: 60px; font-weight: 600; }
+    .log-level-INFO  { color: #93c5fd; }
+    .log-level-WARN  { color: #facc15; }
+    .log-level-ERROR { color: #f87171; }
+    .log-level-FATAL { color: #f87171; }
+    .log-level-DEBUG { color: #9ca3af; }
+    .log-level-TRACE { color: #9ca3af; }
+    .log-attrs { color: #9ca3af; font-size: 11px; margin-top: 4px;
+                 white-space: pre-wrap; word-break: break-all; }
   </style>
 </head>
 <body>
@@ -252,8 +274,52 @@ export function renderDetailView(vm: DetailViewModel): string {
   <h2>Phase timeline</h2>
   ${phaseTimeline}
   ${phaseTable}
+  ${logsSection}
 </body>
 </html>`;
+}
+
+/**
+ * VA-388: detail-pane Logs section. Renders every log record correlated
+ * to this trace in chronological order (timestamp ASC). Level gets a
+ * color per severity; annotated attributes render below the message as
+ * a `key=value` line. Section is omitted entirely when there are no
+ * records — keeps the page clean for old issue processes that
+ * predate the OTLP logs pipeline.
+ */
+function renderLogsSection(logs: readonly StoredLogRecord[]): string {
+  if (logs.length === 0) return "";
+  const rows = logs.map(renderLogRow).join("");
+  return `
+  <h2>Logs</h2>
+  <table class="logs">
+    <thead>
+      <tr>
+        <th>Time</th>
+        <th>Level</th>
+        <th>Message</th>
+      </tr>
+    </thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+function renderLogRow(r: StoredLogRecord): string {
+  const ts = formatTimestamp(parseNs(r.timestampUnixNano));
+  const level = r.level || "UNSET";
+  const levelCls = `log-level log-level-${escapeHtml(level)}`;
+  const attrEntries = Object.entries(r.attributes);
+  const attrs =
+    attrEntries.length === 0
+      ? ""
+      : `<div class="log-attrs">${escapeHtml(
+          attrEntries.map(([k, v]) => `${k}=${v}`).join(" · "),
+        )}</div>`;
+  return `<tr>
+    <td class="log-ts">${escapeHtml(ts)}</td>
+    <td class="log-level"><span class="${levelCls}">${escapeHtml(level)}</span></td>
+    <td><div>${escapeHtml(r.message)}</div>${attrs}</td>
+  </tr>`;
 }
 
 /**

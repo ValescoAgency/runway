@@ -3,6 +3,7 @@ import type {
   AgentIterationRow,
   DrainRow,
   IssueProcessRow,
+  LogRecordRow,
   RawSpanRow,
 } from "./projector.js";
 import { createStorage, type Storage } from "./storage.js";
@@ -784,5 +785,152 @@ describe("createStorage — evaluator aggregates view (VA-399)", () => {
     // "loose-string-..." has a dash so its category is "loose".
     // "OPS" has no dash so its category is the full string.
     expect(rows.map((r) => r.category).sort()).toEqual(["OPS", "loose"]);
+  });
+});
+
+function makeLogRecord(over: Partial<LogRecordRow> = {}): LogRecordRow {
+  return {
+    traceId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    spanId: "2222222222222222",
+    timestampUnixNano: "1715000000500000000",
+    level: "INFO",
+    message: "agent picked up issue",
+    attributes: { issue: "VA-388", branch: "agent/va-388" },
+    ...over,
+  };
+}
+
+describe("createStorage — appendLogRecord / streamLogsFor (VA-388)", () => {
+  it("round-trips a single log record with its attributes intact", () => {
+    storage.appendLogRecord(makeLogRecord());
+
+    const rows = storage.streamLogsFor(
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      traceId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      spanId: "2222222222222222",
+      timestampUnixNano: "1715000000500000000",
+      level: "INFO",
+      message: "agent picked up issue",
+      attributes: { issue: "VA-388", branch: "agent/va-388" },
+    });
+    expect(rows[0]?.insertedAt).toBeTruthy();
+  });
+
+  it("orders streamed records ascending by timestamp (not insertion order)", () => {
+    // Insert out-of-order — middle, latest, earliest.
+    storage.appendLogRecord(
+      makeLogRecord({
+        spanId: "span-mid",
+        timestampUnixNano: "1715000000200000000",
+        message: "middle",
+      }),
+    );
+    storage.appendLogRecord(
+      makeLogRecord({
+        spanId: "span-late",
+        timestampUnixNano: "1715000000900000000",
+        message: "latest",
+      }),
+    );
+    storage.appendLogRecord(
+      makeLogRecord({
+        spanId: "span-early",
+        timestampUnixNano: "1715000000100000000",
+        message: "earliest",
+      }),
+    );
+
+    const rows = storage.streamLogsFor(
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    expect(rows.map((r) => r.message)).toEqual([
+      "earliest",
+      "middle",
+      "latest",
+    ]);
+  });
+
+  it("orders timestamps numerically (not lexically) — varying-length int64 strings sort by value", () => {
+    // Lexical ordering would put "1715000000..." (11 digits) before
+    // "999999999" (9 digits) because "1" < "9", inverting real time.
+    // The CAST to INTEGER fixes that. (Both values fit comfortably
+    // within SQLite's signed 8-byte INTEGER range, < 2^63.)
+    storage.appendLogRecord(
+      makeLogRecord({
+        spanId: "span-newer",
+        timestampUnixNano: "1715000000000000000",
+        message: "newer",
+      }),
+    );
+    storage.appendLogRecord(
+      makeLogRecord({
+        spanId: "span-older",
+        timestampUnixNano: "999999999999999999",
+        message: "older",
+      }),
+    );
+
+    const rows = storage.streamLogsFor(
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    expect(rows.map((r) => r.message)).toEqual(["older", "newer"]);
+  });
+
+  it("scopes results to the requested trace_id", () => {
+    storage.appendLogRecord(
+      makeLogRecord({
+        traceId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        message: "trace A",
+      }),
+    );
+    storage.appendLogRecord(
+      makeLogRecord({
+        traceId: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        message: "trace B",
+      }),
+    );
+
+    const a = storage.streamLogsFor("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    expect(a.map((r) => r.message)).toEqual(["trace A"]);
+    const b = storage.streamLogsFor("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    expect(b.map((r) => r.message)).toEqual(["trace B"]);
+  });
+
+  it("upserts on (trace_id, span_id, timestamp) — exporter retry is idempotent", () => {
+    storage.appendLogRecord(
+      makeLogRecord({ message: "first emit", level: "INFO" }),
+    );
+    storage.appendLogRecord(
+      makeLogRecord({ message: "retry overwrote level", level: "WARN" }),
+    );
+
+    const rows = storage.streamLogsFor(
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      message: "retry overwrote level",
+      level: "WARN",
+    });
+  });
+
+  it("returns an empty list for a trace_id with no logs", () => {
+    const rows = storage.streamLogsFor(
+      "cccccccccccccccccccccccccccccccc",
+    );
+    expect(rows).toEqual([]);
+  });
+
+  it("survives a record with no attributes (empty object → NULL column)", () => {
+    storage.appendLogRecord(makeLogRecord({ attributes: {} }));
+
+    const rows = storage.streamLogsFor(
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.attributes).toEqual({});
   });
 });

@@ -436,3 +436,117 @@ describe("dashboard HTTP server — /api/aggregates (VA-399)", () => {
     expect(body.rows).toEqual([]);
   });
 });
+
+const sampleLogsPayload = {
+  resourceLogs: [
+    {
+      resource: {
+        attributes: [{ key: "service.name", value: { stringValue: "runway" } }],
+      },
+      scopeLogs: [
+        {
+          scope: { name: "test" },
+          logRecords: [
+            {
+              timeUnixNano: "1715000000600000000",
+              severityText: "INFO",
+              body: { stringValue: "Runway picked up VA-388" },
+              traceId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              spanId: "2222222222222222",
+              attributes: [
+                { key: "issue", value: { stringValue: "VA-388" } },
+                { key: "branch", value: { stringValue: "agent/va-388" } },
+              ],
+            },
+            {
+              timeUnixNano: "1715000000700000000",
+              severityText: "WARN",
+              body: { stringValue: "review rejected, retrying" },
+              traceId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              spanId: "2222222222222222",
+              attributes: [
+                { key: "attempt", value: { stringValue: "2" } },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
+describe("dashboard HTTP server — POST /v1/logs (VA-388)", () => {
+  it("accepts an OTLP logs payload and returns the partialSuccess envelope", async () => {
+    const res = await fetch(`${base}/v1/logs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(sampleLogsPayload),
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    const body = (await res.json()) as { partialSuccess: unknown };
+    expect(body.partialSuccess).toEqual({});
+  });
+
+  it("persists log records visible via storage.streamLogsFor on the same trace_id", async () => {
+    await fetch(`${base}/v1/logs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(sampleLogsPayload),
+    });
+    const rows = storage.streamLogsFor(
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => r.level)).toEqual(["INFO", "WARN"]);
+    expect(rows[0]?.attributes).toEqual({
+      issue: "VA-388",
+      branch: "agent/va-388",
+    });
+  });
+
+  it("renders posted log records in the detail-pane Logs section", async () => {
+    // Post both the traces (to create the issue_process row keyed on
+    // span 2222...) and the logs (correlated to the same trace).
+    await fetch(`${base}/v1/traces`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(sampleTracesPayload),
+    });
+    await fetch(`${base}/v1/logs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(sampleLogsPayload),
+    });
+
+    const res = await fetch(`${base}/issue-processes/2222222222222222`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(">Logs<");
+    expect(html).toContain("Runway picked up VA-388");
+    expect(html).toContain("review rejected, retrying");
+    expect(html).toContain("INFO");
+    expect(html).toContain("WARN");
+    // Annotated attributes flow through to the rendered row.
+    expect(html).toContain("issue=VA-388");
+    expect(html).toContain("branch=agent/va-388");
+  });
+
+  it("rejects non-JSON content types with 415", async () => {
+    const res = await fetch(`${base}/v1/logs`, {
+      method: "POST",
+      headers: { "content-type": "application/x-protobuf" },
+      body: "binary garbage",
+    });
+    expect(res.status).toBe(415);
+  });
+
+  it("rejects malformed JSON with 400", async () => {
+    const res = await fetch(`${base}/v1/logs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{not json",
+    });
+    expect(res.status).toBe(400);
+  });
+});
