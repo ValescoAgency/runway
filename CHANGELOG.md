@@ -4,6 +4,19 @@ All notable changes to runway are documented here. Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); breaking
 changes bump the major.
 
+## 0.10.1 — 2026-05-14
+
+Patch release. One bugfix closing the last hole in runway's queue-management story — discovered immediately after 0.10.0 shipped, on the same drain that surfaced VA-417/418/419/420.
+
+### Fixed
+
+- **`fetchReady` accepts In-Progress issues whose `agent/<id>` branch isn't on origin yet** ([PR #87](https://github.com/ValescoAgency/runway/pull/87), VA-421). Linear's GitHub integration auto-transitions an issue to `In Progress` when its identifier is mentioned in an unrelated PR body. The previous `fetchReady` filtered strictly on `state == config.readyStatus`, so an issue that no real drain ever touched could silently fall out of the queue — observed on VA-417 during the 2026-05-14 PM drain, where PRs #78 and #80 both said "Sibling to VA-417" in their bodies, Linear flipped VA-417 to In-Progress, and the next `fetchReady` missed it. The fix: a new `git ls-remote --heads origin agent/<id>` check (`src/git.ts:remoteRefExists`) is the authoritative "no drain attempt in flight" signal. `createLinearGateway` gains an optional `remoteAgentBranchExists` predicate; when provided, `fetchReady` queries In-Progress alongside Todo and skips In-Progress candidates whose remote ref already exists. Todo path unchanged (no extra git call). Help text under `RUNWAY_IN_PROGRESS_STATUS` notes the broadened scope.
+
+### Internal — release stats
+
+- **1 PR since 0.10.0** (1 fix).
+- All 39 test files, 320 specs pass (8 new — 5 VA-421 in `linear-filter.test.ts`, 3 `remoteRefExists` in `git.test.ts`).
+
 ## 0.10.0 — 2026-05-14
 
 Minor release. Seven PRs since 0.9.0, weighted toward orchestrator resilience under retry and the dashboard's first observability slices. Drains that previously stalled on rebase-conflicts at PR-creation time, mis-ordered queues, stale agent branches on HITL retry, or hung Node processes after the work was logically done now self-resolve. The dashboard read-model and per-issue detail pane move from "drain trace exists in SQLite" to "operator can actually inspect a run."
