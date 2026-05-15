@@ -367,3 +367,136 @@ describe("VA-420 — fetchReady drain order", () => {
     ]);
   });
 });
+
+describe("VA-421 — fetchReady accepts In-Progress when no remote agent branch", () => {
+  function stubTeamTodoAndInProgress() {
+    teamsMock.mockResolvedValueOnce({ nodes: [{ id: "team-1", key: "VA" }] });
+    // findStateId is called twice (Todo, then In Progress) when the
+    // gateway is built with `remoteAgentBranchExists`. Tests that
+    // exercise the VA-421 path stub both lookups in that order.
+    workflowStatesMock.mockResolvedValueOnce({
+      nodes: [{ id: "state-todo", name: "Todo" }],
+    });
+    workflowStatesMock.mockResolvedValueOnce({
+      nodes: [{ id: "state-inprog", name: "In Progress" }],
+    });
+  }
+
+  it("accepts an In-Progress issue when origin/agent/<id> does not exist", async () => {
+    stubTeamTodoAndInProgress();
+    // First issues() call — Todo bucket (empty).
+    issuesMock.mockResolvedValueOnce({ nodes: [] });
+    // Second issues() call — In-Progress bucket (one auto-transitioned issue).
+    issuesMock.mockResolvedValueOnce({
+      nodes: [
+        fakeIssue({
+          id: "issue-ip-1",
+          identifier: "VA-417",
+          title: "in-progress, but never drained",
+        }),
+      ],
+    });
+
+    const remoteAgentBranchExists = vi.fn().mockResolvedValue(false);
+    const gateway = createLinearGateway(baseConfig, null, {
+      remoteAgentBranchExists,
+    });
+    const result = await Effect.runPromise(gateway.fetchReady());
+
+    expect(result.map((i) => i.identifier)).toEqual(["VA-417"]);
+    expect(remoteAgentBranchExists).toHaveBeenCalledWith("agent/va-417");
+  });
+
+  it("skips an In-Progress issue when origin/agent/<id> exists", async () => {
+    stubTeamTodoAndInProgress();
+    issuesMock.mockResolvedValueOnce({ nodes: [] });
+    issuesMock.mockResolvedValueOnce({
+      nodes: [
+        fakeIssue({
+          id: "issue-ip-2",
+          identifier: "VA-500",
+          title: "real work in flight",
+        }),
+      ],
+    });
+
+    const remoteAgentBranchExists = vi.fn().mockResolvedValue(true);
+    const gateway = createLinearGateway(baseConfig, null, {
+      remoteAgentBranchExists,
+    });
+    const result = await Effect.runPromise(gateway.fetchReady());
+
+    expect(result).toEqual([]);
+    expect(remoteAgentBranchExists).toHaveBeenCalledWith("agent/va-500");
+  });
+
+  it("skips an In-Progress issue with the HITL label without consulting git", async () => {
+    stubTeamTodoAndInProgress();
+    issuesMock.mockResolvedValueOnce({ nodes: [] });
+    issuesMock.mockResolvedValueOnce({
+      nodes: [
+        fakeIssue({
+          id: "issue-ip-hitl",
+          identifier: "VA-600",
+          title: "in-progress + HITL",
+          labels: ["needs-human"],
+        }),
+      ],
+    });
+
+    const remoteAgentBranchExists = vi.fn().mockResolvedValue(false);
+    const gateway = createLinearGateway(baseConfig, null, {
+      remoteAgentBranchExists,
+    });
+    const result = await Effect.runPromise(gateway.fetchReady());
+
+    expect(result).toEqual([]);
+    // HITL filter runs before the git check — predicate never fires.
+    expect(remoteAgentBranchExists).not.toHaveBeenCalled();
+  });
+
+  it("does not consult git for Todo candidates (no behavior change on the common path)", async () => {
+    stubTeamTodoAndInProgress();
+    issuesMock.mockResolvedValueOnce({
+      nodes: [
+        fakeIssue({
+          id: "issue-todo",
+          identifier: "VA-700",
+          title: "plain todo",
+        }),
+      ],
+    });
+    issuesMock.mockResolvedValueOnce({ nodes: [] });
+
+    const remoteAgentBranchExists = vi.fn().mockResolvedValue(true);
+    const gateway = createLinearGateway(baseConfig, null, {
+      remoteAgentBranchExists,
+    });
+    const result = await Effect.runPromise(gateway.fetchReady());
+
+    expect(result.map((i) => i.identifier)).toEqual(["VA-700"]);
+    expect(remoteAgentBranchExists).not.toHaveBeenCalled();
+  });
+
+  it("omits the In-Progress query entirely when no predicate is provided (legacy callers)", async () => {
+    // No In-Progress state lookup — only Todo. Matches stubTeamAndState
+    // (the pre-VA-421 helper).
+    stubTeamAndState();
+    issuesMock.mockResolvedValueOnce({
+      nodes: [
+        fakeIssue({
+          id: "issue-todo-legacy",
+          identifier: "VA-800",
+          title: "legacy todo",
+        }),
+      ],
+    });
+
+    const gateway = createLinearGateway(baseConfig);
+    const result = await Effect.runPromise(gateway.fetchReady());
+
+    expect(result.map((i) => i.identifier)).toEqual(["VA-800"]);
+    // Sanity: only one issues() call was made — no In-Progress bucket.
+    expect(issuesMock).toHaveBeenCalledTimes(1);
+  });
+});
