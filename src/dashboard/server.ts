@@ -4,6 +4,7 @@ import {
   startLinearSync,
   type LinearSyncHandle,
 } from "./linear-sync.js";
+import { createEventBus, type EventBus } from "./events.js";
 import { projectLogs, projectPayload } from "./projector.js";
 import {
   createStorage,
@@ -11,7 +12,12 @@ import {
   type Storage,
   type StoredIssueProcess,
 } from "./storage.js";
-import { renderDetailView, renderListView } from "./views.js";
+import {
+  renderDetailView,
+  renderIssueProcessRows,
+  renderListView,
+  renderLogsSection,
+} from "./views.js";
 import type { OtlpLogsPayload, OtlpTracesPayload } from "./otlp.js";
 
 // VA-389: phase spans we surface on the detail page's timeline.
@@ -22,6 +28,10 @@ const ISSUE_DETAIL_RE = /^\/issue\/([^/?#]+)\/([^/?#]+)\/?$/;
 // the lookup falls back to the (trace_id, span_id) pair only for
 // older `/issue/...` links that still work for back-compat.
 const ISSUE_PROCESS_DETAIL_RE = /^\/issue-processes\/([^/?#]+)\/?$/;
+// VA-391: SSE detail-pane stream. `:id` is the issue process span_id
+// (same as the detail route); the handler resolves it to a trace_id
+// and forwards every dashboard event for that trace to the client.
+const ISSUE_PROCESS_STREAM_RE = /^\/issue-processes\/([^/?#]+)\/stream\/?$/;
 
 /**
  * VA-386 (dashboard slice 1): the dashboard runs as a single Node HTTP
@@ -64,6 +74,13 @@ export interface ServerOptions {
    * snapshot-at-emit value (the existing outcome cell).
    */
   readonly linearEnabled?: boolean;
+  /**
+   * VA-391: in-process event bus the OTLP ingest paths publish to.
+   * Optional — defaults to a fresh per-server bus, which is what
+   * production wants. Tests inject one to assert publish/subscribe
+   * behaviour without going through SSE.
+   */
+  readonly events?: EventBus;
 }
 
 export interface RunningServer {
@@ -81,11 +98,17 @@ const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MiB — generous; a runway drain 
  */
 export function buildServer(
   storage: Storage,
-  opts: { readonly linearEnabled?: boolean } = {},
+  opts: { readonly linearEnabled?: boolean; readonly events?: EventBus } = {},
 ): Server {
   const linearEnabled = opts.linearEnabled ?? false;
+  // VA-391: an in-process event bus is plumbed through every request
+  // handler so the OTLP ingest paths can publish change events that
+  // the SSE detail-pane stream re-emits to the browser. Callers can
+  // inject their own (tests use this to assert publish behavior);
+  // production gets a fresh per-server bus.
+  const events = opts.events ?? createEventBus();
   return createServer((req, res) => {
-    handle(req, res, storage, linearEnabled).catch((err) => {
+    handle(req, res, storage, linearEnabled, events).catch((err) => {
       writeError(res, 500, "internal_error", asMessage(err));
     });
   });
@@ -96,7 +119,10 @@ export function buildServer(
  * use to close it gracefully (used by tests).
  */
 export async function startServer(opts: ServerOptions): Promise<RunningServer> {
-  const server = buildServer(opts.storage, { linearEnabled: opts.linearEnabled });
+  const server = buildServer(opts.storage, {
+    linearEnabled: opts.linearEnabled,
+    events: opts.events,
+  });
   const port = opts.port ?? 4318;
   const host = opts.host ?? "127.0.0.1";
 
@@ -127,6 +153,7 @@ async function handle(
   res: ServerResponse,
   storage: Storage,
   linearEnabled: boolean,
+  events: EventBus,
 ): Promise<void> {
   // Route on method + path. Nothing fancy — slice 1 only has two
   // endpoints; a router becomes worth its weight in slice 2.
@@ -134,12 +161,12 @@ async function handle(
   const method = req.method ?? "GET";
 
   if (method === "POST" && url === "/v1/traces") {
-    await handleOtlpTraces(req, res, storage);
+    await handleOtlpTraces(req, res, storage, events);
     return;
   }
 
   if (method === "POST" && url === "/v1/logs") {
-    await handleOtlpLogs(req, res, storage);
+    await handleOtlpLogs(req, res, storage, events);
     return;
   }
 
@@ -148,8 +175,26 @@ async function handle(
     return;
   }
 
+  // VA-391: fragment endpoint returns just the tbody so the list view
+  // can poll via htmx without redrawing the rest of the page.
+  if (
+    method === "GET" &&
+    (url === "/issue-processes" || url.startsWith("/issue-processes?"))
+  ) {
+    handleIssueProcessRowsFragment(res, storage, linearEnabled);
+    return;
+  }
+
   if (method === "GET") {
     const pathOnly = url.split("?")[0] ?? "";
+    // VA-391: SSE stream matches BEFORE the detail route so the
+    // `/stream` suffix isn't swallowed as a span_id segment.
+    const streamMatch = ISSUE_PROCESS_STREAM_RE.exec(pathOnly);
+    if (streamMatch) {
+      const spanId = decodeURIComponent(streamMatch[1] ?? "");
+      handleIssueProcessStream(req, res, storage, events, spanId);
+      return;
+    }
     const issueProcessMatch = ISSUE_PROCESS_DETAIL_RE.exec(pathOnly);
     if (issueProcessMatch) {
       const spanId = decodeURIComponent(issueProcessMatch[1] ?? "");
@@ -193,6 +238,7 @@ async function handleOtlpTraces(
   req: IncomingMessage,
   res: ServerResponse,
   storage: Storage,
+  events: EventBus,
 ): Promise<void> {
   const ct = (req.headers["content-type"] ?? "").toString().toLowerCase();
   if (!ct.includes("application/json")) {
@@ -221,8 +267,28 @@ async function handleOtlpTraces(
 
   const projection = projectPayload(payload);
   for (const d of projection.drains) storage.saveDrain(d);
-  for (const p of projection.issueProcesses) storage.saveIssueProcess(p);
-  for (const a of projection.agentIterations) storage.saveAgentIteration(a);
+  for (const p of projection.issueProcesses) {
+    storage.saveIssueProcess(p);
+    // VA-391: notify SSE subscribers that an issue_processes row
+    // changed. Agent iterations and raw spans piggyback on the same
+    // issue-process trigger — anything that affects the detail pane
+    // is refreshed by re-rendering the page on this event.
+    events.publish({
+      kind: "issueProcessChanged",
+      traceId: p.traceId,
+      issueProcessSpanId: p.spanId,
+    });
+  }
+  for (const a of projection.agentIterations) {
+    storage.saveAgentIteration(a);
+    if (a.issueProcessSpanId) {
+      events.publish({
+        kind: "issueProcessChanged",
+        traceId: a.traceId,
+        issueProcessSpanId: a.issueProcessSpanId,
+      });
+    }
+  }
   for (const r of projection.rawSpans) storage.saveRawSpan(r);
 
   // OTLP success body: a small JSON envelope. Required by the spec
@@ -244,6 +310,7 @@ async function handleOtlpLogs(
   req: IncomingMessage,
   res: ServerResponse,
   storage: Storage,
+  events: EventBus,
 ): Promise<void> {
   const ct = (req.headers["content-type"] ?? "").toString().toLowerCase();
   if (!ct.includes("application/json")) {
@@ -272,10 +339,128 @@ async function handleOtlpLogs(
 
   for (const r of projectLogs(payload)) {
     storage.appendLogRecord(r);
+    // VA-391: the SSE detail-pane stream live-tails the Logs section
+    // on every new log record. Filter by trace_id so a subscriber
+    // only sees records for its own issue process.
+    events.publish({
+      kind: "logRecordAppended",
+      traceId: r.traceId,
+      spanId: r.spanId,
+    });
   }
 
   res.writeHead(200, { "content-type": "application/json" });
   res.end(JSON.stringify({ partialSuccess: {} }));
+}
+
+/**
+ * VA-391: SSE detail-pane stream. Sends an initial `data: ready`
+ * frame so the htmx sse extension's `connect` event fires before
+ * the first real payload, then forwards every dashboard event for
+ * this issue process's trace_id as a typed SSE event. Cleanup runs
+ * on either side closing the socket — `req.on("close")` covers both
+ * a browser tab close and a server shutdown.
+ *
+ * Frame format follows htmx's `sse-swap` contract:
+ *
+ *   event: <type>
+ *   data: <html-encoded payload>
+ *   <blank line>
+ *
+ * The htmx sse extension swaps the named target with the frame body
+ * verbatim, so the payloads here are HTML fragments — the same
+ * `renderLogsSection` the detail page uses for its initial render.
+ */
+function handleIssueProcessStream(
+  req: IncomingMessage,
+  res: ServerResponse,
+  storage: Storage,
+  events: EventBus,
+  spanId: string,
+): void {
+  const ip = storage.getIssueProcessBySpanId(spanId);
+  if (!ip) {
+    writeError(res, 404, "not_found", `no issue process for span=${spanId}`);
+    return;
+  }
+
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    // Disable proxy buffering so events flush as they're written —
+    // dashboards behind nginx default to buffering text/event-stream
+    // unless this is set.
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    "x-accel-buffering": "no",
+  });
+  // Initial frame — opens the stream and tells the htmx extension the
+  // connection is live so its `connect` hook can fire.
+  res.write(": runway sse stream open\n\n");
+
+  const subscription = events.subscribe(
+    { traceId: ip.traceId },
+    (event) => {
+      if (event.kind === "logRecordAppended") {
+        const logs = storage.streamLogsFor(ip.traceId);
+        writeSseFrame(res, "logsRefresh", renderLogsSection(logs));
+        return;
+      }
+      if (event.kind === "issueProcessChanged") {
+        // The detail pane re-renders on iteration / phase changes
+        // via a full reload — htmx clients can listen for this
+        // event name and decide their swap strategy. We don't ship
+        // a partial fragment here because the phase timeline +
+        // table re-uses every field on the issueProcess row.
+        writeSseFrame(res, "issueProcessChanged", "");
+        return;
+      }
+    },
+  );
+
+  const cleanup = (): void => {
+    subscription.unsubscribe();
+    if (!res.writableEnded) res.end();
+  };
+  req.on("close", cleanup);
+  req.on("error", cleanup);
+}
+
+/**
+ * VA-391: list-view fragment endpoint. Returns just the rendered
+ * `<tbody>` for the issue-process table so the page can poll via
+ * `hx-trigger="every 3s"` and swap only the rows. The Linear queue
+ * preview and drain summary strip stay static between polls — they
+ * have their own swap triggers (or sit above the polling target).
+ */
+function handleIssueProcessRowsFragment(
+  res: ServerResponse,
+  storage: Storage,
+  linearEnabled: boolean,
+): void {
+  const rows = storage.listIssueProcesses({ limit: 100 });
+  const snapshotsByIdentifier = linearEnabled
+    ? new Map<string, LinearSnapshotRow>(
+        storage.listLinearSnapshots().map((s) => [s.issueIdentifier, s]),
+      )
+    : new Map<string, LinearSnapshotRow>();
+  const html = renderIssueProcessRows({
+    rows,
+    linearEnabled,
+    snapshotsByIdentifier,
+  });
+  res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+  res.end(html);
+}
+
+function writeSseFrame(
+  res: ServerResponse,
+  event: string,
+  data: string,
+): void {
+  // SSE spec: each line in `data` is its own `data:` line. Joining
+  // with `\ndata: ` keeps multi-line HTML fragments intact.
+  const lines = data.split("\n").map((line) => `data: ${line}`).join("\n");
+  res.write(`event: ${event}\n${lines}\n\n`);
 }
 
 function handleListView(
@@ -295,11 +480,17 @@ function handleListView(
         storage.listLinearSnapshots().map((s) => [s.issueIdentifier, s]),
       )
     : new Map<string, LinearSnapshotRow>();
+  // VA-391: drain summary strip — populated when a drainQueue span
+  // hasn't ended yet (inferred by issue_processes with no parent
+  // `drains` row). `null` becomes the "Idle — no active drain"
+  // state in views.
+  const activeDrain = storage.getActiveDrain();
   const html = renderListView({
     rows,
     linearEnabled,
     todoQueue,
     snapshotsByIdentifier,
+    activeDrain,
   });
   res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
   res.end(html);
