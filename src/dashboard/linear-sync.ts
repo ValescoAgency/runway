@@ -213,6 +213,11 @@ export function startLinearSync(opts: LinearSyncOptions): LinearSyncHandle {
     });
 
   const tick = async (): Promise<void> => {
+    // Identifiers written by `getTodoQueue` on this tick. The
+    // `refreshStatus` save path skips these so it doesn't clobber the
+    // `queue_position` that was just set — an issue present in both
+    // calls must keep its queue slot.
+    const queuedIds = new Set<string>();
     try {
       const queue = await opts.adapter.getTodoQueue();
       // Wipe queue positions before saving fresh ones so issues that
@@ -220,6 +225,7 @@ export function startLinearSync(opts: LinearSyncOptions): LinearSyncHandle {
       opts.storage.clearLinearQueuePositions();
       const at = new Date().toISOString();
       queue.forEach((q, i) => {
+        queuedIds.add(q.identifier);
         opts.storage.saveLinearSnapshot({
           issueIdentifier: q.identifier,
           snapshotAt: at,
@@ -244,6 +250,11 @@ export function startLinearSync(opts: LinearSyncOptions): LinearSyncHandle {
         const refreshed = await opts.adapter.refreshStatus(recent);
         const at = new Date().toISOString();
         for (const r of refreshed) {
+          // Skip identifiers `getTodoQueue` just wrote — saving here
+          // with `queuePosition: null` would erase the freshly-set
+          // queue slot and the issue would vanish from the Todo queue
+          // preview even though it's still in Todo.
+          if (queuedIds.has(r.identifier)) continue;
           opts.storage.saveLinearSnapshot({
             issueIdentifier: r.identifier,
             snapshotAt: at,

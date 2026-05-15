@@ -244,6 +244,46 @@ describe("startLinearSync — refreshStatus tick (VA-390)", () => {
     ).toBeUndefined();
   });
 
+  it("preserves queue_position when an identifier is in both getTodoQueue and recentIdentifiers", async () => {
+    // VA-390: an issue in Todo can also be in the recent-touched list
+    // (the dashboard just opened it). The refreshStatus save path must
+    // not clobber the queue_position that getTodoQueue set on the same
+    // tick — otherwise the issue vanishes from the Todo queue preview
+    // even though Linear still has it in Todo.
+    const adapter = makeFakeAdapter();
+    adapter.nextQueue = [
+      { identifier: "VA-1", title: "queued", status: "Todo", labels: ["bug"] },
+    ];
+    adapter.nextRefresh = [
+      {
+        identifier: "VA-1",
+        title: "queued (refreshed)",
+        status: "Todo",
+        labels: ["bug"],
+      },
+    ];
+    handle = startLinearSync({
+      adapter,
+      storage,
+      intervalSeconds: LONG_INTERVAL,
+      logger: silentLogger(),
+      recentIdentifiers: () => ["VA-1"],
+    });
+    await handle.initialTick;
+
+    // Queue preview still lists VA-1 with its queue_position intact.
+    const queue = storage.listLinearTodoQueue();
+    expect(queue.map((q) => q.issueIdentifier)).toEqual(["VA-1"]);
+    expect(queue[0]?.queuePosition).toBe(0);
+    // The original queue snapshot fields are preserved — refreshStatus
+    // did not overwrite the row with queue_position: null.
+    expect(queue[0]).toMatchObject({
+      title: "queued",
+      status: "Todo",
+      labels: ["bug"],
+    });
+  });
+
   it("pulls recent identifiers from storage.listIssueProcesses by default (dedup + most-recent first)", async () => {
     // VA-390: by default the poller asks storage for the most recent
     // distinct issue identifiers. Seed a few issue_processes rows so
