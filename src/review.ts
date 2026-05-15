@@ -4,6 +4,8 @@ import { Effect } from "effect";
 import type { Config } from "./config.js";
 import { captureCommitLog, captureDiff } from "./git.js";
 import type { RunwayIssue } from "./linear.js";
+import { reviewerReportSpanAttrs } from "./meta/span-attrs.js";
+import { parseReviewerReport } from "./meta/templates.js";
 import { renderReviewPrompt } from "./prompts.js";
 import {
   dockerEnv,
@@ -120,14 +122,29 @@ export const runReviewPass = (
     const reviewPrompt = yield* Effect.promise(() =>
       renderReviewPrompt({ issue, diff, commits: commitLog }),
     );
-    const reviewResult = yield* runSandcastle({
-      agent: claudeCode("claude-opus-4-7"),
-      sandbox: docker({ env: dockerEnv(config) }),
-      cwd,
-      prompt: reviewPrompt,
-      branchStrategy: { type: "head" },
-      maxIterations: 1,
-      name: `review-${issue.identifier}`,
+    // VA-401: parse the Reviewer Report inside the `review` span
+    // scope. The span ends as soon as this gen exits — so the OTel
+    // batch processor queues the report attributes for export
+    // immediately, before the orchestrator decides whether to
+    // finalize or retry. We do NOT re-annotate on the parent
+    // `processIssue` span (that span doesn't end until the whole
+    // composer finishes; a parent-level annotation wouldn't be
+    // durable across a finalize crash). The dashboard / IRA read
+    // the reviewer report from the `review` span, then join up via
+    // `parent_span_id` if they need the issue-process context.
+    const reviewResult = yield* Effect.gen(function* () {
+      const result = yield* runSandcastle({
+        agent: claudeCode("claude-opus-4-7"),
+        sandbox: docker({ env: dockerEnv(config) }),
+        cwd,
+        prompt: reviewPrompt,
+        branchStrategy: { type: "head" },
+        maxIterations: 1,
+        name: `review-${issue.identifier}`,
+      });
+      const report = parseReviewerReport(stringifyResult(result));
+      yield* Effect.annotateCurrentSpan(reviewerReportSpanAttrs(report));
+      return result;
     }).pipe(Effect.withSpan("review"));
 
     const verdict = parseReviewVerdict(reviewResult);
