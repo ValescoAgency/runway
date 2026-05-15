@@ -874,17 +874,114 @@ describe("drainQueue finalize-time rebase (VA-419)", () => {
       /flagged for human review/.test(b),
     );
     expect(hitlComment).toBeDefined();
-    expect(hitlComment).toMatch(/Upstream base `main` advanced/);
+    // VA-424: message no longer falsely claims "upstream advanced" —
+    // it names merge conflicts as the cause and points at origin/<base>.
+    expect(hitlComment).toMatch(/onto `origin\/main` produced merge/);
+    expect(hitlComment).not.toMatch(/Upstream base.*advanced/);
     expect(hitlComment).toMatch(/src\/dashboard\/storage\.ts/);
     expect(hitlComment).toMatch(/src\/dashboard\/storage\.test\.ts/);
     expect(hitlComment).toMatch(/Review was APPROVED before the rebase/);
     expect(hitlComment).toMatch(/REVIEW: APPROVED/);
+    // VA-424: recovery guidance no longer recommends VA-417 (which
+    // would destroy the approved work).
+    expect(hitlComment).not.toMatch(/VA-417/);
 
     // `git rebase --abort` ran — pre-rebase state was restored.
     const gitCalls = execaMock.mock.calls
       .filter((c) => c[0] === "git")
       .map((c) => (c[1] as readonly string[]).join(" "));
     expect(gitCalls).toContain("rebase --abort");
+  });
+
+  it("VA-424: non-conflict rebase failure (no unmerged files) → HITL with stderr; PR is NOT opened", async () => {
+    // Mode A from the live evidence: rebase exits non-zero but git
+    // reports no unmerged files (e.g., dirty host worktree). The
+    // orchestrator must distinguish this from a real merge conflict
+    // and surface stderr in the HITL diagnostic.
+    execaMock.mockImplementation((bin: string, args: readonly string[]) => {
+      if (bin !== "git") {
+        return Promise.reject(new Error(`unexpected binary: ${bin}`));
+      }
+      if (args[0] === "symbolic-ref") {
+        return Promise.resolve({ exitCode: 0, stdout: "origin/main\n" });
+      }
+      if (args[0] === "rev-list") {
+        return Promise.resolve({ exitCode: 0, stdout: "3" });
+      }
+      if (args[0] === "diff" && args[1] === "--name-only") {
+        // No unmerged files — this is what makes it a "failure" rather
+        // than a "conflict" per VA-424.
+        return Promise.resolve({ exitCode: 0, stdout: "" });
+      }
+      if (args[0] === "diff" || args[0] === "log") {
+        return Promise.resolve({ exitCode: 0, stdout: "" });
+      }
+      if (args[0] === "fetch") {
+        return Promise.resolve({ exitCode: 0, stdout: "" });
+      }
+      if (args[0] === "rebase") {
+        if (args[1] === "--abort") {
+          return Promise.resolve({ exitCode: 0, stdout: "" });
+        }
+        return Promise.resolve({
+          exitCode: 128,
+          stdout: "",
+          stderr: "error: cannot rebase: You have unstaged changes.\n",
+        });
+      }
+      return Promise.reject(
+        new Error(`unexpected git args: ${args.join(" ")}`),
+      );
+    });
+
+    sandcastleRunMock
+      .mockResolvedValueOnce({
+        stdout: "impl done\nIMPL: DONE",
+        commits: [{ sha: "abc" }],
+      })
+      .mockResolvedValueOnce({
+        stdout: "REVIEW: APPROVED",
+        commits: [],
+      });
+
+    const linear = makeLinear();
+    linear.fetchReady
+      .mockReturnValueOnce(Effect.succeed([issue]))
+      .mockReturnValueOnce(Effect.succeed([]));
+
+    const github = makeGithub();
+    const result = await drainQueue({
+      config,
+      linear: asLinear(linear),
+      github,
+      cwd: "/tmp/repo",
+    });
+
+    expect(result).toMatchObject({
+      attempts: 1,
+      opened: 0,
+      hitl: 1,
+      errored: 0,
+    });
+
+    expect(github.pushBranch).not.toHaveBeenCalled();
+    expect(github.openPullRequest).not.toHaveBeenCalled();
+
+    expect(linear.applyLabel).toHaveBeenCalledWith("issue-123", "needs-human");
+    const commentBodies = linear.comment.mock.calls.map((c) => String(c[1]));
+    const hitlComment = commentBodies.find((b) =>
+      /flagged for human review/.test(b),
+    );
+    expect(hitlComment).toBeDefined();
+    // Failure-path wording — names the failure, surfaces stderr, no
+    // "merge conflicts" claim and no "upstream advanced" claim.
+    expect(hitlComment).toMatch(/onto `origin\/main` failed/);
+    expect(hitlComment).toMatch(/no unmerged files/);
+    expect(hitlComment).toMatch(/cannot rebase: You have unstaged changes/);
+    expect(hitlComment).not.toMatch(/produced merge/);
+    expect(hitlComment).not.toMatch(/Upstream base.*advanced/);
+    expect(hitlComment).not.toMatch(/VA-417/);
+    expect(hitlComment).toMatch(/Review was APPROVED before the rebase/);
   });
 });
 

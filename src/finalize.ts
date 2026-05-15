@@ -22,11 +22,21 @@ export interface FinalizeDeps {
  *
  *   opened          — branch pushed, PR opened, Linear transitioned.
  *   rebase-conflict — review APPROVED but the post-review rebase onto
- *                     the latest `origin/<baseBranch>` produced
- *                     conflicts. The pre-rebase state has been
- *                     restored via `git rebase --abort`; the orchestrator
- *                     should route to HITL with the conflicted-file
- *                     list. PR is NOT opened.
+ *                     the latest `origin/<baseBranch>` produced real
+ *                     merge conflicts (unmerged files reported by
+ *                     `git diff --name-only --diff-filter=U`). The
+ *                     pre-rebase state has been restored via
+ *                     `git rebase --abort`; the orchestrator routes
+ *                     to HITL with the conflicted-file list.
+ *   rebase-failure  — review APPROVED but the post-review rebase
+ *                     exited non-zero with no unmerged files. The
+ *                     rebase failed for a non-conflict reason (dirty
+ *                     host worktree, signing hook, lock contention,
+ *                     etc.); stderr/stdout are captured for the
+ *                     operator. PR is NOT opened.
+ *
+ * VA-424: the two non-ok outcomes are distinct so the HITL diagnostic
+ * names the real cause instead of always claiming "upstream advanced".
  */
 export type FinalizeOutcome =
   | {
@@ -40,6 +50,13 @@ export type FinalizeOutcome =
       readonly conflictedFiles: readonly string[];
       /** Reviewer's verdict line, surfaced in the HITL comment so the
        *  operator knows the diff was APPROVED before the conflict. */
+      readonly reviewVerdict: string;
+    }
+  | {
+      readonly kind: "rebase-failure";
+      readonly baseBranch: string;
+      readonly stderr: string;
+      readonly stdout: string;
       readonly reviewVerdict: string;
     };
 
@@ -73,6 +90,15 @@ export const finalize = (
         reviewVerdict: "REVIEW: APPROVED",
       };
     }
+    if (rebase.kind === "failure") {
+      return {
+        kind: "rebase-failure",
+        baseBranch,
+        stderr: rebase.stderr,
+        stdout: rebase.stdout,
+        reviewVerdict: "REVIEW: APPROVED",
+      };
+    }
 
     yield* github.pushBranch(cwd, branch).pipe(Effect.withSpan("pushBranch"));
     const prBody = buildPrBody(issue);
@@ -91,26 +117,67 @@ export const finalize = (
   });
 
 /**
- * VA-419: format the HITL message body for a rebase-conflict outcome.
- * Names the base branch and the conflicted file list, and quotes the
- * reviewer's APPROVED verdict so the operator knows the agent's diff
- * was good before the conflict surfaced.
+ * VA-419 / VA-424: format the HITL message body for a rebase-conflict
+ * outcome. Names the base branch and the conflicted file list, and
+ * quotes the reviewer's APPROVED verdict so the operator knows the
+ * agent's diff was good before the conflict surfaced. VA-424 drops
+ * the "let VA-417 handle it on the next drain" suggestion — VA-417
+ * hard-resets the agent branch, which would destroy the approved
+ * work. Operator must reconcile manually.
  */
 export function formatRebaseConflictReason(args: {
   readonly baseBranch: string;
   readonly conflictedFiles: readonly string[];
   readonly reviewVerdict: string;
 }): string {
-  const fileLines = args.conflictedFiles.length
-    ? args.conflictedFiles.map((f) => `  - ${f}`).join("\n")
-    : "  (no conflicted files reported by git — inspect manually)";
+  const fileLines = args.conflictedFiles
+    .map((f) => `  - ${f}`)
+    .join("\n");
   return [
-    `Upstream base \`${args.baseBranch}\` advanced during this drain; the rebase`,
-    "onto the latest base produced conflicts in:",
+    `Rebase of the agent branch onto \`origin/${args.baseBranch}\` produced merge`,
+    "conflicts in:",
     fileLines,
     `Review was APPROVED before the rebase (\`${args.reviewVerdict}\`); the agent's diff`,
-    "is good but needs operator reconciliation against the new base. Re-run runway",
-    "after rebasing manually, or let VA-417 handle it on the next drain.",
+    "is good but needs operator reconciliation against the new base. Rebase the",
+    "agent branch manually and re-open the PR — do NOT let the next drain reset",
+    "this branch (that would discard the approved work).",
+  ].join("\n");
+}
+
+/**
+ * VA-424: format the HITL message body for a rebase-failure outcome
+ * (rebase exited non-zero but git reported no unmerged files —
+ * something other than a real merge conflict broke it). Surfaces
+ * git's stderr/stdout so the operator can diagnose, and explicitly
+ * does NOT recommend VA-417 (which would destroy the approved work).
+ */
+export function formatRebaseFailureReason(args: {
+  readonly baseBranch: string;
+  readonly stderr: string;
+  readonly stdout: string;
+  readonly reviewVerdict: string;
+}): string {
+  const trimmedStderr = args.stderr.trim();
+  const trimmedStdout = args.stdout.trim();
+  const diagnostic =
+    trimmedStderr.length > 0
+      ? trimmedStderr
+      : trimmedStdout.length > 0
+        ? trimmedStdout
+        : "(git produced no stderr or stdout output)";
+  const diagnosticBlock = diagnostic
+    .split("\n")
+    .map((line) => `  ${line}`)
+    .join("\n");
+  return [
+    `Rebase of the agent branch onto \`origin/${args.baseBranch}\` failed without`,
+    "producing merge conflicts (git reported no unmerged files). Diagnostic from",
+    "git:",
+    diagnosticBlock,
+    `Review was APPROVED before the rebase (\`${args.reviewVerdict}\`); the agent's diff`,
+    "is good. Investigate the underlying cause, rebase the agent branch manually",
+    "if appropriate, and re-open the PR — do NOT let the next drain reset this",
+    "branch (that would discard the approved work).",
   ].join("\n");
 }
 
