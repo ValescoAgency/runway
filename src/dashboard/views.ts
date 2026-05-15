@@ -1,4 +1,5 @@
 import type {
+  ActiveDrain,
   LinearSnapshotRow,
   PhaseSpan,
   StoredAgentIteration,
@@ -58,6 +59,14 @@ export interface ListViewModel {
   readonly todoQueue: readonly LinearSnapshotRow[];
   /** Latest Linear snapshot keyed by issue_identifier. Empty when sync disabled. */
   readonly snapshotsByIdentifier: ReadonlyMap<string, LinearSnapshotRow>;
+  /**
+   * VA-391: present when an in-flight drain is running, null when the
+   * dashboard is idle. The drain summary strip renders one or the
+   * other based on this field; null is the explicit "idle" signal.
+   * Pre-VA-391 callers (legacy tests passing a bare row array) get
+   * the idle state by default.
+   */
+  readonly activeDrain?: ActiveDrain | null;
 }
 
 export function renderListView(input: ListViewModel | readonly StoredIssueProcess[]): string {
@@ -67,25 +76,47 @@ export function renderListView(input: ListViewModel | readonly StoredIssueProces
         linearEnabled: false,
         todoQueue: [],
         snapshotsByIdentifier: new Map(),
+        activeDrain: null,
       }
     : (input as ListViewModel);
 
-  const tableBody =
-    vm.rows.length === 0
-      ? `<tr><td colspan="4" class="empty">No issue processes yet. Run <code>runway run</code> with <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> pointing here to populate.</td></tr>`
-      : vm.rows.map((r) => renderRow(r, vm.snapshotsByIdentifier)).join("");
+  const tableBody = renderIssueProcessRows({
+    rows: vm.rows,
+    linearEnabled: vm.linearEnabled,
+    snapshotsByIdentifier: vm.snapshotsByIdentifier,
+  });
 
   const queueSection = vm.linearEnabled ? renderTodoQueue(vm.todoQueue) : "";
+  // VA-391: drain summary strip renders ABOVE the queue + run list
+  // so the operator sees in-flight progress at the top of the page.
+  const drainStrip = renderDrainStrip(vm.activeDrain ?? null);
 
+  // VA-391: htmx + sse extension are loaded once at the top of the
+  // page. Polling on the rows tbody refreshes the recent-runs section
+  // every 3s without rerendering the queue preview or drain strip.
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <title>runway dashboard</title>
-  <style>${SHARED_STYLE}</style>
+  <style>${SHARED_STYLE}
+    .drain-strip { padding: 8px 12px; margin: 0 0 16px;
+                   border: 1px solid #2a2a2e; border-radius: 4px;
+                   font-size: 12px; display: flex; align-items: center;
+                   gap: 12px; flex-wrap: wrap; }
+    .drain-strip.active { border-color: #60a5fa; background: #0c1a30; }
+    .drain-strip.idle   { color: #9ca3af; }
+    .drain-strip .strip-label { color: #9ca3af; }
+    .drain-strip .strip-counter { color: #d4d4d8; }
+    .drain-strip .strip-counter strong { color: #e5e5e5; }
+    .drain-strip .counter-hitl   strong { color: #facc15; }
+    .drain-strip .counter-err    strong { color: #f87171; }
+  </style>
+  <script src="https://unpkg.com/htmx.org@1.9.12" integrity="sha384-ujb1lZYygJmzgSwoxRggbCHcjc0rB2XoQrxeTUQyRjrOnlCoYta87iKBWq3EsdM2" crossorigin="anonymous"></script>
 </head>
 <body>
   <h1>runway · issue processes</h1>
+  ${drainStrip}
   ${queueSection}
   <h2>Recent runs</h2>
   <table>
@@ -97,10 +128,58 @@ export function renderListView(input: ListViewModel | readonly StoredIssueProces
         <th>Seen at</th>
       </tr>
     </thead>
-    <tbody>${tableBody}</tbody>
+    <tbody id="issue-process-rows"
+           hx-get="/issue-processes"
+           hx-trigger="every 3s"
+           hx-swap="innerHTML">${tableBody}</tbody>
   </table>
 </body>
 </html>`;
+}
+
+/**
+ * VA-391: drain summary strip. Renders the in-flight drain's progress
+ * when one is active; otherwise emits the explicit "Idle" indicator
+ * so the operator can tell at a glance that no drain is running.
+ */
+function renderDrainStrip(active: ActiveDrain | null): string {
+  if (!active) {
+    return `<div class="drain-strip idle">Idle — no active drain</div>`;
+  }
+  const startedAt = formatTimestamp(parseNs(active.startedAtUnixNano));
+  // The AC's "X/N issues" phrasing maps to current/expected. The
+  // expected count isn't knowable without a drain-attempts signal,
+  // so we report "completed-so-far of total-issued"; both are
+  // tracked, and once the drain ends they collapse to N/N. The
+  // wording stays close to the AC's spelling.
+  const completed =
+    active.openedCount + active.hitlCount + active.erroredCount;
+  return `<div class="drain-strip active">
+    <span class="strip-label">Drain started</span>
+    <span>${escapeHtml(startedAt)}</span>
+    <span class="strip-counter"><strong>${completed}</strong>/<strong>${active.issueCount}</strong> issues</span>
+    <span class="strip-counter counter-hitl"><strong>${active.hitlCount}</strong> HITL</span>
+    <span class="strip-counter counter-err"><strong>${active.erroredCount}</strong> errors</span>
+  </div>`;
+}
+
+/**
+ * VA-391: tbody fragment for the issue-processes table. Used by the
+ * htmx-polled fragment endpoint (`GET /issue-processes`) and as the
+ * initial render inside the full list page — keeps the polling /
+ * static render symmetric.
+ */
+export function renderIssueProcessRows(input: {
+  readonly rows: readonly StoredIssueProcess[];
+  readonly linearEnabled: boolean;
+  readonly snapshotsByIdentifier: ReadonlyMap<string, LinearSnapshotRow>;
+}): string {
+  if (input.rows.length === 0) {
+    return `<tr><td colspan="4" class="empty">No issue processes yet. Run <code>runway run</code> with <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> pointing here to populate.</td></tr>`;
+  }
+  return input.rows
+    .map((r) => renderRow(r, input.snapshotsByIdentifier))
+    .join("");
 }
 
 /**
@@ -219,11 +298,18 @@ export function renderDetailView(vm: DetailViewModel): string {
     ? `<div><span class="label">HITL reason:</span><span class="detail">${escapeHtml(ip.hitlReason)}</span></div>`
     : "";
 
+  // VA-391: SSE stream URL is the detail page URL + `/stream`. The
+  // htmx sse extension auto-connects on page load and dispatches
+  // named events that `sse-swap` consumes.
+  const streamUrl = `/issue-processes/${encodeURIComponent(ip.spanId)}/stream`;
+
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <title>${escapeHtml(ip.issueIdentifier)} · runway dashboard</title>
+  <script src="https://unpkg.com/htmx.org@1.9.12" integrity="sha384-ujb1lZYygJmzgSwoxRggbCHcjc0rB2XoQrxeTUQyRjrOnlCoYta87iKBWq3EsdM2" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/htmx-ext-sse@2.2.2/sse.js" crossorigin="anonymous"></script>
   <style>${SHARED_STYLE}
     .breadcrumb { color: #9ca3af; margin-bottom: 16px; font-size: 12px; }
     .title { font-size: 14px; color: #d4d4d8; margin: -8px 0 12px; }
@@ -245,6 +331,7 @@ export function renderDetailView(vm: DetailViewModel): string {
     .iter-status-blocked  { color: #f87171; }
     .iter-status-continue { color: #facc15; }
     .iter-status-missing  { color: #9ca3af; }
+    .logs-pane { margin-top: 8px; }
     .logs { font-size: 12px; }
     .logs td { vertical-align: top; }
     .logs td.log-ts { color: #9ca3af; white-space: nowrap; }
@@ -274,7 +361,11 @@ export function renderDetailView(vm: DetailViewModel): string {
   <h2>Phase timeline</h2>
   ${phaseTimeline}
   ${phaseTable}
-  ${logsSection}
+  <div hx-ext="sse" sse-connect="${escapeHtml(streamUrl)}">
+    <div class="logs-pane" sse-swap="logsRefresh">
+      ${logsSection}
+    </div>
+  </div>
 </body>
 </html>`;
 }
@@ -286,8 +377,12 @@ export function renderDetailView(vm: DetailViewModel): string {
  * a `key=value` line. Section is omitted entirely when there are no
  * records — keeps the page clean for old issue processes that
  * predate the OTLP logs pipeline.
+ *
+ * VA-391 also re-uses this for SSE log refreshes — the `logsRefresh`
+ * frame body is the full section HTML, and htmx's `sse-swap` replaces
+ * the surrounding pane's children with it.
  */
-function renderLogsSection(logs: readonly StoredLogRecord[]): string {
+export function renderLogsSection(logs: readonly StoredLogRecord[]): string {
   if (logs.length === 0) return "";
   const rows = logs.map(renderLogRow).join("");
   return `

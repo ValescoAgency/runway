@@ -102,6 +102,26 @@ export interface StoredLogRecord extends LogRecordRow {
   readonly insertedAt: string;
 }
 
+/**
+ * VA-391: snapshot of an in-flight drain, computed from `issue_processes`
+ * rows whose parent drain hasn't ended yet (the OTel SDK emits span
+ * rows on end; an "unfinished drainQueue span" therefore means a
+ * trace with one or more issue_processes but no corresponding row
+ * in `drains`).
+ *
+ * `startedAtUnixNano` is the earliest issue_process start in the
+ * drain — close-enough to "drain start" for the dashboard's clock.
+ * The four counters reflect the rows landed so far for that drain.
+ */
+export interface ActiveDrain {
+  readonly traceId: string;
+  readonly startedAtUnixNano: string;
+  readonly issueCount: number;
+  readonly openedCount: number;
+  readonly hitlCount: number;
+  readonly erroredCount: number;
+}
+
 export interface Storage {
   saveDrain(d: DrainRow): void;
   saveIssueProcess(p: IssueProcessRow): void;
@@ -200,6 +220,15 @@ export interface Storage {
    * pagination.
    */
   streamLogsFor(traceId: string): readonly StoredLogRecord[];
+  /**
+   * VA-391: return the currently in-flight drain, or null when no
+   * drain is active. "Active" = a trace_id has issue_processes
+   * rows but no `drains` row (the parent drain span hasn't ended
+   * yet). When multiple traces match (parallel drains aren't
+   * supported in v1 but the SQL doesn't care), the most-recently-
+   * started one wins.
+   */
+  getActiveDrain(): ActiveDrain | null;
   close(): void;
 }
 
@@ -622,6 +651,35 @@ export function createStorage(
     FROM linear_snapshots
   `);
 
+  // VA-391: "active drain" = a trace_id with one or more
+  // issue_processes rows but no row in `drains`. The drain span
+  // hasn't been emitted yet (BatchSpanProcessor flushes on end), so
+  // we infer in-flight by the absence of the parent. Earliest
+  // start_time across the trace's issue_processes is the drain
+  // start; the counters slice by outcome_kind. LIMIT 1 picks the
+  // most-recently-started in-flight drain — v1 only runs one drain
+  // at a time but the SQL is robust to a future parallel mode.
+  const getActiveDrainStmt = db.prepare(`
+    WITH active AS (
+      SELECT trace_id
+      FROM issue_processes
+      WHERE trace_id NOT IN (SELECT trace_id FROM drains)
+      GROUP BY trace_id
+      ORDER BY MIN(CAST(start_time_unix_nano AS INTEGER)) DESC
+      LIMIT 1
+    )
+    SELECT
+      ip.trace_id,
+      MIN(ip.start_time_unix_nano) AS started_at_unix_nano,
+      COUNT(*) AS issue_count,
+      SUM(CASE WHEN ip.outcome_kind = 'opened'  THEN 1 ELSE 0 END) AS opened_count,
+      SUM(CASE WHEN ip.outcome_kind = 'hitl'    THEN 1 ELSE 0 END) AS hitl_count,
+      SUM(CASE WHEN ip.outcome_kind = 'errored' THEN 1 ELSE 0 END) AS errored_count
+    FROM issue_processes ip
+    WHERE ip.trace_id = (SELECT trace_id FROM active)
+    GROUP BY ip.trace_id
+  `);
+
   const insertLogRecord = db.prepare(`
     INSERT INTO log_records (
       trace_id, span_id, timestamp_unix_nano, level, message, attributes_json
@@ -812,6 +870,19 @@ export function createStorage(
   const streamLogsFor = (traceId: string): readonly StoredLogRecord[] =>
     listLogsByTrace.all(traceId).map(rowToLogRecord);
 
+  const getActiveDrain = (): ActiveDrain | null => {
+    const row = getActiveDrainStmt.get() as Record<string, unknown> | undefined;
+    if (!row || row.trace_id == null) return null;
+    return {
+      traceId: String(row.trace_id ?? ""),
+      startedAtUnixNano: String(row.started_at_unix_nano ?? ""),
+      issueCount: Number(row.issue_count ?? 0),
+      openedCount: Number(row.opened_count ?? 0),
+      hitlCount: Number(row.hitl_count ?? 0),
+      erroredCount: Number(row.errored_count ?? 0),
+    };
+  };
+
   const close = (): void => {
     db.close();
   };
@@ -833,6 +904,7 @@ export function createStorage(
     listLinearSnapshots,
     appendLogRecord,
     streamLogsFor,
+    getActiveDrain,
     close,
   };
 }

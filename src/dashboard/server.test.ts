@@ -550,3 +550,176 @@ describe("dashboard HTTP server — POST /v1/logs (VA-388)", () => {
     expect(res.status).toBe(400);
   });
 });
+
+describe("dashboard HTTP server — list-view fragment & SSE (VA-391)", () => {
+  it("GET /issue-processes returns just the tbody fragment (no <html>)", async () => {
+    await fetch(`${base}/v1/traces`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(sampleTracesPayload),
+    });
+
+    const res = await fetch(`${base}/issue-processes`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/html");
+    const html = await res.text();
+    // Fragment, not a full document — the polling tbody swap relies
+    // on no surrounding <html> / <body> tags.
+    expect(html).not.toContain("<html");
+    expect(html).not.toContain("<body");
+    expect(html).toContain("<tr");
+    expect(html).toContain("VA-312");
+  });
+
+  it("SSE stream returns 404 when the issue process span_id doesn't resolve", async () => {
+    const res = await fetch(`${base}/issue-processes/does-not-exist/stream`);
+    expect(res.status).toBe(404);
+  });
+
+  it("SSE stream live-tails a new log record as a logsRefresh frame", async () => {
+    // First land the issue_processes row so the SSE handler can
+    // resolve the span_id to a trace_id.
+    await fetch(`${base}/v1/traces`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(sampleTracesPayload),
+    });
+
+    const controller = new AbortController();
+    const streamRes = await fetch(
+      `${base}/issue-processes/2222222222222222/stream`,
+      { signal: controller.signal },
+    );
+    expect(streamRes.status).toBe(200);
+    expect(streamRes.headers.get("content-type")).toContain("text/event-stream");
+
+    const reader = streamRes.body!.getReader();
+    const decoder = new TextDecoder();
+    // Drain the initial open frame so we don't conflate it with the
+    // post-publish frame.
+    await reader.read();
+
+    // Publish a log on the same trace_id — should arrive as an SSE
+    // logsRefresh frame containing the rendered Logs section.
+    await fetch(`${base}/v1/logs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(sampleLogsPayload),
+    });
+
+    // Read until we see a logsRefresh event or time out. The bus
+    // delivers synchronously after the POST resolves, so this read
+    // is bounded.
+    let buf = "";
+    for (let i = 0; i < 5; i++) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      if (buf.includes("event: logsRefresh")) break;
+    }
+
+    expect(buf).toContain("event: logsRefresh");
+    // The frame body is the rendered Logs section HTML — both posted
+    // log lines should appear.
+    expect(buf).toContain("Runway picked up VA-388");
+    expect(buf).toContain("review rejected, retrying");
+
+    controller.abort();
+  });
+
+  it("the SSE handler unsubscribes when the client closes the connection", async () => {
+    const { createEventBus } = await import("./events.js");
+    const events = createEventBus();
+    // Replace the running server with one wired to the custom bus
+    // so we can observe subscriberCount before/after.
+    await running.close();
+    storage = createStorage(":memory:");
+    running = await startServer({
+      storage,
+      port: 0,
+      host: "127.0.0.1",
+      events,
+    });
+    base = `http://127.0.0.1:${running.port}`;
+
+    await fetch(`${base}/v1/traces`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(sampleTracesPayload),
+    });
+
+    expect(events.subscriberCount()).toBe(0);
+
+    const controller = new AbortController();
+    const streamRes = await fetch(
+      `${base}/issue-processes/2222222222222222/stream`,
+      { signal: controller.signal },
+    );
+    // Drain the initial frame so the subscribe definitely fired.
+    await streamRes.body!.getReader().read();
+    expect(events.subscriberCount()).toBe(1);
+
+    controller.abort();
+    // Wait a tick for the server's "close" handler to run.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(events.subscriberCount()).toBe(0);
+  });
+
+  it("renders the drain summary strip on / when an in-flight drain exists", async () => {
+    // Post an issue_processes WITHOUT its parent drain → the
+    // storage layer treats this as in-flight.
+    const partial = {
+      resourceSpans: [
+        {
+          scopeSpans: [
+            {
+              spans: [
+                {
+                  traceId: "ffffffffffffffffffffffffffffffff",
+                  spanId: "ff11111111111111",
+                  parentSpanId: "ff00000000000000",
+                  name: "processIssue",
+                  startTimeUnixNano: "1715000010000000000",
+                  endTimeUnixNano: "1715000011000000000",
+                  attributes: [
+                    {
+                      key: "runway.issue.identifier",
+                      value: { stringValue: "VA-IN-FLIGHT" },
+                    },
+                    {
+                      key: "runway.outcome.kind",
+                      value: { stringValue: "opened" },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    await fetch(`${base}/v1/traces`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(partial),
+    });
+
+    const res = await fetch(`${base}/`);
+    const html = await res.text();
+    expect(html).toContain("Drain started");
+    // counters render with surrounding <strong> tags for visual
+    // hierarchy — assert on the markup so a future restyling doesn't
+    // silently lose the counts.
+    expect(html).toMatch(/<strong>1<\/strong>\/<strong>1<\/strong> issues/);
+    expect(html).toContain("<strong>0</strong> HITL");
+    expect(html).toContain("<strong>0</strong> errors");
+    expect(html).not.toContain("Idle — no active drain");
+  });
+
+  it("renders the Idle indicator on / when no drain is active", async () => {
+    const res = await fetch(`${base}/`);
+    const html = await res.text();
+    expect(html).toContain("Idle — no active drain");
+    expect(html).not.toContain("Drain started");
+  });
+});

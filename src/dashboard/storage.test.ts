@@ -934,3 +934,94 @@ describe("createStorage — appendLogRecord / streamLogsFor (VA-388)", () => {
     expect(rows[0]?.attributes).toEqual({});
   });
 });
+
+describe("createStorage — getActiveDrain (VA-391)", () => {
+  it("returns null when no issue processes have landed yet", () => {
+    expect(storage.getActiveDrain()).toBeNull();
+  });
+
+  it("returns null once the drain ends (drains row landed for the same trace_id)", () => {
+    storage.saveIssueProcess(
+      makeIssueProcess({ traceId: "trace-A", outcomeKind: "opened" }),
+    );
+    expect(storage.getActiveDrain()).not.toBeNull();
+
+    storage.saveDrain(makeDrain({ traceId: "trace-A" }));
+    expect(storage.getActiveDrain()).toBeNull();
+  });
+
+  it("surfaces the in-flight drain's start time + per-outcome counters", () => {
+    storage.saveIssueProcess(
+      makeIssueProcess({
+        traceId: "trace-A",
+        spanId: "ip-1",
+        outcomeKind: "opened",
+        startTimeUnixNano: "1715000000100000000",
+      }),
+    );
+    storage.saveIssueProcess(
+      makeIssueProcess({
+        traceId: "trace-A",
+        spanId: "ip-2",
+        outcomeKind: "hitl",
+        startTimeUnixNano: "1715000000300000000",
+      }),
+    );
+    storage.saveIssueProcess(
+      makeIssueProcess({
+        traceId: "trace-A",
+        spanId: "ip-3",
+        outcomeKind: "errored",
+        startTimeUnixNano: "1715000000500000000",
+      }),
+    );
+
+    expect(storage.getActiveDrain()).toEqual({
+      traceId: "trace-A",
+      // Earliest start across the three issue processes.
+      startedAtUnixNano: "1715000000100000000",
+      issueCount: 3,
+      openedCount: 1,
+      hitlCount: 1,
+      erroredCount: 1,
+    });
+  });
+
+  it("picks the most-recently-started in-flight drain when several traces are active", () => {
+    storage.saveIssueProcess(
+      makeIssueProcess({
+        traceId: "trace-older",
+        spanId: "ip-old",
+        outcomeKind: "opened",
+        startTimeUnixNano: "1715000000100000000",
+      }),
+    );
+    storage.saveIssueProcess(
+      makeIssueProcess({
+        traceId: "trace-newer",
+        spanId: "ip-new",
+        outcomeKind: "opened",
+        startTimeUnixNano: "1715000999900000000",
+      }),
+    );
+
+    expect(storage.getActiveDrain()?.traceId).toBe("trace-newer");
+  });
+
+  it("ignores traces whose drains row already landed (treats them as finished)", () => {
+    storage.saveIssueProcess(
+      makeIssueProcess({ traceId: "trace-finished", outcomeKind: "opened" }),
+    );
+    storage.saveDrain(makeDrain({ traceId: "trace-finished" }));
+    storage.saveIssueProcess(
+      makeIssueProcess({
+        traceId: "trace-running",
+        spanId: "ip-running",
+        outcomeKind: "opened",
+        startTimeUnixNano: "1715000111100000000",
+      }),
+    );
+
+    expect(storage.getActiveDrain()?.traceId).toBe("trace-running");
+  });
+});
