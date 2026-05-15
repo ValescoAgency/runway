@@ -3,6 +3,7 @@ import type {
   AgentIterationRow,
   DrainRow,
   IssueProcessRow,
+  LogRecordRow,
   RawSpanRow,
 } from "./projector.js";
 
@@ -90,6 +91,17 @@ export interface LinearSnapshotRow {
   readonly queuePosition: number | null;
 }
 
+/**
+ * VA-388: row shape returned by `streamLogsFor`. Mirrors `LogRecordRow`
+ * (the projector's input shape) plus an `insertedAt` audit timestamp.
+ * The dashboard surfaces `level` + `message` + `attributes` in the
+ * detail-pane Logs section; the trace_id / span_id pair is what
+ * correlates a log record to an issue process row.
+ */
+export interface StoredLogRecord extends LogRecordRow {
+  readonly insertedAt: string;
+}
+
 export interface Storage {
   saveDrain(d: DrainRow): void;
   saveIssueProcess(p: IssueProcessRow): void;
@@ -168,6 +180,26 @@ export interface Storage {
    * an N+1 round-trip.
    */
   listLinearSnapshots(): readonly LinearSnapshotRow[];
+  /**
+   * VA-388: append a single log record. The (trace_id, span_id,
+   * timestamp_unix_nano) triple is the PK — OTLP delivery is
+   * at-least-once, so an exporter retry on a flush would otherwise
+   * double-insert. Last writer wins on a duplicate.
+   */
+  appendLogRecord(r: LogRecordRow): void;
+  /**
+   * VA-388: log records for a given trace_id, ordered ascending by
+   * `timestamp_unix_nano` (the SDK-supplied time, not the receive
+   * time) so a Logs section reads chronologically even if records
+   * arrived out of order. The detail pane filters this set in JS
+   * (cheap — a single drain's log records are bounded).
+   *
+   * Despite the name "stream", this is a synchronous list read; the
+   * verb matches VA-388's AC and signals "everything for this trace,
+   * not just one span" without the dashboard having to spell out
+   * pagination.
+   */
+  streamLogsFor(traceId: string): readonly StoredLogRecord[];
   close(): void;
 }
 
@@ -264,6 +296,20 @@ const SCHEMA = `
 
   CREATE INDEX IF NOT EXISTS idx_linear_snapshots_queue_position
     ON linear_snapshots(queue_position);
+
+  CREATE TABLE IF NOT EXISTS log_records (
+    trace_id TEXT NOT NULL,
+    span_id TEXT NOT NULL,
+    timestamp_unix_nano TEXT NOT NULL,
+    level TEXT NOT NULL,
+    message TEXT NOT NULL,
+    attributes_json TEXT,
+    inserted_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (trace_id, span_id, timestamp_unix_nano)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_log_records_trace_timestamp
+    ON log_records(trace_id, timestamp_unix_nano);
 `;
 
 const DEFAULT_AGGREGATE_WINDOW = 30;
@@ -576,6 +622,29 @@ export function createStorage(
     FROM linear_snapshots
   `);
 
+  const insertLogRecord = db.prepare(`
+    INSERT INTO log_records (
+      trace_id, span_id, timestamp_unix_nano, level, message, attributes_json
+    ) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT (trace_id, span_id, timestamp_unix_nano) DO UPDATE SET
+      level = excluded.level,
+      message = excluded.message,
+      attributes_json = excluded.attributes_json
+  `);
+
+  // VA-388: order by SDK-supplied timestamp (CAST to INTEGER so the
+  // string-encoded int64 sorts numerically, not lexically) — exporter
+  // retries can re-deliver out of order but the operator should see
+  // chronological output.
+  const listLogsByTrace = db.prepare(`
+    SELECT
+      trace_id, span_id, timestamp_unix_nano, level, message,
+      attributes_json, inserted_at
+    FROM log_records
+    WHERE trace_id = ?
+    ORDER BY CAST(timestamp_unix_nano AS INTEGER) ASC, span_id ASC
+  `);
+
   const saveDrain = (d: DrainRow): void => {
     insertDrain.run(
       d.traceId,
@@ -724,6 +793,25 @@ export function createStorage(
   const listLinearSnapshots = (): readonly LinearSnapshotRow[] =>
     listAllSnapshotsStmt.all().map(rowToLinearSnapshot);
 
+  const appendLogRecord = (r: LogRecordRow): void => {
+    insertLogRecord.run(
+      r.traceId,
+      r.spanId,
+      r.timestampUnixNano,
+      r.level,
+      r.message,
+      // VA-388: attributes round-trip as a JSON object string. Same
+      // shape as `issue_labels` — an empty/absent attribute set
+      // becomes NULL so the column stays small for the common case.
+      Object.keys(r.attributes).length === 0
+        ? null
+        : JSON.stringify(r.attributes),
+    );
+  };
+
+  const streamLogsFor = (traceId: string): readonly StoredLogRecord[] =>
+    listLogsByTrace.all(traceId).map(rowToLogRecord);
+
   const close = (): void => {
     db.close();
   };
@@ -743,6 +831,8 @@ export function createStorage(
     clearLinearQueuePositions,
     listLinearTodoQueue,
     listLinearSnapshots,
+    appendLogRecord,
+    streamLogsFor,
     close,
   };
 }
@@ -842,6 +932,45 @@ function rowToLinearSnapshot(row: unknown): LinearSnapshotRow {
     labels: parseLabels(r.labels_json),
     queuePosition: nullableNum(r.queue_position),
   };
+}
+
+/**
+ * VA-388: decode a `log_records` row back into the projector shape +
+ * the audit `insertedAt`. `attributes_json` reverses the JSON-string
+ * encoding written by `appendLogRecord`; malformed / null payloads
+ * collapse to an empty record so callers can iterate without a
+ * null-guard.
+ */
+function rowToLogRecord(row: unknown): StoredLogRecord {
+  const r = row as Record<string, unknown>;
+  return {
+    traceId: String(r.trace_id ?? ""),
+    spanId: String(r.span_id ?? ""),
+    timestampUnixNano: String(r.timestamp_unix_nano ?? ""),
+    level: String(r.level ?? ""),
+    message: String(r.message ?? ""),
+    attributes: parseAttributes(r.attributes_json),
+    insertedAt: String(r.inserted_at ?? ""),
+  };
+}
+
+function parseAttributes(v: unknown): Record<string, string> {
+  if (v === null || v === undefined) return {};
+  if (typeof v !== "string") return {};
+  try {
+    const parsed = JSON.parse(v) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    const out: Record<string, string> = {};
+    for (const [k, val] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof val === "string") out[k] = val;
+      else if (val !== null && val !== undefined) out[k] = String(val);
+    }
+    return out;
+  } catch {
+    return {};
+  }
 }
 
 function rowToAggregate(row: unknown): EvaluatorAggregate {

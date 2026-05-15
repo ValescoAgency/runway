@@ -64,6 +64,44 @@ export interface OtlpTracesPayload {
   readonly resourceSpans: readonly OtlpResourceSpans[];
 }
 
+/**
+ * VA-388: OTLP HTTP/JSON wire types for logs. The shape mirrors traces
+ * (resource → scope → records) and the int64 fields again travel as
+ * strings per the proto3 JSON mapping. We model only the subset of
+ * `LogRecord` the dashboard reads: timestamp, severity, body (string),
+ * attributes, trace_id, span_id. Other fields (`observed_time_unix_nano`,
+ * `flags`, `severity_number`'s typed enum semantics) are accepted
+ * silently and ignored.
+ */
+export interface OtlpLogBody {
+  readonly stringValue?: string;
+}
+
+export interface OtlpLogRecord {
+  readonly timeUnixNano?: string;
+  readonly observedTimeUnixNano?: string;
+  readonly severityNumber?: number;
+  readonly severityText?: string;
+  readonly body?: OtlpLogBody;
+  readonly attributes?: readonly OtlpAttribute[];
+  readonly traceId?: string;
+  readonly spanId?: string;
+}
+
+export interface OtlpScopeLogs {
+  readonly scope?: OtlpScope;
+  readonly logRecords: readonly OtlpLogRecord[];
+}
+
+export interface OtlpResourceLogs {
+  readonly resource?: OtlpResource;
+  readonly scopeLogs: readonly OtlpScopeLogs[];
+}
+
+export interface OtlpLogsPayload {
+  readonly resourceLogs: readonly OtlpResourceLogs[];
+}
+
 export type AttrScalar = string | number | boolean | readonly string[];
 
 /**

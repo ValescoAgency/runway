@@ -1,26 +1,37 @@
-import { NodeSdk } from "@effect/opentelemetry";
+import { Logger as OtelLogger, NodeSdk } from "@effect/opentelemetry";
+import { OTLPLogExporter } from "@opentelemetry/exporter-logs-otlp-http";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
+import { BatchLogRecordProcessor } from "@opentelemetry/sdk-logs";
 import { BatchSpanProcessor } from "@opentelemetry/sdk-trace-base";
 import { Layer } from "effect";
 
 /**
- * VA-358: OpenTelemetry tracer for the orchestrator.
+ * VA-358 + VA-388: OpenTelemetry telemetry layer for the orchestrator.
  *
- * Env-conditional: only wires the OTLP HTTP exporter when
- * `OTEL_EXPORTER_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`)
- * is set. Otherwise we provide `NodeSdk.layerEmpty` — `Effect.withSpan`
- * still works in the program but the resulting spans get dropped on the
- * floor rather than spamming the network. Dev-mode default: no traces,
- * no warnings.
+ * Env-conditional: only wires the OTLP HTTP exporters when
+ * `OTEL_EXPORTER_OTLP_ENDPOINT` (or one of the signal-specific
+ * `_TRACES_ENDPOINT` / `_LOGS_ENDPOINT` overrides) is set. Otherwise
+ * we provide `NodeSdk.layerEmpty` — `Effect.withSpan` and
+ * `Effect.logInfo` still work in the program but the resulting spans
+ * and log records are dropped on the floor rather than spamming the
+ * network. Dev-mode default: no traces, no logs, no warnings.
  *
- * Standard OpenTelemetry env vars apply (the exporter reads them
- * itself): `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`,
+ * VA-388 also bridges Effect's `Logger` to the OTLP logs path. With
+ * `OtelLogger.layerLoggerReplace` provided downstream of the configured
+ * SDK, every existing `Effect.logInfo` / `logWarning` / `logError`
+ * call emits an OTel log record — annotated context (e.g.
+ * `Effect.annotateLogs({ issue, branch })`) flows as log-record
+ * attributes without changes at the call sites.
+ *
+ * Standard OpenTelemetry env vars apply (the exporters read them
+ * themselves): `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`,
  * `OTEL_SERVICE_NAME`, etc.
  */
-const isTracingEnabled = (): boolean => {
+const isTelemetryEnabled = (): boolean => {
   return Boolean(
     process.env.OTEL_EXPORTER_OTLP_ENDPOINT ||
-      process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+      process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT ||
+      process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT,
   );
 };
 
@@ -30,8 +41,29 @@ const liveLayer = NodeSdk.layer(() => ({
     serviceVersion: process.env.RUNWAY_VERSION,
   },
   spanProcessor: new BatchSpanProcessor(new OTLPTraceExporter()),
+  // VA-388: pair the trace SDK with a logs SDK so Effect's logger can
+  // emit through the OtelLoggerProvider context that `NodeSdk.layer`
+  // builds. `OTLPLogExporter` defaults to the same endpoint family as
+  // the trace exporter (reading `OTEL_EXPORTER_OTLP_ENDPOINT` and the
+  // `_LOGS_ENDPOINT` override), so a single env var lights up both
+  // paths.
+  logRecordProcessor: new BatchLogRecordProcessor(new OTLPLogExporter()),
 }));
 
-export const TelemetryLive: Layer.Layer<never, never, never> = isTracingEnabled()
-  ? (liveLayer as unknown as Layer.Layer<never, never, never>)
-  : (NodeSdk.layerEmpty as unknown as Layer.Layer<never, never, never>);
+// VA-388: replace Effect's default logger with one that fans out to
+// the OtelLoggerProvider built by `NodeSdk.layer`. Provided ON TOP of
+// `liveLayer` so the OtelLoggerProvider context is satisfied; without
+// the SDK behind it, this layer would fail to construct.
+const loggerLayer = Layer.provide(
+  OtelLogger.layerLoggerReplace,
+  liveLayer,
+);
+
+export const TelemetryLive: Layer.Layer<never, never, never> =
+  isTelemetryEnabled()
+    ? (Layer.merge(liveLayer, loggerLayer) as unknown as Layer.Layer<
+        never,
+        never,
+        never
+      >)
+    : (NodeSdk.layerEmpty as unknown as Layer.Layer<never, never, never>);

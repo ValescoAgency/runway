@@ -4,7 +4,7 @@ import {
   startLinearSync,
   type LinearSyncHandle,
 } from "./linear-sync.js";
-import { projectPayload } from "./projector.js";
+import { projectLogs, projectPayload } from "./projector.js";
 import {
   createStorage,
   type LinearSnapshotRow,
@@ -12,7 +12,7 @@ import {
   type StoredIssueProcess,
 } from "./storage.js";
 import { renderDetailView, renderListView } from "./views.js";
-import type { OtlpTracesPayload } from "./otlp.js";
+import type { OtlpLogsPayload, OtlpTracesPayload } from "./otlp.js";
 
 // VA-389: phase spans we surface on the detail page's timeline.
 // Anything else stays in raw_spans for debugging but isn't rendered.
@@ -138,6 +138,11 @@ async function handle(
     return;
   }
 
+  if (method === "POST" && url === "/v1/logs") {
+    await handleOtlpLogs(req, res, storage);
+    return;
+  }
+
   if (method === "GET" && (url === "/" || url.startsWith("/?"))) {
     handleListView(res, storage, linearEnabled);
     return;
@@ -227,6 +232,52 @@ async function handleOtlpTraces(
   res.end(JSON.stringify({ partialSuccess: {} }));
 }
 
+/**
+ * VA-388: OTLP HTTP/JSON logs receiver. Same content-type / body /
+ * success-envelope contract as `/v1/traces`; the projector hands back
+ * `LogRecordRow`s which we persist via `storage.appendLogRecord`. As
+ * with traces, retries (the SDK's BatchLogRecordProcessor will re-send
+ * on a transient failure) are idempotent — the PK is (trace_id,
+ * span_id, timestamp).
+ */
+async function handleOtlpLogs(
+  req: IncomingMessage,
+  res: ServerResponse,
+  storage: Storage,
+): Promise<void> {
+  const ct = (req.headers["content-type"] ?? "").toString().toLowerCase();
+  if (!ct.includes("application/json")) {
+    writeError(
+      res,
+      415,
+      "unsupported_media_type",
+      `expected application/json, got "${ct}"`,
+    );
+    return;
+  }
+
+  const body = await readBody(req);
+  if (body === undefined) {
+    writeError(res, 413, "payload_too_large", `body exceeds ${MAX_BODY_BYTES} bytes`);
+    return;
+  }
+
+  let payload: OtlpLogsPayload;
+  try {
+    payload = JSON.parse(body) as OtlpLogsPayload;
+  } catch (err) {
+    writeError(res, 400, "invalid_json", asMessage(err));
+    return;
+  }
+
+  for (const r of projectLogs(payload)) {
+    storage.appendLogRecord(r);
+  }
+
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end(JSON.stringify({ partialSuccess: {} }));
+}
+
 function handleListView(
   res: ServerResponse,
   storage: Storage,
@@ -307,10 +358,16 @@ function renderDetailFor(
   const phaseSpans = storage.listPhaseSpans(ip.traceId, ip.spanId, [
     ...DETAIL_PHASE_NAMES,
   ]);
+  // VA-388: log records for the same trace_id, regardless of which
+  // span emitted them. The view filters in JS to the records whose
+  // span chain falls under this issue process — bounded by a single
+  // drain, so the over-fetch is cheap.
+  const logs = storage.streamLogsFor(ip.traceId);
   const html = renderDetailView({
     issueProcess: ip,
     iterations,
     phaseSpans,
+    logs,
   });
   res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
   res.end(html);

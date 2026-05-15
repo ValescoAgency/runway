@@ -1,5 +1,8 @@
 import {
   attrMap,
+  type OtlpAttribute,
+  type OtlpLogRecord,
+  type OtlpLogsPayload,
   type OtlpResourceSpans,
   type OtlpSpan,
   type OtlpTracesPayload,
@@ -100,6 +103,31 @@ export interface AgentIterationRow {
   readonly endTimeUnixNano: string;
   readonly sandcastleRunId: string | null;
   readonly exitStatus: string | null;
+}
+
+/**
+ * VA-388: one row per Effect log record forwarded over OTLP. The
+ * `traceId` / `spanId` pair correlates the record back to the
+ * issue_process row that was active when the log emitted, so the
+ * detail pane can render the logs alongside that issue's phase
+ * timeline. `attributes` carries Effect's annotated log context
+ * (e.g. `{ issue: "VA-388", branch: "agent/va-388" }`) as a flat
+ * string→string map — non-string values are stringified at projection
+ * time so the storage column stays predictable.
+ */
+export interface LogRecordRow {
+  readonly traceId: string;
+  readonly spanId: string;
+  /** Int64 unix nanoseconds, kept as a string for precision. */
+  readonly timestampUnixNano: string;
+  /**
+   * Severity label as emitted by the SDK — `INFO`, `WARN`, `ERROR`, etc.
+   * Falls back to `severityNumber`'s OTel range when `severityText` is
+   * absent.
+   */
+  readonly level: string;
+  readonly message: string;
+  readonly attributes: Record<string, string>;
 }
 
 export interface Projection {
@@ -262,4 +290,76 @@ function strArrayAttr(
   v: string | number | boolean | readonly string[] | undefined,
 ): readonly string[] {
   return Array.isArray(v) ? (v as readonly string[]) : [];
+}
+
+/**
+ * VA-388: project an OTLP logs payload into `LogRecordRow`s. Records
+ * without a trace_id are dropped — every Effect log emitted under
+ * `Effect.withSpan` has one, so a missing value here means the record
+ * came from outside the orchestrator's traced path (e.g. a stray
+ * library log) and the dashboard has nowhere to show it.
+ *
+ * `timeUnixNano` falls back to `observedTimeUnixNano` when absent;
+ * either is enough for chronological ordering. Records that carry
+ * neither are dropped (we won't fabricate a timestamp).
+ */
+export function projectLogs(payload: OtlpLogsPayload): readonly LogRecordRow[] {
+  const out: LogRecordRow[] = [];
+  for (const rl of payload.resourceLogs ?? []) {
+    for (const sl of rl.scopeLogs ?? []) {
+      for (const rec of sl.logRecords ?? []) {
+        const row = projectLogRecord(rec);
+        if (row) out.push(row);
+      }
+    }
+  }
+  return out;
+}
+
+function projectLogRecord(rec: OtlpLogRecord): LogRecordRow | undefined {
+  const traceId = rec.traceId?.trim();
+  if (!traceId) return undefined;
+  const timestamp = rec.timeUnixNano ?? rec.observedTimeUnixNano;
+  if (!timestamp) return undefined;
+  return {
+    traceId,
+    spanId: rec.spanId ?? "",
+    timestampUnixNano: timestamp,
+    level: severityLabel(rec),
+    message: rec.body?.stringValue ?? "",
+    attributes: attributesToStringMap(rec.attributes),
+  };
+}
+
+/**
+ * OTel's `severityNumber` is a 1-24 enum; map it back to the standard
+ * coarse labels when `severityText` is absent. Effect's logger always
+ * sets `severityText` in practice, but the OTLP spec marks it optional
+ * so we don't rely on it.
+ */
+function severityLabel(rec: OtlpLogRecord): string {
+  if (rec.severityText) return rec.severityText.toUpperCase();
+  const n = rec.severityNumber ?? 0;
+  if (n >= 21) return "FATAL";
+  if (n >= 17) return "ERROR";
+  if (n >= 13) return "WARN";
+  if (n >= 9) return "INFO";
+  if (n >= 5) return "DEBUG";
+  if (n >= 1) return "TRACE";
+  return "UNSET";
+}
+
+function attributesToStringMap(
+  attrs: readonly OtlpAttribute[] | undefined,
+): Record<string, string> {
+  const m = attrMap(attrs);
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(m)) {
+    if (Array.isArray(v)) {
+      out[k] = v.join(", ");
+    } else {
+      out[k] = String(v);
+    }
+  }
+  return out;
 }
