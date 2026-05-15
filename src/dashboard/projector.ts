@@ -1,5 +1,8 @@
 import {
   attrMap,
+  type OtlpLogRecord,
+  type OtlpLogsPayload,
+  type OtlpResourceLogs,
   type OtlpResourceSpans,
   type OtlpSpan,
   type OtlpTracesPayload,
@@ -54,10 +57,30 @@ export interface RawSpanRow {
   readonly payload: string;
 }
 
+/**
+ * VA-388: one OTLP `LogRecord` flattened into the columns the storage
+ * layer needs. `timeUnixNano` round-trips as a string so int64
+ * timestamps never lose precision through `number`. `attributesJson`
+ * is the JSON-stringified attribute bag (so we don't have to re-parse
+ * OTLP wire variants on every read).
+ */
+export interface LogRecordRow {
+  readonly traceId: string;
+  readonly spanId: string;
+  readonly timeUnixNano: string;
+  readonly level: string;
+  readonly message: string;
+  readonly attributesJson: string;
+}
+
 export interface Projection {
   readonly drains: readonly DrainRow[];
   readonly issueProcesses: readonly IssueProcessRow[];
   readonly rawSpans: readonly RawSpanRow[];
+}
+
+export interface LogProjection {
+  readonly logs: readonly LogRecordRow[];
 }
 
 const DRAIN_SPAN = "drainQueue";
@@ -150,6 +173,84 @@ function projectIssueProcess(span: OtlpSpan): IssueProcessRow | undefined {
     statusCode: span.status?.code ?? null,
     statusMessage: span.status?.message ?? null,
   };
+}
+
+/**
+ * VA-388: project an OTLP logs payload into typed log rows. The
+ * Effect-side bridge (`@effect/opentelemetry`'s `layerLoggerAdd`)
+ * stamps the active span's `traceId`/`spanId` into every record; we
+ * pass those straight through to the storage row PK so the detail
+ * pane can render correlated logs without a join.
+ */
+export function projectLogsPayload(payload: OtlpLogsPayload): LogProjection {
+  const logs: LogRecordRow[] = [];
+  for (const rl of payload.resourceLogs ?? []) {
+    collectFromResourceLogs(rl, logs);
+  }
+  return { logs };
+}
+
+function collectFromResourceLogs(
+  rl: OtlpResourceLogs,
+  out: LogRecordRow[],
+): void {
+  for (const sl of rl.scopeLogs ?? []) {
+    for (const record of sl.logRecords ?? []) {
+      out.push(projectLogRecord(record));
+    }
+  }
+}
+
+function projectLogRecord(rec: OtlpLogRecord): LogRecordRow {
+  const attrs = attrMap(rec.attributes);
+  const ts = rec.timeUnixNano ?? rec.observedTimeUnixNano ?? "0";
+  return {
+    traceId: rec.traceId ?? "",
+    spanId: rec.spanId ?? "",
+    timeUnixNano: ts,
+    level: rec.severityText ?? severityNumberToLabel(rec.severityNumber),
+    message: extractBody(rec),
+    attributesJson: JSON.stringify(attrs),
+  };
+}
+
+function extractBody(rec: OtlpLogRecord): string {
+  const body = rec.body;
+  if (!body) return "";
+  if (body.stringValue !== undefined) return body.stringValue;
+  if (body.intValue !== undefined) return String(body.intValue);
+  if (body.boolValue !== undefined) return String(body.boolValue);
+  if (body.doubleValue !== undefined) return String(body.doubleValue);
+  if (body.arrayValue) {
+    return body.arrayValue.values
+      .map((v) => {
+        if (v.stringValue !== undefined) return v.stringValue;
+        if (v.intValue !== undefined) return String(v.intValue);
+        if (v.boolValue !== undefined) return String(v.boolValue);
+        if (v.doubleValue !== undefined) return String(v.doubleValue);
+        return "";
+      })
+      .filter((s) => s.length > 0)
+      .join(" ");
+  }
+  return "";
+}
+
+/**
+ * OTLP severity numbers (1-24) come from the spec; we only need a
+ * coarse label fallback when `severityText` is absent. Buckets follow
+ * `@effect/opentelemetry`'s `Logger.layerLoggerAdd` mapping (Effect's
+ * log levels are 1-indexed alongside OTel's), so the round-trip from
+ * `Effect.logInfo` → OTel → display stays stable.
+ */
+function severityNumberToLabel(n: number | undefined): string {
+  if (n === undefined || n === 0) return "INFO";
+  if (n >= 21) return "FATAL";
+  if (n >= 17) return "ERROR";
+  if (n >= 13) return "WARN";
+  if (n >= 9) return "INFO";
+  if (n >= 5) return "DEBUG";
+  return "TRACE";
 }
 
 function strAttr(v: string | number | boolean | undefined): string | undefined {

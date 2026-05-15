@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { StoredIssueProcess } from "./storage.js";
-import { escapeHtml, renderListView } from "./views.js";
+import type { StoredIssueProcess, StoredLogRecord } from "./storage.js";
+import { escapeHtml, renderDetailView, renderListView } from "./views.js";
 
 function row(over: Partial<StoredIssueProcess> = {}): StoredIssueProcess {
   return {
@@ -55,6 +55,83 @@ describe("escapeHtml (VA-386)", () => {
     const html = renderListView([
       row({ outcomeDetail: `<script>alert("xss")</script>` }),
     ]);
+    expect(html).not.toContain("<script>alert");
+    expect(html).toContain("&lt;script&gt;alert");
+  });
+});
+
+function logRow(over: Partial<StoredLogRecord> = {}): StoredLogRecord {
+  return {
+    traceId: "a".repeat(32),
+    spanId: "b".repeat(16),
+    timeUnixNano: "1715000000000000000",
+    level: "INFO",
+    message: "base branch resolved",
+    attributesJson: JSON.stringify({ issue: "VA-1", branch: "agent/va-1" }),
+    attributes: { issue: "VA-1", branch: "agent/va-1" },
+    ...over,
+  };
+}
+
+describe("renderDetailView (VA-388)", () => {
+  it("renders the issue process header and a logs table with timestamp/level/message/attrs", () => {
+    const html = renderDetailView({
+      traceId: "a".repeat(32),
+      issueProcess: row({ issueIdentifier: "VA-99", branch: "agent/va-99" }),
+      logs: [logRow({ message: "first" }), logRow({ message: "second", timeUnixNano: "1715000001000000000" })],
+    });
+    expect(html).toContain("VA-99");
+    expect(html).toContain("agent/va-99");
+    expect(html).toContain("Logs");
+    expect(html).toContain("first");
+    expect(html).toContain("second");
+    expect(html).toContain("INFO");
+    expect(html).toContain("issue=VA-1");
+    // Logs render ascending — `first` precedes `second` in the HTML.
+    expect(html.indexOf("first")).toBeLessThan(html.indexOf("second"));
+  });
+
+  it("renders an empty state for the Logs section when no records exist", () => {
+    const html = renderDetailView({
+      traceId: "a".repeat(32),
+      issueProcess: row(),
+      logs: [],
+    });
+    expect(html).toContain("No log records yet for this trace");
+  });
+
+  it("renders an empty state for the header when no issue process exists for the trace", () => {
+    const html = renderDetailView({
+      traceId: "ffffffffffffffffffffffffffffffff",
+      issueProcess: undefined,
+      logs: [],
+    });
+    expect(html).toContain("No issue process found");
+    expect(html).toContain("ffffffffffffffffffffffffffffffff");
+  });
+
+  it("formats the nanosecond timestamp as ISO-8601 in the table", () => {
+    const html = renderDetailView({
+      traceId: "a".repeat(32),
+      issueProcess: row(),
+      logs: [logRow({ timeUnixNano: "1715000000000000000" })],
+    });
+    // Truncated to ms: 1715000000000 → 2024-05-06T12:53:20.000Z.
+    expect(html).toContain(
+      new Date(1715000000000).toISOString(),
+    );
+  });
+
+  it("escapes hostile attribute values to prevent XSS in the Attributes cell", () => {
+    const html = renderDetailView({
+      traceId: "a".repeat(32),
+      issueProcess: row(),
+      logs: [
+        logRow({
+          attributes: { hostile: `<script>alert("x")</script>` },
+        }),
+      ],
+    });
     expect(html).not.toContain("<script>alert");
     expect(html).toContain("&lt;script&gt;alert");
   });

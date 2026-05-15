@@ -1,8 +1,8 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { projectPayload } from "./projector.js";
+import { projectLogsPayload, projectPayload } from "./projector.js";
 import { createStorage, type Storage } from "./storage.js";
-import { renderListView } from "./views.js";
-import type { OtlpTracesPayload } from "./otlp.js";
+import { renderDetailView, renderListView } from "./views.js";
+import type { OtlpLogsPayload, OtlpTracesPayload } from "./otlp.js";
 
 /**
  * VA-386 (dashboard slice 1): the dashboard runs as a single Node HTTP
@@ -10,7 +10,10 @@ import type { OtlpTracesPayload } from "./otlp.js";
  *
  *   POST /v1/traces  →  OTLP HTTP receiver (JSON encoding); projects
  *                       and persists to SQLite.
+ *   POST /v1/logs    →  OTLP HTTP logs receiver (VA-388); persists log
+ *                       records keyed on (trace_id, span_id).
  *   GET  /            →  HTML list of issue processes.
+ *   GET  /trace/:id   →  Detail pane: issue process + correlated logs.
  *
  * The OTLP HTTP spec lets the same server host receivers and UI under
  * one port when a reverse-proxy isn't in play. We deliberately keep
@@ -98,8 +101,19 @@ async function handle(
     return;
   }
 
+  if (method === "POST" && url === "/v1/logs") {
+    await handleOtlpLogs(req, res, storage);
+    return;
+  }
+
   if (method === "GET" && (url === "/" || url.startsWith("/?"))) {
     handleListView(res, storage);
+    return;
+  }
+
+  if (method === "GET" && url.startsWith("/trace/")) {
+    const traceId = decodeURIComponent(url.slice("/trace/".length));
+    handleDetailView(res, storage, traceId);
     return;
   }
 
@@ -169,6 +183,71 @@ function handleListView(res: ServerResponse, storage: Storage): void {
   const html = renderListView(rows);
   res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
   res.end(html);
+}
+
+/**
+ * VA-388: per-trace detail pane. The trace id segment uniquely
+ * identifies an issue process (drainQueue + its processIssue children
+ * share the same trace), so we scope both the issue-process lookup
+ * and the log stream to it.
+ */
+function handleDetailView(
+  res: ServerResponse,
+  storage: Storage,
+  traceId: string,
+): void {
+  const processes = storage.listIssueProcesses({ traceId, limit: 1 });
+  const logs = storage.streamLogsFor(traceId);
+  const html = renderDetailView({
+    traceId,
+    issueProcess: processes[0],
+    logs,
+  });
+  const status = processes.length === 0 && logs.length === 0 ? 404 : 200;
+  res.writeHead(status, { "content-type": "text/html; charset=utf-8" });
+  res.end(html);
+}
+
+/**
+ * VA-388: log-records ingestion mirrors `/v1/traces` — JSON-only on
+ * the hot path, OTLP `partialSuccess` envelope on success so the
+ * Effect SDK exporter doesn't retry.
+ */
+async function handleOtlpLogs(
+  req: IncomingMessage,
+  res: ServerResponse,
+  storage: Storage,
+): Promise<void> {
+  const ct = (req.headers["content-type"] ?? "").toString().toLowerCase();
+  if (!ct.includes("application/json")) {
+    writeError(
+      res,
+      415,
+      "unsupported_media_type",
+      `expected application/json, got "${ct}"`,
+    );
+    return;
+  }
+
+  const body = await readBody(req);
+  if (body === undefined) {
+    writeError(res, 413, "payload_too_large", `body exceeds ${MAX_BODY_BYTES} bytes`);
+    return;
+  }
+
+  let payload: OtlpLogsPayload;
+  try {
+    payload = JSON.parse(body) as OtlpLogsPayload;
+  } catch (err) {
+    writeError(res, 400, "invalid_json", asMessage(err));
+    return;
+  }
+
+  const projection = projectLogsPayload(payload);
+  for (const r of projection.logs) storage.appendLogRecord(r);
+
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end(JSON.stringify({ partialSuccess: {} }));
 }
 
 async function readBody(req: IncomingMessage): Promise<string | undefined> {

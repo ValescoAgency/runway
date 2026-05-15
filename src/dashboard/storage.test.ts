@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type {
   DrainRow,
   IssueProcessRow,
+  LogRecordRow,
   RawSpanRow,
 } from "./projector.js";
 import { createStorage, type Storage } from "./storage.js";
@@ -52,6 +53,21 @@ function makeRawSpan(over: Partial<RawSpanRow> = {}): RawSpanRow {
     spanId: "3333333333333333",
     name: "unknownSpan",
     payload: JSON.stringify({ name: "unknownSpan" }),
+    ...over,
+  };
+}
+
+function makeLogRecord(over: Partial<LogRecordRow> = {}): LogRecordRow {
+  return {
+    traceId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    spanId: "2222222222222222",
+    timeUnixNano: "1715000000000000000",
+    level: "INFO",
+    message: "base branch resolved",
+    attributesJson: JSON.stringify({
+      issue: "VA-312",
+      branch: "agent/va-312",
+    }),
     ...over,
   };
 }
@@ -150,5 +166,102 @@ describe("createStorage — saveDrain / saveIssueProcess / saveRawSpan", () => {
     // If the upsert is broken, the second call would have thrown.
     // No assertion needed beyond "did not throw".
     expect(true).toBe(true);
+  });
+});
+
+describe("createStorage — appendLogRecord / streamLogsFor (VA-388)", () => {
+  it("round-trips a log record with attributes parsed back to a plain object", () => {
+    storage.appendLogRecord(makeLogRecord());
+    const out = storage.streamLogsFor("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      traceId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      spanId: "2222222222222222",
+      timeUnixNano: "1715000000000000000",
+      level: "INFO",
+      message: "base branch resolved",
+    });
+    expect(out[0]?.attributes).toEqual({
+      issue: "VA-312",
+      branch: "agent/va-312",
+    });
+  });
+
+  it("orders streamed log records ascending by timestamp (then by span_id as a tiebreaker)", () => {
+    // Two messages out-of-insertion-order to prove sort lives at read
+    // time, not write time.
+    storage.appendLogRecord(
+      makeLogRecord({
+        message: "later",
+        spanId: "bbbbbbbbbbbbbbbb",
+        timeUnixNano: "1715000002000000000",
+      }),
+    );
+    storage.appendLogRecord(
+      makeLogRecord({
+        message: "earlier",
+        spanId: "aaaaaaaaaaaaaaaa",
+        timeUnixNano: "1715000001000000000",
+      }),
+    );
+    storage.appendLogRecord(
+      makeLogRecord({
+        message: "earliest",
+        spanId: "cccccccccccccccc",
+        timeUnixNano: "1715000000500000000",
+      }),
+    );
+
+    const out = storage.streamLogsFor("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    expect(out.map((r) => r.message)).toEqual([
+      "earliest",
+      "earlier",
+      "later",
+    ]);
+  });
+
+  it("scopes streamLogsFor() to the requested trace id", () => {
+    storage.appendLogRecord(
+      makeLogRecord({
+        traceId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        message: "trace A",
+      }),
+    );
+    storage.appendLogRecord(
+      makeLogRecord({
+        traceId: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        message: "trace B",
+      }),
+    );
+
+    const onlyA = storage.streamLogsFor("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    expect(onlyA.map((r) => r.message)).toEqual(["trace A"]);
+
+    const onlyB = storage.streamLogsFor("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    expect(onlyB.map((r) => r.message)).toEqual(["trace B"]);
+  });
+
+  it("idempotently upserts on retried emits keyed by (trace_id, span_id, timestamp, message)", () => {
+    storage.appendLogRecord(
+      makeLogRecord({
+        level: "INFO",
+        attributesJson: JSON.stringify({ branch: "first" }),
+      }),
+    );
+    storage.appendLogRecord(
+      makeLogRecord({
+        level: "WARN",
+        attributesJson: JSON.stringify({ branch: "second" }),
+      }),
+    );
+
+    const out = storage.streamLogsFor("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    expect(out).toHaveLength(1);
+    expect(out[0]?.level).toBe("WARN");
+    expect(out[0]?.attributes).toEqual({ branch: "second" });
+  });
+
+  it("returns an empty list when no logs exist for the trace", () => {
+    expect(storage.streamLogsFor("none")).toEqual([]);
   });
 });

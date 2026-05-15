@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
-import type { OtlpSpan, OtlpTracesPayload } from "./otlp.js";
-import { projectPayload } from "./projector.js";
+import type {
+  OtlpLogRecord,
+  OtlpLogsPayload,
+  OtlpSpan,
+  OtlpTracesPayload,
+} from "./otlp.js";
+import { projectLogsPayload, projectPayload } from "./projector.js";
 
 // VA-386: projector is the pure boundary between OTLP wire format and
 // the typed runway rows the dashboard renders. Hand-built fixtures
@@ -256,5 +261,139 @@ describe("projectPayload — multiple resource/scope spans", () => {
   it("returns empty projections for an empty payload (smoke)", () => {
     const out = projectPayload({ resourceSpans: [] });
     expect(out).toEqual({ drains: [], issueProcesses: [], rawSpans: [] });
+  });
+});
+
+function logPayload(records: readonly OtlpLogRecord[]): OtlpLogsPayload {
+  return {
+    resourceLogs: [
+      {
+        resource: {
+          attributes: [
+            { key: "service.name", value: { stringValue: "runway" } },
+          ],
+        },
+        scopeLogs: [{ scope: { name: "@effect/opentelemetry" }, logRecords: records }],
+      },
+    ],
+  };
+}
+
+describe("projectLogsPayload (VA-388)", () => {
+  it("projects a body+attributes log record keyed on trace_id / span_id", () => {
+    const out = projectLogsPayload(
+      logPayload([
+        {
+          timeUnixNano: "1715000000000000000",
+          severityText: "INFO",
+          severityNumber: 9,
+          body: { stringValue: "base branch resolved" },
+          traceId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          spanId: "1111111111111111",
+          attributes: [
+            { key: "issue", value: { stringValue: "VA-312" } },
+            { key: "branch", value: { stringValue: "agent/va-312" } },
+          ],
+        },
+      ]),
+    );
+    expect(out.logs).toHaveLength(1);
+    expect(out.logs[0]).toMatchObject({
+      traceId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      spanId: "1111111111111111",
+      timeUnixNano: "1715000000000000000",
+      level: "INFO",
+      message: "base branch resolved",
+    });
+    expect(JSON.parse(out.logs[0]!.attributesJson)).toEqual({
+      issue: "VA-312",
+      branch: "agent/va-312",
+    });
+  });
+
+  it("falls back to severityNumber → label when severityText is absent", () => {
+    const out = projectLogsPayload(
+      logPayload([
+        {
+          timeUnixNano: "1715000000000000000",
+          severityNumber: 17,
+          body: { stringValue: "boom" },
+        },
+      ]),
+    );
+    expect(out.logs[0]?.level).toBe("ERROR");
+  });
+
+  it("uses observedTimeUnixNano when timeUnixNano is absent", () => {
+    const out = projectLogsPayload(
+      logPayload([
+        {
+          observedTimeUnixNano: "1715000000111111111",
+          severityText: "INFO",
+          body: { stringValue: "x" },
+        },
+      ]),
+    );
+    expect(out.logs[0]?.timeUnixNano).toBe("1715000000111111111");
+  });
+
+  it("flattens multiple resourceLogs / scopeLogs into one ordered projection", () => {
+    const out = projectLogsPayload({
+      resourceLogs: [
+        {
+          scopeLogs: [
+            {
+              logRecords: [
+                {
+                  timeUnixNano: "1",
+                  severityText: "INFO",
+                  body: { stringValue: "a" },
+                  traceId: "t1",
+                  spanId: "s1",
+                },
+              ],
+            },
+            {
+              logRecords: [
+                {
+                  timeUnixNano: "2",
+                  severityText: "WARN",
+                  body: { stringValue: "b" },
+                  traceId: "t1",
+                  spanId: "s2",
+                },
+              ],
+            },
+          ],
+        },
+        {
+          scopeLogs: [
+            {
+              logRecords: [
+                {
+                  timeUnixNano: "3",
+                  severityText: "ERROR",
+                  body: { stringValue: "c" },
+                  traceId: "t1",
+                  spanId: "s3",
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+    expect(out.logs.map((r) => r.message)).toEqual(["a", "b", "c"]);
+  });
+
+  it("survives an empty body (no stringValue) by emitting an empty message string", () => {
+    const out = projectLogsPayload(
+      logPayload([{ timeUnixNano: "1", severityText: "INFO" }]),
+    );
+    expect(out.logs[0]?.message).toBe("");
+  });
+
+  it("returns no logs for an empty payload (smoke)", () => {
+    expect(projectLogsPayload({ resourceLogs: [] })).toEqual({ logs: [] });
   });
 });

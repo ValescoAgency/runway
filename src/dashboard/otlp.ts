@@ -65,6 +65,37 @@ export interface OtlpTracesPayload {
 }
 
 /**
+ * VA-388: just enough of `opentelemetry.proto.logs.v1` to receive
+ * `POST /v1/logs`. The OTLP/HTTP+JSON encoding of `LogRecord.body` is
+ * an `AnyValue` — same union as attribute values — so we reuse
+ * `OtlpAttributeValue` here.
+ */
+export interface OtlpLogRecord {
+  readonly timeUnixNano?: string;
+  readonly observedTimeUnixNano?: string;
+  readonly severityNumber?: number;
+  readonly severityText?: string;
+  readonly body?: OtlpAttributeValue;
+  readonly attributes?: readonly OtlpAttribute[];
+  readonly traceId?: string;
+  readonly spanId?: string;
+}
+
+export interface OtlpScopeLogs {
+  readonly scope?: OtlpScope;
+  readonly logRecords: readonly OtlpLogRecord[];
+}
+
+export interface OtlpResourceLogs {
+  readonly resource?: OtlpResource;
+  readonly scopeLogs: readonly OtlpScopeLogs[];
+}
+
+export interface OtlpLogsPayload {
+  readonly resourceLogs: readonly OtlpResourceLogs[];
+}
+
+/**
  * Coerce an OTLP attribute value to a plain JS scalar. We collapse
  * the typed wire variants (`stringValue` / `intValue` / `boolValue` /
  * `doubleValue`) into one return path so callers downstream can

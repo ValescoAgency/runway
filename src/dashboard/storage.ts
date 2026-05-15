@@ -1,5 +1,10 @@
 import { DatabaseSync } from "node:sqlite";
-import type { DrainRow, IssueProcessRow, RawSpanRow } from "./projector.js";
+import type {
+  DrainRow,
+  IssueProcessRow,
+  LogRecordRow,
+  RawSpanRow,
+} from "./projector.js";
 
 /**
  * VA-386 (dashboard slice 1): SQLite storage for the typed projections
@@ -25,11 +30,32 @@ export interface StoredIssueProcess extends IssueProcessRow {
   readonly insertedAt: string;
 }
 
+export interface StoredLogRecord extends LogRecordRow {
+  /**
+   * Decoded attribute bag — the on-disk column is `attributes_json`,
+   * which the reader rehydrates so the view layer never re-parses.
+   */
+  readonly attributes: Record<string, string | number | boolean>;
+}
+
 export interface Storage {
   saveDrain(d: DrainRow): void;
   saveIssueProcess(p: IssueProcessRow): void;
   saveRawSpan(r: RawSpanRow): void;
+  /**
+   * VA-388: persist one log record from a POST /v1/logs batch. Keyed
+   * on `(trace_id, span_id, timestamp, message)` — span_id can be
+   * absent (a log without an active span); we coerce missing values
+   * to empty string for the PK so retried emits still upsert cleanly.
+   */
+  appendLogRecord(r: LogRecordRow): void;
   listIssueProcesses(filter?: IssueProcessFilter): readonly StoredIssueProcess[];
+  /**
+   * VA-388: read every log record for a trace, ordered ascending by
+   * `(timestamp, span_id)` — matches what the detail pane needs to
+   * render a chronological log tail correlated to the issue process.
+   */
+  streamLogsFor(traceId: string): readonly StoredLogRecord[];
   close(): void;
 }
 
@@ -80,6 +106,20 @@ const SCHEMA = `
     inserted_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (trace_id, span_id)
   );
+
+  CREATE TABLE IF NOT EXISTS log_records (
+    trace_id TEXT NOT NULL,
+    span_id TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    level TEXT NOT NULL,
+    message TEXT NOT NULL,
+    attributes_json TEXT NOT NULL,
+    inserted_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (trace_id, span_id, timestamp, message)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_log_records_trace_id
+    ON log_records(trace_id, timestamp ASC);
 `;
 
 /**
@@ -136,6 +176,22 @@ export function createStorage(path: string): Storage {
     ON CONFLICT (trace_id, span_id) DO UPDATE SET
       name = excluded.name,
       payload = excluded.payload
+  `);
+
+  const insertLogRecord = db.prepare(`
+    INSERT INTO log_records (
+      trace_id, span_id, timestamp, level, message, attributes_json
+    ) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT (trace_id, span_id, timestamp, message) DO UPDATE SET
+      level = excluded.level,
+      attributes_json = excluded.attributes_json
+  `);
+
+  const listLogsByTrace = db.prepare(`
+    SELECT trace_id, span_id, timestamp, level, message, attributes_json
+    FROM log_records
+    WHERE trace_id = ?
+    ORDER BY timestamp ASC, span_id ASC
   `);
 
   // Two list variants instead of one with conditional SQL — keeps
@@ -199,6 +255,22 @@ export function createStorage(path: string): Storage {
     insertRawSpan.run(r.traceId, r.spanId, r.name, r.payload);
   };
 
+  const appendLogRecord = (r: LogRecordRow): void => {
+    insertLogRecord.run(
+      r.traceId,
+      r.spanId,
+      r.timeUnixNano,
+      r.level,
+      r.message,
+      r.attributesJson,
+    );
+  };
+
+  const streamLogsFor = (traceId: string): readonly StoredLogRecord[] => {
+    const rows = listLogsByTrace.all(traceId);
+    return rows.map(rowToLogRecord);
+  };
+
   const listIssueProcesses = (
     filter?: IssueProcessFilter,
   ): readonly StoredIssueProcess[] => {
@@ -217,7 +289,9 @@ export function createStorage(path: string): Storage {
     saveDrain,
     saveIssueProcess,
     saveRawSpan,
+    appendLogRecord,
     listIssueProcesses,
+    streamLogsFor,
     close,
   };
 }
@@ -257,4 +331,29 @@ function nullableNum(v: unknown): number | null {
   if (v === null || v === undefined) return null;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
+}
+
+function rowToLogRecord(row: unknown): StoredLogRecord {
+  const r = row as Record<string, unknown>;
+  const json = typeof r.attributes_json === "string" ? r.attributes_json : "{}";
+  let attributes: Record<string, string | number | boolean>;
+  try {
+    const parsed = JSON.parse(json);
+    attributes =
+      parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as Record<string, string | number | boolean>)
+        : {};
+  } catch {
+    // A corrupted row shouldn't crash the detail view; surface as empty.
+    attributes = {};
+  }
+  return {
+    traceId: String(r.trace_id ?? ""),
+    spanId: String(r.span_id ?? ""),
+    timeUnixNano: String(r.timestamp ?? ""),
+    level: String(r.level ?? ""),
+    message: String(r.message ?? ""),
+    attributesJson: json,
+    attributes,
+  };
 }
