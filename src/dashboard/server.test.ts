@@ -723,3 +723,230 @@ describe("dashboard HTTP server — list-view fragment & SSE (VA-391)", () => {
     expect(html).not.toContain("Drain started");
   });
 });
+
+// VA-392: filter chips + URL state + empty-state distinction.
+describe("dashboard HTTP server — list view filters (VA-392)", () => {
+  // Stage a few representative outcomes so chip filters have something
+  // to bite on.
+  beforeEach(async () => {
+    const payload = {
+      resourceSpans: [
+        {
+          resource: {
+            attributes: [
+              { key: "service.name", value: { stringValue: "runway" } },
+            ],
+          },
+          scopeSpans: [
+            {
+              scope: { name: "test" },
+              spans: [
+                {
+                  traceId: "cccccccccccccccccccccccccccccccc",
+                  spanId: "c000000000000001",
+                  name: "processIssue",
+                  startTimeUnixNano: "1715000000000000000",
+                  endTimeUnixNano: "1715000000500000000",
+                  attributes: [
+                    {
+                      key: "runway.issue.identifier",
+                      value: { stringValue: "VA-OPENED" },
+                    },
+                    {
+                      key: "runway.outcome.kind",
+                      value: { stringValue: "opened" },
+                    },
+                  ],
+                },
+                {
+                  traceId: "cccccccccccccccccccccccccccccccc",
+                  spanId: "c000000000000002",
+                  name: "processIssue",
+                  startTimeUnixNano: "1715000001000000000",
+                  endTimeUnixNano: "1715000001500000000",
+                  attributes: [
+                    {
+                      key: "runway.issue.identifier",
+                      value: { stringValue: "VA-HITL" },
+                    },
+                    {
+                      key: "runway.outcome.kind",
+                      value: { stringValue: "hitl" },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    await fetch(`${base}/v1/traces`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  });
+
+  it("renders one chip per outcome kind on the list view", async () => {
+    const html = await (await fetch(`${base}/`)).text();
+    expect(html).toContain('class="filter-chip outcome-opened"');
+    expect(html).toContain('class="filter-chip outcome-hitl"');
+    expect(html).toContain('class="filter-chip outcome-errored"');
+    expect(html).toContain('class="filter-chip outcome-in-flight"');
+  });
+
+  it("filters the row set when ?outcome= is set in the URL", async () => {
+    const html = await (await fetch(`${base}/?outcome=opened`)).text();
+    expect(html).toContain("VA-OPENED");
+    expect(html).not.toContain("VA-HITL");
+    // The opened chip carries the `active` class on this URL.
+    expect(html).toContain('outcome-opened active"');
+  });
+
+  it("supports multiple outcomes via comma-separated ?outcome=", async () => {
+    const html = await (
+      await fetch(`${base}/?outcome=opened,hitl`)
+    ).text();
+    expect(html).toContain("VA-OPENED");
+    expect(html).toContain("VA-HITL");
+  });
+
+  it("encodes the filter state in the fragment endpoint URL so polling preserves it", async () => {
+    const html = await (await fetch(`${base}/?outcome=hitl`)).text();
+    // The tbody's hx-get URL embeds the same filter so the htmx poll
+    // doesn't reset the user's chip selection.
+    expect(html).toMatch(/hx-get="\/issue-processes\?outcome=hitl"/);
+  });
+
+  it("returns the filtered tbody fragment via /issue-processes?outcome=…", async () => {
+    const res = await fetch(`${base}/issue-processes?outcome=opened`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("VA-OPENED");
+    expect(html).not.toContain("VA-HITL");
+  });
+
+  it("shows the 'no rows match this filter' empty state when a filter yields nothing", async () => {
+    const html = await (
+      await fetch(`${base}/?outcome=errored`)
+    ).text();
+    expect(html).toContain("No issue processes match this filter");
+    expect(html).not.toContain("No issue processes yet.");
+  });
+
+  it("falls back to the 'no data yet' empty state when no filter is active", async () => {
+    // Build a fresh server with empty storage so the unfiltered empty
+    // state has a chance to render.
+    const emptyStorage = createStorage(":memory:");
+    const emptyRunning = await startServer({ storage: emptyStorage, port: 0 });
+    try {
+      const html = await (
+        await fetch(`http://127.0.0.1:${emptyRunning.port}/`)
+      ).text();
+      expect(html).toContain("No issue processes yet.");
+      expect(html).not.toContain("No issue processes match this filter");
+    } finally {
+      await emptyRunning.close();
+      emptyStorage.close();
+    }
+  });
+
+  it("filters by recent drain via ?drain=<traceId>", async () => {
+    // Ingest a second drain with a different trace_id so the chip
+    // selection actually narrows the row set.
+    const otherTrace = {
+      resourceSpans: [
+        {
+          resource: {
+            attributes: [
+              { key: "service.name", value: { stringValue: "runway" } },
+            ],
+          },
+          scopeSpans: [
+            {
+              scope: { name: "test" },
+              spans: [
+                {
+                  traceId: "dddddddddddddddddddddddddddddddd",
+                  spanId: "d000000000000001",
+                  name: "processIssue",
+                  startTimeUnixNano: "1715000010000000000",
+                  endTimeUnixNano: "1715000010500000000",
+                  attributes: [
+                    {
+                      key: "runway.issue.identifier",
+                      value: { stringValue: "VA-OTHER" },
+                    },
+                    {
+                      key: "runway.outcome.kind",
+                      value: { stringValue: "opened" },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    await fetch(`${base}/v1/traces`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(otherTrace),
+    });
+    const html = await (
+      await fetch(`${base}/?drain=cccccccccccccccccccccccccccccccc`)
+    ).text();
+    expect(html).toContain("VA-OPENED");
+    expect(html).toContain("VA-HITL");
+    expect(html).not.toContain("VA-OTHER");
+  });
+
+  it("ignores unknown ?range= values rather than 400-ing", async () => {
+    const res = await fetch(`${base}/?range=garbage`);
+    expect(res.status).toBe(200);
+    // The "all" range chip remains active when the input is unknown.
+    const html = await res.text();
+    expect(html).toContain('range-all active"');
+  });
+
+  it("renders an htmx-indicator progress bar above the table", async () => {
+    const html = await (await fetch(`${base}/`)).text();
+    expect(html).toContain('class="progress-bar htmx-indicator"');
+    expect(html).toContain('hx-indicator="#rows-progress"');
+  });
+});
+
+// VA-392: explicit OTLP / dashboard bind env vars. `DASHBOARD_BIND`
+// overrides the dashboard listener's host; `OTLP_BIND` overrides the
+// OTLP receiver's. Both default to 127.0.0.1.
+describe("dashboard HTTP server — explicit bind env vars (VA-392)", () => {
+  it("keeps the 127.0.0.1 default when no host option is passed", async () => {
+    const localStorage = createStorage(":memory:");
+    const localRunning = await startServer({ storage: localStorage, port: 0 });
+    try {
+      const addr = localRunning.server.address();
+      expect((addr as { address: string }).address).toBe("127.0.0.1");
+    } finally {
+      await localRunning.close();
+      localStorage.close();
+    }
+  });
+
+  it("honors an explicit host option (the env-var wiring lives in main())", async () => {
+    const localStorage = createStorage(":memory:");
+    const localRunning = await startServer({
+      storage: localStorage,
+      port: 0,
+      host: "127.0.0.1",
+    });
+    try {
+      const addr = localRunning.server.address();
+      expect((addr as { address: string }).address).toBe("127.0.0.1");
+    } finally {
+      await localRunning.close();
+      localStorage.close();
+    }
+  });
+});
