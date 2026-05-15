@@ -103,6 +103,23 @@ export interface RunwayConfig {
    * are split across distinct identities.
    */
   readonly commentAuthorAllowlist?: readonly string[];
+  /**
+   * VA-402: env-only signal for the Anthropic model the IRA's Run
+   * Review pass invokes. `undefined` when `RUNWAY_META_REVIEW_MODEL`
+   * is unset — the runner then falls back to `.runway/config.yml`
+   * (matches the PRD's `.afk/config.yml` intent under runway's
+   * existing `.runway/*.yml` convention) and finally to the
+   * hard-coded `claude-sonnet-4-6` default. Resolution lives in
+   * `meta/runner.ts` so the file-merge stays close to the pass that
+   * actually consumes it.
+   */
+  readonly metaReviewModel?: string;
+  /**
+   * VA-402: env-only signal for the Linear project the IRA writes
+   * its Reviews into. Same resolution chain as `metaReviewModel`:
+   * env → `.runway/config.yml` → `"runway-meta"` default.
+   */
+  readonly metaProjectName?: string;
 }
 
 // Back-compat alias — existing consumers (orchestrator, gateways)
@@ -166,6 +183,8 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
   commentAuthorAllowlist: EConfig.option(
     EConfig.string("RUNWAY_COMMENT_AUTHOR_ALLOWLIST"),
   ),
+  metaReviewModel: EConfig.option(EConfig.string("RUNWAY_META_REVIEW_MODEL")),
+  metaProjectName: EConfig.option(EConfig.string("RUNWAY_META_PROJECT_NAME")),
 }).pipe(
   Effect.map(
     (raw): RunwayConfig => ({
@@ -187,6 +206,8 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
         ?.split(",")
         .map((s) => s.trim())
         .filter(Boolean),
+      metaReviewModel: Option.getOrUndefined(raw.metaReviewModel),
+      metaProjectName: Option.getOrUndefined(raw.metaProjectName),
     }),
   ),
 );

@@ -191,6 +191,106 @@ export function parseReviewerReport(
 }
 
 // ---------------------------------------------------------------------------
+// Run Review (v1.0.0) — IRA's per-issue retrospective verdict
+// ---------------------------------------------------------------------------
+
+export const RUN_REVIEW_VERSION = "1.0.0";
+export const RUN_REVIEW_FENCE_TAG = "runway-run-review";
+
+/**
+ * VA-402: PRD-spec absolute quality axis. STRONG / ADEQUATE / WEAK /
+ * FAILED captures the IRA's view of how well runway performed each
+ * dimension on this run. Independent of the relative axis (BETTER /
+ * STEADY / WORSE vs. recent norms), which lands in VA-405 — at this
+ * slice the relative slots stay null.
+ */
+const QualityAbsoluteSchema = z.enum([
+  "STRONG",
+  "ADEQUATE",
+  "WEAK",
+  "FAILED",
+]);
+
+const QualityRelativeSchema = z.enum(["BETTER", "STEADY", "WORSE"]);
+
+/**
+ * Each quality dimension has an absolute axis + (eventually) a
+ * relative axis. The relative slot stays `null` at this slice; VA-405
+ * populates it once rolling norms exist. Justification is one short
+ * sentence — the IRA's reason for the absolute grade.
+ */
+const QualitySectionSchema = z.object({
+  absolute: QualityAbsoluteSchema,
+  relative: QualityRelativeSchema.nullable(),
+  justification: z.string(),
+});
+
+export type QualityAbsolute = z.infer<typeof QualityAbsoluteSchema>;
+export type QualityRelative = z.infer<typeof QualityRelativeSchema>;
+export type QualitySection = z.infer<typeof QualitySectionSchema>;
+
+/**
+ * VA-402: PRD-spec target taxonomy for IRA recommendations. The
+ * Weekly Review's promoter (VA-408) groups recommendations by this
+ * field as the structural pattern key — bumping the alphabet here
+ * needs a coordinated change in the promoter.
+ */
+const RecommendationTargetSchema = z.enum([
+  "prompt",
+  "workflow",
+  "sandcastle",
+  "issue-body",
+  "tooling",
+]);
+
+const RecommendationConfidenceSchema = z.enum(["LOW", "MEDIUM", "HIGH"]);
+
+const RecommendationSchema = z.object({
+  target: RecommendationTargetSchema,
+  change: z.string().min(1),
+  confidence: RecommendationConfidenceSchema,
+});
+
+export type RecommendationTarget = z.infer<typeof RecommendationTargetSchema>;
+export type Recommendation = z.infer<typeof RecommendationSchema>;
+
+/**
+ * VA-403 adds the hindsight signals contents (PR merge state, human
+ * comments on PR review threads, follow-up issues). At this slice
+ * the field is reserved with a `null`-able shape so v1.0.0 payloads
+ * persist a stable empty marker and the v1.1.0 schema can widen it
+ * without a major bump.
+ */
+const HindsightSignalsSchema = z.null();
+
+const RunReviewSchema = z.object({
+  template_version: z.string(),
+  issue_identifier: z.string().min(1),
+  drain_trace_id: z.string().min(1),
+  final_outcome: z.string().min(1),
+  // Five quality dimensions per PRD. Each is a QualitySection
+  // (absolute + relative + justification). At this slice all
+  // `relative` slots are `null` because no rolling norms exist yet.
+  issue_quality: QualitySectionSchema,
+  prompt_quality: QualitySectionSchema,
+  agent_quality: QualitySectionSchema,
+  reviewer_quality: QualitySectionSchema,
+  orchestration_quality: QualitySectionSchema,
+  recommendations: z.array(RecommendationSchema),
+  hindsight_signals: HindsightSignalsSchema,
+});
+
+export type RunReview = z.infer<typeof RunReviewSchema>;
+
+export function parseRunReview(text: string): ReportParseResult<RunReview> {
+  return parseReport(text, {
+    fenceTag: RUN_REVIEW_FENCE_TAG,
+    schema: RunReviewSchema,
+    expectedMajor: parseMajor(RUN_REVIEW_VERSION),
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Generic parser — fence extraction → JSON parse → version handshake
 // → schema validation
 // ---------------------------------------------------------------------------

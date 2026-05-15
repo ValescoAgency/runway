@@ -4,8 +4,11 @@ import {
   CODING_AGENT_REPORT_VERSION,
   REVIEWER_REPORT_FENCE_TAG,
   REVIEWER_REPORT_VERSION,
+  RUN_REVIEW_FENCE_TAG,
+  RUN_REVIEW_VERSION,
   parseCodingAgentReport,
   parseReviewerReport,
+  parseRunReview,
 } from "./templates.js";
 
 // VA-401 / VA-400: schema + version handshake tests for the two
@@ -31,6 +34,9 @@ const wrapAgent = (json: string): string =>
 
 const wrapReviewer = (json: string): string =>
   ["```" + REVIEWER_REPORT_FENCE_TAG, json, "```"].join("\n");
+
+const wrapRunReview = (json: string): string =>
+  ["```" + RUN_REVIEW_FENCE_TAG, json, "```"].join("\n");
 
 const VALID_AGENT_REPORT = {
   template_version: CODING_AGENT_REPORT_VERSION,
@@ -319,7 +325,7 @@ describe("parseReviewerReport (VA-401)", () => {
     expect(result.error.kind).toBe("schema-mismatch");
   });
 
-  it("permits an optional guidance_to_coding_agent field on APPROVED", () => {
+  it("permits an optional guidance_to_coding_agent field on APPROVE", () => {
     const stdout = wrapReviewer(
       JSON.stringify({
         ...VALID_REVIEWER_REPORT,
@@ -330,5 +336,132 @@ describe("parseReviewerReport (VA-401)", () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.report.guidance_to_coding_agent).toContain("Consider");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// VA-402: Run Review (v1.0.0) — the per-issue IRA verdict
+// ---------------------------------------------------------------------------
+
+const VALID_RUN_REVIEW = {
+  template_version: RUN_REVIEW_VERSION,
+  issue_identifier: "VA-401",
+  drain_trace_id: "0123456789abcdef0123456789abcdef",
+  final_outcome: "opened",
+  // PRD's five quality dimensions, each absolute + (null relative at
+  // this slice — VA-405 wires the rolling-norms axis).
+  issue_quality: {
+    absolute: "STRONG",
+    relative: null,
+    justification: "Issue body was specific and well-scoped.",
+  },
+  prompt_quality: {
+    absolute: "ADEQUATE",
+    relative: null,
+    justification: "Prompt covered the requirement; could be tighter on edge cases.",
+  },
+  agent_quality: {
+    absolute: "STRONG",
+    relative: null,
+    justification: "Agent satisfied every AC and produced surgical commits.",
+  },
+  reviewer_quality: {
+    absolute: "STRONG",
+    relative: null,
+    justification: "Reviewer caught a real divergence and routed it correctly.",
+  },
+  orchestration_quality: {
+    absolute: "STRONG",
+    relative: null,
+    justification: "Pipeline ran in 2 iterations, no infra retries.",
+  },
+  recommendations: [
+    {
+      target: "prompt",
+      change: "Add an explicit instruction to verify report verdicts match markers.",
+      confidence: "MEDIUM",
+    },
+  ],
+  // VA-403 fills this in. v1.0.0 carries `null` as a stable marker.
+  hindsight_signals: null,
+};
+
+describe("parseRunReview (VA-402)", () => {
+  it("parses a well-formed Run Review at the current version", () => {
+    const stdout = [
+      "Preamble from the IRA's response.",
+      wrapRunReview(JSON.stringify(VALID_RUN_REVIEW)),
+      "",
+    ].join("\n");
+    const result = parseRunReview(stdout);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.issue_identifier).toBe("VA-401");
+    expect(result.report.final_outcome).toBe("opened");
+    expect(result.report.issue_quality.absolute).toBe("STRONG");
+    expect(result.report.recommendations).toHaveLength(1);
+    expect(result.report.recommendations[0]?.target).toBe("prompt");
+    // Hindsight slot is `null` at v1.0.0 — VA-403 will widen.
+    expect(result.report.hindsight_signals).toBeNull();
+  });
+
+  it("returns missing-block when no runway-run-review fence is present", () => {
+    const result = parseRunReview("opening preamble, no JSON block");
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.kind).toBe("missing-block");
+  });
+
+  it("rejects an absolute-quality value outside the PRD alphabet", () => {
+    const stdout = wrapRunReview(
+      JSON.stringify({
+        ...VALID_RUN_REVIEW,
+        agent_quality: {
+          ...VALID_RUN_REVIEW.agent_quality,
+          absolute: "EXCELLENT",
+        },
+      }),
+    );
+    const result = parseRunReview(stdout);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.kind).toBe("schema-mismatch");
+  });
+
+  it("rejects a recommendation target outside the PRD taxonomy", () => {
+    const stdout = wrapRunReview(
+      JSON.stringify({
+        ...VALID_RUN_REVIEW,
+        recommendations: [
+          {
+            target: "everything",
+            change: "fix it all",
+            confidence: "HIGH",
+          },
+        ],
+      }),
+    );
+    const result = parseRunReview(stdout);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.kind).toBe("schema-mismatch");
+  });
+
+  it("accepts a forward-compatible minor version inside the current major", () => {
+    const stdout = wrapRunReview(
+      JSON.stringify({ ...VALID_RUN_REVIEW, template_version: "1.5.0" }),
+    );
+    const result = parseRunReview(stdout);
+    expect(result.ok).toBe(true);
+  });
+
+  it("rejects a major-version bump as version-mismatch", () => {
+    const stdout = wrapRunReview(
+      JSON.stringify({ template_version: "2.0.0" }),
+    );
+    const result = parseRunReview(stdout);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.kind).toBe("version-mismatch");
   });
 });

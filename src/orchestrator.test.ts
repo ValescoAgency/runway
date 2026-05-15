@@ -102,6 +102,8 @@ const config: Config = {
   // accidentally fire it. Tests exercising retry behavior override
   // with `{ ...config, reviewRetries: N }` explicitly.
   reviewRetries: 0,
+  metaReviewModel: "claude-sonnet-4-6",
+  metaProjectName: "runway-meta",
 };
 
 const issue: RunwayIssue = {
