@@ -1,6 +1,16 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import {
+  createLinearAdapter,
+  startLinearSync,
+  type LinearSyncHandle,
+} from "./linear-sync.js";
 import { projectPayload } from "./projector.js";
-import { createStorage, type Storage, type StoredIssueProcess } from "./storage.js";
+import {
+  createStorage,
+  type LinearSnapshotRow,
+  type Storage,
+  type StoredIssueProcess,
+} from "./storage.js";
 import { renderDetailView, renderListView } from "./views.js";
 import type { OtlpTracesPayload } from "./otlp.js";
 
@@ -46,6 +56,14 @@ export interface ServerOptions {
    * loopback-only by default.
    */
   readonly host?: string;
+  /**
+   * VA-390: when true, the list view renders the "Todo queue (next up)"
+   * section and per-row Linear status badges. When false (the default,
+   * matching "LINEAR_API_KEY is absent"), the dashboard behaves
+   * exactly as before — queue preview hidden, badges fall back to the
+   * snapshot-at-emit value (the existing outcome cell).
+   */
+  readonly linearEnabled?: boolean;
 }
 
 export interface RunningServer {
@@ -61,9 +79,13 @@ const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MiB — generous; a runway drain 
  * is NOT listening yet — call `.listen()` on the returned `server` or
  * use `startServer` for the all-in-one helper.
  */
-export function buildServer(storage: Storage): Server {
+export function buildServer(
+  storage: Storage,
+  opts: { readonly linearEnabled?: boolean } = {},
+): Server {
+  const linearEnabled = opts.linearEnabled ?? false;
   return createServer((req, res) => {
-    handle(req, res, storage).catch((err) => {
+    handle(req, res, storage, linearEnabled).catch((err) => {
       writeError(res, 500, "internal_error", asMessage(err));
     });
   });
@@ -74,7 +96,7 @@ export function buildServer(storage: Storage): Server {
  * use to close it gracefully (used by tests).
  */
 export async function startServer(opts: ServerOptions): Promise<RunningServer> {
-  const server = buildServer(opts.storage);
+  const server = buildServer(opts.storage, { linearEnabled: opts.linearEnabled });
   const port = opts.port ?? 4318;
   const host = opts.host ?? "127.0.0.1";
 
@@ -104,6 +126,7 @@ async function handle(
   req: IncomingMessage,
   res: ServerResponse,
   storage: Storage,
+  linearEnabled: boolean,
 ): Promise<void> {
   // Route on method + path. Nothing fancy — slice 1 only has two
   // endpoints; a router becomes worth its weight in slice 2.
@@ -116,7 +139,7 @@ async function handle(
   }
 
   if (method === "GET" && (url === "/" || url.startsWith("/?"))) {
-    handleListView(res, storage);
+    handleListView(res, storage, linearEnabled);
     return;
   }
 
@@ -204,9 +227,29 @@ async function handleOtlpTraces(
   res.end(JSON.stringify({ partialSuccess: {} }));
 }
 
-function handleListView(res: ServerResponse, storage: Storage): void {
+function handleListView(
+  res: ServerResponse,
+  storage: Storage,
+  linearEnabled: boolean,
+): void {
   const rows = storage.listIssueProcesses({ limit: 100 });
-  const html = renderListView(rows);
+  // VA-390: only read Linear-side data when the sync is enabled. The
+  // tables exist either way (the schema is unconditional), but a
+  // disabled dashboard never paid for the poller so the rows would be
+  // empty anyway — short-circuiting keeps the list-view path identical
+  // to the pre-VA-390 behavior.
+  const todoQueue = linearEnabled ? storage.listLinearTodoQueue() : [];
+  const snapshotsByIdentifier = linearEnabled
+    ? new Map<string, LinearSnapshotRow>(
+        storage.listLinearSnapshots().map((s) => [s.issueIdentifier, s]),
+      )
+    : new Map<string, LinearSnapshotRow>();
+  const html = renderListView({
+    rows,
+    linearEnabled,
+    todoQueue,
+    snapshotsByIdentifier,
+  });
   res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
   res.end(html);
 }
@@ -344,11 +387,41 @@ export async function main(): Promise<void> {
   const storage = createStorage(sqlitePath, {
     aggregateWindowDrains: aggregateWindow,
   });
-  const otlp = await startServer({ storage, port: otlpPort, host });
+
+  // VA-390: Linear sync is opt-in via LINEAR_API_KEY presence. Absent
+  // → no poller, no queue preview, no status badges; the dashboard
+  // looks exactly as it did pre-VA-390. Present → wire the adapter
+  // and start polling at LINEAR_POLL_INTERVAL_SECONDS (default 300).
+  const linearApiKey = process.env.LINEAR_API_KEY;
+  const linearEnabled = Boolean(linearApiKey);
+  let linearSync: LinearSyncHandle | null = null;
+  if (linearApiKey) {
+    const adapter = createLinearAdapter({
+      apiKey: linearApiKey,
+      team: process.env.RUNWAY_LINEAR_TEAM,
+      readyStatus: process.env.RUNWAY_READY_STATUS,
+    });
+    const intervalSeconds =
+      parsePositiveInt(process.env.LINEAR_POLL_INTERVAL_SECONDS) ?? 300;
+    linearSync = startLinearSync({
+      adapter,
+      storage,
+      intervalSeconds,
+    });
+    console.log(
+      `[runway dashboard] linear sync: polling every ${intervalSeconds}s (team=${process.env.RUNWAY_LINEAR_TEAM ?? "VA"} ready=${process.env.RUNWAY_READY_STATUS ?? "Todo"})`,
+    );
+  } else {
+    console.log(
+      "[runway dashboard] linear sync: disabled (LINEAR_API_KEY not set)",
+    );
+  }
+
+  const otlp = await startServer({ storage, port: otlpPort, host, linearEnabled });
   const dashboard =
     dashboardPort === otlpPort
       ? otlp
-      : await startServer({ storage, port: dashboardPort, host });
+      : await startServer({ storage, port: dashboardPort, host, linearEnabled });
 
   console.log(
     `[runway dashboard] OTLP ${host}:${otlp.port} · dashboard ${host}:${dashboard.port}; sqlite=${sqlitePath}`,
@@ -356,6 +429,7 @@ export async function main(): Promise<void> {
 
   const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
     console.log(`[runway dashboard] ${signal} — shutting down`);
+    linearSync?.stop();
     await otlp.close();
     if (dashboard !== otlp) await dashboard.close();
     storage.close();

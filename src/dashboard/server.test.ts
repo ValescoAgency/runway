@@ -333,6 +333,70 @@ describe("dashboard HTTP server — VA-387 span enrichment", () => {
   });
 });
 
+// VA-390: when LINEAR_API_KEY is configured the server flips the
+// `linearEnabled` flag on; the list view then queries linear_snapshots
+// and renders the queue preview + per-row status badges. The poller
+// itself is covered in linear-sync.test.ts — these tests only assert
+// the server-level wiring.
+describe("dashboard HTTP server — Linear sync surfaces (VA-390)", () => {
+  it("hides the Todo queue section by default (LINEAR_API_KEY-absent path)", async () => {
+    const res = await fetch(`${base}/`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).not.toContain("Todo queue (next up)");
+  });
+
+  it("renders queue rows and per-row status badges when linearEnabled is true", async () => {
+    // Boot a second server instance with linearEnabled=true sharing
+    // the same storage so we can seed linear_snapshots rows before
+    // the GET fires.
+    storage.saveLinearSnapshot({
+      issueIdentifier: "VA-Q1",
+      snapshotAt: "t",
+      status: "Todo",
+      title: "Queued one",
+      labels: ["a"],
+      queuePosition: 0,
+    });
+    storage.saveLinearSnapshot({
+      issueIdentifier: "VA-312",
+      snapshotAt: "t2",
+      status: "In Review",
+      title: "Already processed",
+      labels: [],
+      queuePosition: null,
+    });
+    // Push a processIssue span so the row's identifier exists in
+    // issue_processes — the badge join key is issueIdentifier.
+    await fetch(`${base}/v1/traces`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(sampleTracesPayload),
+    });
+
+    const { startServer } = await import("./server.js");
+    const enabled = await startServer({
+      storage,
+      port: 0,
+      host: "127.0.0.1",
+      linearEnabled: true,
+    });
+    try {
+      const res = await fetch(`http://127.0.0.1:${enabled.port}/`);
+      const html = await res.text();
+      expect(html).toContain("Todo queue (next up)");
+      expect(html).toContain("VA-Q1");
+      expect(html).toContain("Queued one");
+      // The status badge for VA-312 reflects the fresher Linear status
+      // ("In Review") rather than the run's terminal outcome.
+      expect(html).toContain("status-badge");
+      expect(html).toContain("In Review");
+    } finally {
+      await enabled.close();
+    }
+  });
+});
+
 // VA-399: the evaluator-facing aggregates view is queryable both by an
 // external evaluator (sqlite SELECT) and the dashboard UI / HTTP
 // clients (GET /api/aggregates). This test asserts the HTTP shape — the

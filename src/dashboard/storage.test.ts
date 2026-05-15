@@ -419,6 +419,110 @@ describe("createStorage — listPhaseSpans (VA-389)", () => {
   });
 });
 
+// VA-390 (dashboard slice 6): linear_snapshots round-trip + the
+// queue_position semantics the dashboard depends on. The poller is
+// covered in linear-sync.test.ts; these tests pin the storage seams
+// it relies on.
+describe("createStorage — linear_snapshots (VA-390)", () => {
+  it("upserts a snapshot keyed on issue_identifier (last writer wins)", () => {
+    storage.saveLinearSnapshot({
+      issueIdentifier: "VA-1",
+      snapshotAt: "2026-05-15T00:00:00Z",
+      status: "Todo",
+      title: "first",
+      labels: ["bug"],
+      queuePosition: 0,
+    });
+    storage.saveLinearSnapshot({
+      issueIdentifier: "VA-1",
+      snapshotAt: "2026-05-15T00:05:00Z",
+      status: "In Progress",
+      title: "first (renamed)",
+      labels: ["bug", "wip"],
+      queuePosition: null,
+    });
+    const all = storage.listLinearSnapshots();
+    expect(all).toHaveLength(1);
+    expect(all[0]).toMatchObject({
+      status: "In Progress",
+      title: "first (renamed)",
+      labels: ["bug", "wip"],
+      queuePosition: null,
+    });
+  });
+
+  it("orders the Todo queue by queue_position and drops null-position rows", () => {
+    storage.saveLinearSnapshot({
+      issueIdentifier: "VA-2",
+      snapshotAt: "t",
+      status: "Todo",
+      title: "second",
+      labels: [],
+      queuePosition: 1,
+    });
+    storage.saveLinearSnapshot({
+      issueIdentifier: "VA-1",
+      snapshotAt: "t",
+      status: "Todo",
+      title: "first",
+      labels: [],
+      queuePosition: 0,
+    });
+    storage.saveLinearSnapshot({
+      issueIdentifier: "VA-99",
+      snapshotAt: "t",
+      status: "In Review",
+      title: "history",
+      labels: [],
+      queuePosition: null,
+    });
+    expect(storage.listLinearTodoQueue().map((q) => q.issueIdentifier)).toEqual([
+      "VA-1",
+      "VA-2",
+    ]);
+  });
+
+  it("clearLinearQueuePositions nulls every queue_position without dropping rows", () => {
+    storage.saveLinearSnapshot({
+      issueIdentifier: "VA-1",
+      snapshotAt: "t",
+      status: "Todo",
+      title: "x",
+      labels: [],
+      queuePosition: 0,
+    });
+    storage.saveLinearSnapshot({
+      issueIdentifier: "VA-2",
+      snapshotAt: "t",
+      status: "Todo",
+      title: "y",
+      labels: [],
+      queuePosition: 1,
+    });
+    storage.clearLinearQueuePositions();
+    expect(storage.listLinearTodoQueue()).toEqual([]);
+    expect(storage.listLinearSnapshots()).toHaveLength(2);
+    expect(
+      storage
+        .listLinearSnapshots()
+        .every((s) => s.queuePosition === null),
+    ).toBe(true);
+  });
+
+  it("round-trips an empty labels list as [] (not null)", () => {
+    storage.saveLinearSnapshot({
+      issueIdentifier: "VA-3",
+      snapshotAt: "t",
+      status: "Todo",
+      title: "x",
+      labels: [],
+      queuePosition: null,
+    });
+    const out = storage.listLinearSnapshots();
+    expect(out[0]?.labels).toEqual([]);
+  });
+});
+
 // VA-399: evaluator_aggregates_v1 — the IRA-facing read-model.
 // Fixtures are intentionally tiny (single-digit row counts) so a
 // future reader can verify each expected value by mental arithmetic.
