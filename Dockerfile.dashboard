@@ -9,11 +9,25 @@
 FROM node:24-slim AS build
 WORKDIR /app
 
-# Enable corepack-managed pnpm; the lockfile pins the version
-# transitively via packageManager (when present). `--frozen-lockfile`
-# guarantees we install exactly what was resolved at commit time.
-RUN corepack enable
-COPY package.json pnpm-lock.yaml ./
+# VA-393: install pnpm directly rather than going through corepack.
+# Recent Node 24 + corepack combinations require an integrity hash in
+# package.json#packageManager to auto-download a pinned pnpm version;
+# without one, `pnpm install` fails non-interactively in CI. Direct
+# `npm i -g` skips the corepack signature/prompt flow entirely. The
+# version is kept in sync manually with package.json#packageManager
+# (currently pnpm@11.1.1) — both lines are one-liners, so the
+# drift risk is low and grep-discoverable.
+RUN npm install -g pnpm@11.1.1
+# pnpm 11 reads build-script approval from pnpm-workspace.yaml
+# (`allowBuilds`); without it pnpm errors out on every install with
+# ERR_PNPM_IGNORED_BUILDS. The `.npmrc` is also copied so any scope-
+# routing rules (we pin @valescoagency to the public registry) apply
+# inside the container as well.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
+# `--frozen-lockfile` guarantees we install exactly what was resolved
+# at commit time. The repo's `prepare` script (`lefthook install -f`)
+# expects a `.git` dir and silently exits via `|| true` when it's
+# missing — that's why we don't need to drag git into the build stage.
 RUN pnpm install --frozen-lockfile
 
 COPY tsconfig.json tsconfig.build.json ./

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { dashCommand, printDashUsage } from "./commands/dash.js";
 import { doctorCommand, printDoctorUsage } from "./commands/doctor.js";
 import { initCommand, printInitUsage } from "./commands/init.js";
 import { runCommand, printRunUsage } from "./commands/run.js";
@@ -16,6 +17,12 @@ interface Subcommand {
 }
 
 const SUBCOMMANDS: readonly Subcommand[] = [
+  {
+    name: "dash",
+    summary: "Operate the runway operations dashboard (up / logs / stop).",
+    run: dashCommand,
+    help: printDashUsage,
+  },
   {
     name: "doctor",
     summary: "Read-only preflight: tooling, env, repo state, agent image.",

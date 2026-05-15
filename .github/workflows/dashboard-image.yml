@@ -1,0 +1,75 @@
+name: Dashboard image
+
+# VA-393: builds + publishes the operations dashboard image to GHCR.
+# Triggers:
+#   - push to master  → :latest, :master, :<git-sha-short>
+#   - push of v*.*.*  → :<semver>, :<semver>-major-minor, :<semver>-major, :<git-sha-short>
+# Pull requests build only (no push) so contributor forks can't poison the
+# published tag stream.
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - "v*.*.*"
+  pull_request:
+    paths:
+      - "Dockerfile.dashboard"
+      - "src/dashboard/**"
+      - ".github/workflows/dashboard-image.yml"
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      # `packages: write` is required to push to ghcr.io. `contents: read`
+      # covers the checkout. `id-token: write` is here for future
+      # provenance (cosign/sigstore) — harmless when unused.
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/runway-dashboard
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        # Pull requests don't push; skip auth so contributor forks
+        # (which can't read packages: write) still build cleanly.
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # docker/metadata-action turns refs into a tag set: master → latest,
+      # v1.2.3 → 1.2.3 + 1.2 + 1, every ref gets a short SHA tag.
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.dashboard
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
