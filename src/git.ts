@@ -195,17 +195,28 @@ export const hasCommits = (
 
 /**
 /**
- * VA-419: outcome of a rebase-onto-base attempt at finalize time.
+ * VA-419 / VA-424: outcome of a rebase-onto-base attempt at finalize time.
  *
- *   ok       — fast-forward or clean replay; the agent branch ref now
- *              points at the rebased commits and is safe to push.
- *   conflict — git rebase exited non-zero. We capture the unmerged
- *              file list (best-effort) and call `git rebase --abort`
- *              before returning so the working tree is restored.
+ *   ok       — exit 0 (no-op or clean replay); the agent branch ref
+ *              now points at the rebased commits and is safe to push.
+ *   conflict — exit non-zero AND `git diff --name-only --diff-filter=U`
+ *              reported unmerged files. A real merge conflict.
+ *   failure  — exit non-zero with no unmerged files. Something other
+ *              than a merge conflict broke the rebase (dirty host
+ *              worktree, signing hook, lock contention, etc.); we
+ *              capture stderr/stdout for the HITL diagnostic.
+ *
+ * Either non-ok outcome runs `git rebase --abort` before returning so
+ * the working tree is restored.
  */
 export type RebaseResult =
   | { readonly kind: "ok" }
-  | { readonly kind: "conflict"; readonly conflictedFiles: readonly string[] };
+  | { readonly kind: "conflict"; readonly conflictedFiles: readonly string[] }
+  | {
+      readonly kind: "failure";
+      readonly stderr: string;
+      readonly stdout: string;
+    };
 
 /**
  * VA-419: fetch the latest `origin/<baseBranch>` and rebase the agent
@@ -223,9 +234,13 @@ export type RebaseResult =
  *
  * The fetch step may fail (network blip, gh auth expired). We let
  * that error bubble — finalize routes it through the existing
- * processIssue failure path. A non-zero rebase exit is treated as
- * "conflict" regardless of cause, since the safe response is the
- * same: abort and route to HITL.
+ * processIssue failure path.
+ *
+ * VA-424: a non-zero rebase exit is no longer collapsed to "conflict".
+ * We probe `git diff --name-only --diff-filter=U` and split: unmerged
+ * files present → real merge conflict; empty → non-conflict failure
+ * (dirty host worktree, signing hook, etc.). The two cases need
+ * different HITL diagnostics, so we surface them separately.
  */
 export const rebaseOntoBase = (
   repoPath: string,
@@ -255,7 +270,8 @@ export const rebaseOntoBase = (
     }
 
     // Collect the unmerged file list before aborting — `--diff-filter=U`
-    // matches only files git left in conflict state.
+    // matches only files git left in conflict state. Empty list means
+    // the rebase failed for a non-conflict reason.
     const conflictedFiles = yield* runExecaScoped(
       "git",
       ["diff", "--name-only", "--diff-filter=U"],
@@ -284,7 +300,15 @@ export const rebaseOntoBase = (
       }),
     ).pipe(Effect.catchAll(() => Effect.succeed(undefined)));
 
-    return { kind: "conflict", conflictedFiles } as const;
+    if (conflictedFiles.length > 0) {
+      return { kind: "conflict", conflictedFiles } as const;
+    }
+
+    const rawStderr = (rebase as { stderr?: unknown }).stderr;
+    const stderr = typeof rawStderr === "string" ? rawStderr : "";
+    const rawStdout = rebase.stdout;
+    const stdout = typeof rawStdout === "string" ? rawStdout : "";
+    return { kind: "failure", stderr, stdout } as const;
   });
 
 /**

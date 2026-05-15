@@ -13,7 +13,11 @@ import {
   formatPriorFeedback,
 } from "./prompts.js";
 import { runReviewPass } from "./review.js";
-import { finalize, formatRebaseConflictReason } from "./finalize.js";
+import {
+  finalize,
+  formatRebaseConflictReason,
+  formatRebaseFailureReason,
+} from "./finalize.js";
 
 // Re-exports so existing callers (commands/run.ts) and tests
 // (orchestrator.test.ts) keep working without import churn. The
@@ -395,15 +399,20 @@ const processIssue = (
 
       const review = yield* runReviewPass(issue, deps, branch);
       if (review.kind === "approved") {
-        // VA-419: finalize may report `rebase-conflict` when the base
-        // branch advanced during this drain and the post-review rebase
-        // hit a conflict. Route to HITL with the conflicted-file list
-        // — reviewer's APPROVED verdict is preserved in the message so
-        // the operator knows the diff was good before the conflict
-        // surfaced.
+        // VA-419 / VA-424: finalize may report `rebase-conflict` (real
+        // merge conflicts) or `rebase-failure` (non-zero rebase exit
+        // with no unmerged files — e.g., dirty host worktree, signing
+        // hook). Both route to HITL but with distinct diagnostics so
+        // the operator sees the real cause. Reviewer's APPROVED
+        // verdict is preserved in either message.
         const finalized = yield* finalize(issue, deps, branch);
         if (finalized.kind === "rebase-conflict") {
           const reason = formatRebaseConflictReason(finalized);
+          yield* flagHitl(issue, deps, reason);
+          return { kind: "hitl", detail: reason };
+        }
+        if (finalized.kind === "rebase-failure") {
+          const reason = formatRebaseFailureReason(finalized);
           yield* flagHitl(issue, deps, reason);
           return { kind: "hitl", detail: reason };
         }

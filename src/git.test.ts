@@ -302,14 +302,32 @@ describe("pruneStaleAgentBranch (VA-366 + VA-417)", () => {
   });
 });
 
-describe("rebaseOntoBase (VA-419)", () => {
+describe("rebaseOntoBase (VA-419 / VA-424)", () => {
   const runRebase = (base = "master", branch = "agent/va-419") =>
     Effect.runPromise(rebaseOntoBase("/tmp/repo", base, branch));
 
-  it("returns `ok` when fetch and rebase both exit 0 (clean replay)", async () => {
+  it("returns `ok` for a no-op rebase (exit 0, branch already at base)", async () => {
+    // Real-world: branch ref equals origin/<base> tip — git prints
+    // "Current branch ... is up to date." and exits 0. No replayed
+    // commits, but still an `ok` outcome → finalize opens the PR.
     execaMock
       .mockResolvedValueOnce({ exitCode: 0, stdout: "" }) // fetch
-      .mockResolvedValueOnce({ exitCode: 0, stdout: "" }); // rebase
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        stdout: "Current branch agent/va-419 is up to date.\n",
+      });
+    await expect(runRebase()).resolves.toEqual({ kind: "ok" });
+    // No diff or --abort calls — the no-op path is straight-through.
+    expect(execaMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns `ok` for a clean fast-forward / replay (exit 0 with replayed commits)", async () => {
+    execaMock
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "" }) // fetch
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        stdout: "Successfully rebased and updated refs/heads/agent/va-419.\n",
+      });
     await expect(runRebase()).resolves.toEqual({ kind: "ok" });
 
     expect(execaMock.mock.calls[0]?.[1]).toEqual([
@@ -322,14 +340,17 @@ describe("rebaseOntoBase (VA-419)", () => {
       "origin/master",
       "agent/va-419",
     ]);
-    // Clean path doesn't run diff or --abort.
     expect(execaMock).toHaveBeenCalledTimes(2);
   });
 
-  it("on non-zero rebase exit: captures the conflicted-file list and aborts", async () => {
+  it("returns `conflict` with the unmerged file list when git reports unmerged paths", async () => {
     execaMock
       .mockResolvedValueOnce({ exitCode: 0, stdout: "" }) // fetch
-      .mockResolvedValueOnce({ exitCode: 1, stdout: "" }) // rebase fails
+      .mockResolvedValueOnce({
+        exitCode: 1,
+        stdout: "",
+        stderr: "CONFLICT (content): Merge conflict in src/dashboard/storage.ts\n",
+      }) // rebase fails
       .mockResolvedValueOnce({
         // diff --name-only --diff-filter=U
         exitCode: 0,
@@ -354,16 +375,41 @@ describe("rebaseOntoBase (VA-419)", () => {
     expect(execaMock.mock.calls[3]?.[1]).toEqual(["rebase", "--abort"]);
   });
 
-  it("still emits a conflict outcome (with an empty file list) when the diff probe fails", async () => {
+  it("returns `failure` (with stderr) when rebase exits non-zero but git reports no unmerged files", async () => {
+    // VA-424: non-conflict failure path — e.g., dirty host worktree,
+    // signing hook, lock contention. Mode A from the live evidence.
     execaMock
       .mockResolvedValueOnce({ exitCode: 0, stdout: "" }) // fetch
-      .mockResolvedValueOnce({ exitCode: 1, stdout: "" }) // rebase fails
+      .mockResolvedValueOnce({
+        exitCode: 128,
+        stdout: "",
+        stderr: "error: cannot rebase: You have unstaged changes.\n",
+      }) // rebase fails for non-conflict reason
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "" }) // diff probe empty
+      .mockResolvedValueOnce({ exitCode: 128, stdout: "" }); // rebase --abort (no-op, no rebase in progress)
+
+    await expect(runRebase()).resolves.toEqual({
+      kind: "failure",
+      stderr: "error: cannot rebase: You have unstaged changes.\n",
+      stdout: "",
+    });
+  });
+
+  it("returns `failure` when the diff probe throws (no unmerged-file evidence available)", async () => {
+    execaMock
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "" }) // fetch
+      .mockResolvedValueOnce({
+        exitCode: 1,
+        stdout: "",
+        stderr: "fatal: some other rebase failure\n",
+      })
       .mockRejectedValueOnce(new Error("git broke")) // diff probe throws
       .mockResolvedValueOnce({ exitCode: 0, stdout: "" }); // rebase --abort
 
     await expect(runRebase()).resolves.toEqual({
-      kind: "conflict",
-      conflictedFiles: [],
+      kind: "failure",
+      stderr: "fatal: some other rebase failure\n",
+      stdout: "",
     });
   });
 

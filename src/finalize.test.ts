@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { buildPrBody, formatRebaseConflictReason } from "./finalize.js";
+import {
+  buildPrBody,
+  formatRebaseConflictReason,
+  formatRebaseFailureReason,
+} from "./finalize.js";
 import type { RunwayIssue } from "./linear.js";
 
 const issue: RunwayIssue = {
@@ -24,7 +28,7 @@ describe("buildPrBody (VA-412)", () => {
   });
 });
 
-describe("formatRebaseConflictReason (VA-419)", () => {
+describe("formatRebaseConflictReason (VA-419 / VA-424)", () => {
   it("names the base branch, lists conflicted files, and quotes the APPROVED verdict", () => {
     const reason = formatRebaseConflictReason({
       baseBranch: "master",
@@ -34,19 +38,84 @@ describe("formatRebaseConflictReason (VA-419)", () => {
       ],
       reviewVerdict: "REVIEW: APPROVED",
     });
-    expect(reason).toMatch(/Upstream base `master` advanced/);
+    expect(reason).toMatch(/onto `origin\/master` produced merge/);
     expect(reason).toMatch(/- src\/dashboard\/storage\.ts/);
     expect(reason).toMatch(/- src\/dashboard\/storage\.test\.ts/);
     expect(reason).toMatch(/Review was APPROVED before the rebase/);
     expect(reason).toMatch(/`REVIEW: APPROVED`/);
   });
 
-  it("falls back to a hint when git reported no conflicted files", () => {
+  it("does not claim 'upstream advanced' (VA-424 fix — that wording was inaccurate)", () => {
     const reason = formatRebaseConflictReason({
-      baseBranch: "main",
-      conflictedFiles: [],
+      baseBranch: "master",
+      conflictedFiles: ["src/foo.ts"],
       reviewVerdict: "REVIEW: APPROVED",
     });
-    expect(reason).toMatch(/no conflicted files reported by git/);
+    expect(reason).not.toMatch(/Upstream base.*advanced/);
+  });
+
+  it("does not recommend letting VA-417 handle it (VA-424 fix — VA-417 destroys approved work)", () => {
+    const reason = formatRebaseConflictReason({
+      baseBranch: "master",
+      conflictedFiles: ["src/foo.ts"],
+      reviewVerdict: "REVIEW: APPROVED",
+    });
+    expect(reason).not.toMatch(/VA-417/);
+    // The original wording told operators to "let VA-417 handle it on the
+    // next drain" — that path destroys approved work. New wording must
+    // not recommend deferring to the next drain (it can still warn
+    // operators _not_ to do so, which is the opposite advice).
+    expect(reason).not.toMatch(/(^|[^A-Z])let .*(VA-417|next drain) handle/i);
+    expect(reason).toMatch(/manually/);
+  });
+});
+
+describe("formatRebaseFailureReason (VA-424)", () => {
+  it("surfaces git stderr, names the base branch, and quotes the APPROVED verdict", () => {
+    const reason = formatRebaseFailureReason({
+      baseBranch: "master",
+      stderr: "error: cannot rebase: You have unstaged changes.\n",
+      stdout: "",
+      reviewVerdict: "REVIEW: APPROVED",
+    });
+    expect(reason).toMatch(/onto `origin\/master` failed/);
+    expect(reason).toMatch(/no unmerged files/);
+    expect(reason).toMatch(/cannot rebase: You have unstaged changes/);
+    expect(reason).toMatch(/Review was APPROVED before the rebase/);
+  });
+
+  it("falls back to stdout when stderr is empty", () => {
+    const reason = formatRebaseFailureReason({
+      baseBranch: "main",
+      stderr: "",
+      stdout: "some rebase output that hints at what went wrong",
+      reviewVerdict: "REVIEW: APPROVED",
+    });
+    expect(reason).toMatch(/some rebase output/);
+  });
+
+  it("renders a placeholder when git produced no output", () => {
+    const reason = formatRebaseFailureReason({
+      baseBranch: "main",
+      stderr: "",
+      stdout: "",
+      reviewVerdict: "REVIEW: APPROVED",
+    });
+    expect(reason).toMatch(/no stderr or stdout/);
+  });
+
+  it("does not recommend letting VA-417 handle it (VA-417 destroys approved work)", () => {
+    const reason = formatRebaseFailureReason({
+      baseBranch: "master",
+      stderr: "some failure",
+      stdout: "",
+      reviewVerdict: "REVIEW: APPROVED",
+    });
+    expect(reason).not.toMatch(/VA-417/);
+    // The original wording told operators to "let VA-417 handle it on the
+    // next drain" — that path destroys approved work. New wording must
+    // not recommend deferring to the next drain (it can still warn
+    // operators _not_ to do so, which is the opposite advice).
+    expect(reason).not.toMatch(/(^|[^A-Z])let .*(VA-417|next drain) handle/i);
   });
 });
