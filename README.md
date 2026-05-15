@@ -8,10 +8,11 @@ coding-agent runs, then **drain** a Linear queue against it. Wraps
 inside Docker), [varlock](https://varlock.dev) + 1Password for
 zero-secrets-at-rest, and the `gh` CLI for PR creation.
 
-## Five commands
+## Six commands
 
 | | |
 |---|---|
+| `runway dash` | Bring up the operations dashboard (`up` / `logs` / `stop`). Wraps the published `ghcr.io/valescoagency/runway-dashboard` image so any runway-using project can run the dashboard without cloning runway. Ports bind to `127.0.0.1` only. |
 | `runway doctor` | Read-only preflight diagnostic: host tooling, env vars, repo state, and the agent docker image. Use when something stopped working and you want a sanity report. `--json` for CI / scripted health checks. |
 | `runway init` | Scaffold the cwd repo for runway: write `.sandcastle/Dockerfile` + (tier 2) `.env.schema` with op:// references. Run **once per target repo**. |
 | `runway run` | Drain a Linear queue. For each `Todo` issue: branch, agent works, sub-agent reviews, PR opens (or `ready-for-human` label). Run **whenever you want a batch of work done**. |
@@ -386,6 +387,76 @@ the issue gets the HITL label and a comment with the reviewer's reason.
 
 The reviewer is intentionally adversarial — its job is to find reasons
 NOT to ship, not to rubber-stamp.
+
+## Dashboard
+
+`runway run` emits OpenTelemetry traces + logs for every drain. The
+operations dashboard projects those into a local SQLite db and serves
+a single-page web UI for browsing recent runs, drilling into per-issue
+timelines, and filtering by outcome / drain / date range. Binds to
+`127.0.0.1` only — no auth, no LAN exposure by default.
+
+### v2: `runway dash` (recommended)
+
+```bash
+# Bring up the dashboard from any directory — no runway clone required.
+runway dash up
+
+# In another shell, point runway run at it:
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+runway run
+
+# Open http://localhost:3001/ in a browser.
+
+# Tail the container logs.
+runway dash logs --follow
+
+# Tear down (volume + history preserved).
+runway dash stop
+
+# Tear down AND drop history.
+runway dash stop --purge
+```
+
+`runway dash up` pulls `ghcr.io/valescoagency/runway-dashboard:latest`,
+creates a named volume (`runway-dashboard-data`) for the SQLite db,
+and runs a detached container. Repeated `runway dash up` calls are
+idempotent: an already-running container stays as-is, a stopped one
+is started, otherwise a fresh container is created.
+
+Override the image with `--image=…` or `RUNWAY_DASHBOARD_IMAGE`; the
+ports with `--otlp-port=…` / `--dashboard-port=…`. Forward Linear
+sync by exporting `LINEAR_API_KEY` (and optionally
+`LINEAR_POLL_INTERVAL_SECONDS`, `RUNWAY_LINEAR_TEAM`,
+`RUNWAY_READY_STATUS`) before `runway dash up` — the CLI passes them
+through to the container without echoing the value through argv.
+
+### v1: docker-compose (for hacking on the dashboard itself)
+
+The runway repo also ships a `docker-compose.yml` that builds the
+dashboard locally from `Dockerfile.dashboard`. Use this when you're
+developing the dashboard code and want to iterate without publishing
+an image:
+
+```bash
+git clone https://github.com/ValescoAgency/runway && cd runway
+docker compose up           # builds + runs the local image
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+```
+
+### Migrating from compose to `runway dash`
+
+1. `docker compose down` (in the runway repo).
+2. `runway dash up` (anywhere).
+
+The default named volume is different (`runway-dashboard-data` vs
+compose's `runway-data`), so history doesn't carry over automatically.
+To preserve it, copy the volume contents before switching:
+
+```bash
+docker run --rm -v runway-data:/from -v runway-dashboard-data:/to \
+  alpine sh -c 'cp -a /from/. /to/'
+```
 
 ## What's deliberately missing in v1
 
