@@ -127,6 +127,25 @@ describe("dashboard HTTP server (VA-386)", () => {
   });
 });
 
+// VA-385: localhost-only bind is an explicit security commitment in
+// the dashboard ADR ("Binds to 127.0.0.1 only. No auth in v1."). When
+// `host` is omitted, startServer must bind loopback rather than
+// inheriting the prior 0.0.0.0 default.
+describe("dashboard HTTP server — default bind address (VA-385)", () => {
+  it("binds to 127.0.0.1 when host is unspecified", async () => {
+    const localStorage = createStorage(":memory:");
+    const localRunning = await startServer({ storage: localStorage, port: 0 });
+    try {
+      const addr = localRunning.server.address();
+      expect(addr && typeof addr === "object").toBe(true);
+      expect((addr as { address: string }).address).toBe("127.0.0.1");
+    } finally {
+      await localRunning.close();
+      localStorage.close();
+    }
+  });
+});
+
 // VA-389: the detail route picks up impl-iter spans + review/finalize
 // phase spans from the same POST that fed the list view and renders
 // a single timeline page.

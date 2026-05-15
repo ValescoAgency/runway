@@ -36,7 +36,15 @@ export interface ServerOptions {
   readonly storage: Storage;
   /** Listening port. Defaults to `OTLP_PORT` (4318). */
   readonly port?: number;
-  /** Bind address; defaults to `0.0.0.0` (Docker-friendly). */
+  /**
+   * Bind address. Defaults to `127.0.0.1` per VA-385's security
+   * commitment ("Binds to `127.0.0.1` only. No auth in v1."). The
+   * Dockerfile overrides this to `0.0.0.0` via `DASHBOARD_HOST` so
+   * Docker's port forwarding can reach the listener; docker-compose
+   * then gates the host port to loopback via the `127.0.0.1:` prefix
+   * on the published port. Stand-alone (non-Docker) operators get
+   * loopback-only by default.
+   */
   readonly host?: string;
 }
 
@@ -68,7 +76,7 @@ export function buildServer(storage: Storage): Server {
 export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   const server = buildServer(opts.storage);
   const port = opts.port ?? 4318;
-  const host = opts.host ?? "0.0.0.0";
+  const host = opts.host ?? "127.0.0.1";
 
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -320,6 +328,11 @@ export async function main(): Promise<void> {
   const sqlitePath = process.env.SQLITE_PATH ?? "/data/runway.sqlite";
   const otlpPort = parsePort("OTLP_PORT", "4318");
   const dashboardPort = parsePort("DASHBOARD_PORT", "3001");
+  // VA-385: explicit security commitment — loopback by default. The
+  // Dockerfile sets `DASHBOARD_HOST=0.0.0.0` so Docker's port-forward
+  // can reach the listener; stand-alone (e.g. `runway dash`) gets
+  // 127.0.0.1 without configuration.
+  const host = process.env.DASHBOARD_HOST?.trim() || "127.0.0.1";
   // VA-399: rolling-window size for the evaluator aggregates view.
   // Defaults to 30 drains; operators bump it for longer-baseline IRA
   // comparisons. Missing/invalid → fall through to the storage layer's
@@ -331,14 +344,14 @@ export async function main(): Promise<void> {
   const storage = createStorage(sqlitePath, {
     aggregateWindowDrains: aggregateWindow,
   });
-  const otlp = await startServer({ storage, port: otlpPort });
+  const otlp = await startServer({ storage, port: otlpPort, host });
   const dashboard =
     dashboardPort === otlpPort
       ? otlp
-      : await startServer({ storage, port: dashboardPort });
+      : await startServer({ storage, port: dashboardPort, host });
 
   console.log(
-    `[runway dashboard] OTLP :${otlp.port} · dashboard :${dashboard.port}; sqlite=${sqlitePath}`,
+    `[runway dashboard] OTLP ${host}:${otlp.port} · dashboard ${host}:${dashboard.port}; sqlite=${sqlitePath}`,
   );
 
   const shutdown = async (signal: NodeJS.Signals): Promise<void> => {

@@ -24,13 +24,17 @@ services:
       DASHBOARD_PORT: ${DASHBOARD_PORT:-3001}
       SQLITE_PATH: /data/runway.sqlite
     ports:
+      # VA-385: bind host-side to 127.0.0.1 only. The dashboard's
+      # security commitment is loopback-only; without the explicit
+      # `127.0.0.1:` prefix Docker publishes to 0.0.0.0 on the host
+      # and the dashboard becomes reachable from the LAN. Container
+      # side stays 0.0.0.0 (set by `DASHBOARD_HOST` in the Dockerfile)
+      # so Docker's port-forward to the listener still works.
+      #
       # OTLP HTTP endpoint — `runway run` posts /v1/traces here.
-      # Host and container side use the same value so the server's
-      # listener (driven by OTLP_PORT inside the container) lines up
-      # with the host port without further override.
-      - "${OTLP_PORT:-4318}:${OTLP_PORT:-4318}"
+      - "127.0.0.1:${OTLP_PORT:-4318}:${OTLP_PORT:-4318}"
       # Dashboard UI — operator opens this in a browser.
-      - "${DASHBOARD_PORT:-3001}:${DASHBOARD_PORT:-3001}"
+      - "127.0.0.1:${DASHBOARD_PORT:-3001}:${DASHBOARD_PORT:-3001}"
     volumes:
       - runway-data:/data
     healthcheck:
