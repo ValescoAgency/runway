@@ -154,6 +154,48 @@ varlock run --schema /path/to/runway/.env.schema -- runway --max 3
 Without varlock, runway falls back to plain `process.env` and
 sandcastle reads `.sandcastle/.env` per its docs.
 
+## Signed agent commits (optional)
+
+Runway can sign every commit the agent produces so the PR lands on
+GitHub with a **Verified** badge. Off by default; opt in per target
+repo by populating four extra refs in `.env.schema`.
+
+Setup (one-time per bot):
+
+1. Generate an Ed25519 SSH signing keypair for the runway agent:
+
+   ```bash
+   ssh-keygen -t ed25519 -C "runway-agent" -N "" -f ~/.ssh/runway_bot
+   ```
+
+2. Store the keypair plus the bot's git identity in 1Password under
+   `op://<vault>/runway-signing-ssh`:
+
+   | field     | value                                      |
+   |-----------|--------------------------------------------|
+   | `private` | contents of `~/.ssh/runway_bot`            |
+   | `public`  | contents of `~/.ssh/runway_bot.pub`        |
+   | `name`    | the bot's git `user.name` (e.g. `Runway Agent`) |
+   | `email`   | the bot's git `user.email` (must match the GitHub agent account) |
+
+3. Register the public key as a **Signing Key** on the GitHub
+   account that owns the agent's `GH_TOKEN` (this is what makes
+   GitHub render Verified — both Authentication and Signing Keys
+   are managed under Settings → SSH and GPG keys).
+
+4. Uncomment the four `RUNWAY_SIGNING_*` lines at the bottom of
+   `.env.schema` (the file `runway init --tier=2` wrote at your repo
+   root). The lines come pre-filled with `op://` references
+   matching the layout above.
+
+Validate with `runway doctor`: the **Environment / agent commit
+signing** check goes from `warn (off)` to `ok` once all four refs
+are declared. Tear down by re-commenting the four lines — runway
+falls back to plain unsigned commits.
+
+Design rationale + future migration path (GitHub App identity) is in
+[`docs/adr/0003-agent-commit-signing.md`](docs/adr/0003-agent-commit-signing.md).
+
 ## Install
 
 ```bash

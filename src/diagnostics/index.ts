@@ -122,6 +122,7 @@ import { linearScopeDiagnostic } from "./linear-scope.js";
 import { baseBranchDiagnostic } from "./base-branch.js";
 import { opTokenDiagnostic } from "./op-token.js";
 import { claudeAuthModeDiagnostic } from "./claude-auth-mode.js";
+import { gitSigningDiagnostic } from "./git-signing.js";
 import { policyDiagnostic } from "./policy.js";
 import { gitStateDiagnostic } from "./git-state.js";
 import { runwayScaffoldDiagnostic } from "./runway-scaffold.js";
@@ -142,6 +143,7 @@ export const DIAGNOSTICS: readonly Diagnostic[] = [
   baseBranchDiagnostic,
   opTokenDiagnostic,
   claudeAuthModeDiagnostic,
+  gitSigningDiagnostic,
   policyDiagnostic,
   // Repo state
   gitStateDiagnostic,

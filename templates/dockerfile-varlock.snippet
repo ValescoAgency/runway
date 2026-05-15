@@ -21,18 +21,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && rm -rf /var/lib/apt/lists/*
 
 # Shim the `claude` binary so every invocation runs through varlock.
-# The real binary moves to claude.real; the shim resolves secrets from
-# 1Password (using OP_SERVICE_ACCOUNT_TOKEN passed in by runway) and
-# execs the real claude with secrets in its process env. Secrets exist
-# only inside the lifetime of one claude invocation — never in any
-# image layer, never on the container filesystem.
-RUN mv /home/agent/.local/bin/claude /home/agent/.local/bin/claude.real \
-  && printf '%s\n' \
-       '#!/usr/bin/env bash' \
-       'set -euo pipefail' \
-       'exec varlock run --env-file /home/agent/workspace/.env.schema -- /home/agent/.local/bin/claude.real "$@"' \
-       > /home/agent/.local/bin/claude \
-  && chmod +x /home/agent/.local/bin/claude \
+# The real binary moves to claude.real; the shim (vendored at
+# .sandcastle/runway-claude-shim by `runway init --tier=2`) resolves
+# secrets from 1Password (using OP_SERVICE_ACCOUNT_TOKEN passed in by
+# runway) and execs the real claude with secrets in its process env.
+# Secrets exist only inside the lifetime of one claude invocation —
+# never in any image layer, never on the container filesystem.
+#
+# VA-413: when .env.schema declares the runway agent signing env vars
+# (RUNWAY_SIGNING_SSH_PRIVKEY, _PUBKEY, _NAME, _EMAIL), the shim also
+# materialises the SSH signing key to a 0600 file under $HOME and
+# configures git to use it. The bootstrap is a no-op when any of the
+# four are unset, so unsigned-commit scaffolds keep working.
+RUN mv /home/agent/.local/bin/claude /home/agent/.local/bin/claude.real
+COPY .sandcastle/runway-claude-shim /home/agent/.local/bin/claude
+RUN chmod +x /home/agent/.local/bin/claude \
   && chown ${AGENT_UID}:${AGENT_GID} /home/agent/.local/bin/claude
 
 USER ${AGENT_UID}:${AGENT_GID}
