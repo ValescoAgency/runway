@@ -104,23 +104,22 @@ export interface RunwayConfig {
    */
   readonly commentAuthorAllowlist?: readonly string[];
   /**
-   * VA-402: the Anthropic model the IRA's Run Review pass invokes.
-   * Default `claude-sonnet-4-6` — sufficient judgment quality for
-   * structured per-run grading, cheaper than Opus. Overridable via
-   * `RUNWAY_META_REVIEW_MODEL` for operators who want stronger
-   * reasoning (and are willing to pay for it). Distinct from the
-   * impl / reviewer agent models (those run inside the sandcastle
-   * container; this one runs in the runway process).
+   * VA-402: env-only signal for the Anthropic model the IRA's Run
+   * Review pass invokes. `undefined` when `RUNWAY_META_REVIEW_MODEL`
+   * is unset — the runner then falls back to `.runway/config.yml`
+   * (matches the PRD's `.afk/config.yml` intent under runway's
+   * existing `.runway/*.yml` convention) and finally to the
+   * hard-coded `claude-sonnet-4-6` default. Resolution lives in
+   * `meta/runner.ts` so the file-merge stays close to the pass that
+   * actually consumes it.
    */
-  readonly metaReviewModel: string;
+  readonly metaReviewModel?: string;
   /**
-   * VA-402: name of the Linear project the IRA writes its Reviews
-   * into. Defaults to `runway-meta` per the PRD; overridable for
-   * operators that already host a project under a different name.
-   * Resolved by name (not by ID) so the same env var works against
-   * any workspace.
+   * VA-402: env-only signal for the Linear project the IRA writes
+   * its Reviews into. Same resolution chain as `metaReviewModel`:
+   * env → `.runway/config.yml` → `"runway-meta"` default.
    */
-  readonly metaProjectName: string;
+  readonly metaProjectName?: string;
 }
 
 // Back-compat alias — existing consumers (orchestrator, gateways)
@@ -184,12 +183,8 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
   commentAuthorAllowlist: EConfig.option(
     EConfig.string("RUNWAY_COMMENT_AUTHOR_ALLOWLIST"),
   ),
-  metaReviewModel: EConfig.string("RUNWAY_META_REVIEW_MODEL").pipe(
-    EConfig.withDefault("claude-sonnet-4-6"),
-  ),
-  metaProjectName: EConfig.string("RUNWAY_META_PROJECT_NAME").pipe(
-    EConfig.withDefault("runway-meta"),
-  ),
+  metaReviewModel: EConfig.option(EConfig.string("RUNWAY_META_REVIEW_MODEL")),
+  metaProjectName: EConfig.option(EConfig.string("RUNWAY_META_PROJECT_NAME")),
 }).pipe(
   Effect.map(
     (raw): RunwayConfig => ({
@@ -211,8 +206,8 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
         ?.split(",")
         .map((s) => s.trim())
         .filter(Boolean),
-      metaReviewModel: raw.metaReviewModel,
-      metaProjectName: raw.metaProjectName,
+      metaReviewModel: Option.getOrUndefined(raw.metaReviewModel),
+      metaProjectName: Option.getOrUndefined(raw.metaProjectName),
     }),
   ),
 );

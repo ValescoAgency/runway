@@ -76,7 +76,12 @@ export async function reviewCommand(argv: readonly string[]): Promise<void> {
   const outcome = await Effect.runPromise(
     dispatchRunReview(
       { traceId: parsed.traceId, issueIdentifier: parsed.issueIdentifier },
-      { config, dashboardDbPath, anthropicApiKey },
+      {
+        config,
+        cwd: process.cwd(),
+        dashboardDbPath,
+        anthropicApiKey,
+      },
     ),
   );
 

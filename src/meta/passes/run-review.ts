@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { Effect } from "effect";
 import type { Storage } from "../../dashboard/storage.js";
+import { loadContextFor, type RunReviewContext } from "../context.js";
 import type {
   CapturedCodingAgentReport,
   CapturedIssueProcess,
@@ -71,31 +72,28 @@ export const runRunReviewPass = (
   deps: RunReviewPassDeps,
 ): Effect.Effect<RunReviewPassOutcome, never, never> =>
   Effect.gen(function* () {
-    // 1) Load the captured context. A missing issue_processes row is
-    //    a real error (drain too fresh or collector dropped the
-    //    batch); we surface it as a stub and exit 0.
-    const ip = yield* deps.dashboardRead
-      .loadIssueProcess(args.traceId, args.issueIdentifier)
-      .pipe(
-        Effect.either,
-      );
-    if (ip._tag === "Left") {
+    // 1) Load the captured context via the `meta/context` seam.
+    //    Discriminated by pass — VA-403 / VA-405 widen the shape
+    //    without editing this pass.
+    const contextResult = yield* loadContextFor(
+      {
+        pass: "run-review",
+        traceId: args.traceId,
+        issueIdentifier: args.issueIdentifier,
+      },
+      deps.dashboardRead,
+    ).pipe(Effect.either);
+    if (contextResult._tag === "Left") {
       return yield* writeFailedStub(
         args,
         deps,
-        `failed to load issue_process: ${
-          (ip.left as { message?: string }).message ?? String(ip.left)
+        `failed to load context: ${
+          (contextResult.left as { message?: string }).message ??
+          String(contextResult.left)
         }`,
       );
     }
-    const issueProcess = ip.right;
-
-    const agentReport = yield* deps.dashboardRead
-      .loadCodingAgentReport(args.traceId, issueProcess.spanId)
-      .pipe(Effect.orElseSucceed(() => missingCodingReport("read error")));
-    const reviewerReport = yield* deps.dashboardRead
-      .loadReviewerReport(args.traceId, issueProcess.spanId)
-      .pipe(Effect.orElseSucceed(() => missingReviewerReport("read error")));
+    const ctx: RunReviewContext = contextResult.right.context;
 
     // 2) Call the IRA LLM with a structured prompt. The `callRunReview`
     //    helper bakes in the version-handshake parse. Errors that
@@ -106,9 +104,9 @@ export const runRunReviewPass = (
       systemPrompt: SYSTEM_PROMPT,
       userPrompt: composeUserPrompt(
         args,
-        issueProcess,
-        agentReport,
-        reviewerReport,
+        ctx.issueProcess,
+        ctx.codingAgentReport,
+        ctx.reviewerReport,
       ),
     }).pipe(Effect.either);
 
@@ -136,7 +134,7 @@ export const runRunReviewPass = (
     const issueResult = yield* deps.metaLinear
       .createRunReviewIssue({
         title: `Run Review: ${args.issueIdentifier} (drain ${shortenTrace(args.traceId)})`,
-        body: renderReviewMarkdown(parsed.report, args, issueProcess),
+        body: renderReviewMarkdown(parsed.report, args, ctx.issueProcess),
       })
       .pipe(Effect.either);
 
@@ -186,8 +184,31 @@ const writeFailedStub = (
   reason: string,
   preservedReview?: RunReview,
 ): Effect.Effect<RunReviewPassOutcome, never, never> =>
-  Effect.sync(() => {
+  Effect.gen(function* () {
     const metaReviewId = randomUUID();
+    // VA-402 per PRD: failure writes BOTH a `meta-failed` SQLite row
+    // AND a corresponding Linear stub issue in `runway-meta`. The
+    // Linear stub means the operator sees the gap in the meta-project
+    // view rather than only on the dashboard. Best-effort: if the
+    // Linear write itself fails (e.g. the API was down), the SQLite
+    // row still lands so we don't lose the audit record.
+    const linearResult = yield* deps.metaLinear
+      .createRunReviewIssue({
+        title: `Run Review FAILED: ${args.issueIdentifier} (drain ${shortenTrace(args.traceId)})`,
+        body: renderFailedStubMarkdown(args, reason, preservedReview),
+      })
+      .pipe(Effect.either);
+    const linearIdentifier =
+      linearResult._tag === "Right" ? linearResult.right.identifier : null;
+    const linearUrl =
+      linearResult._tag === "Right" ? linearResult.right.url : null;
+    const secondaryLinearError =
+      linearResult._tag === "Left"
+        ? `linear stub write also failed: ${
+            (linearResult.left as { message?: string }).message ??
+            String(linearResult.left)
+          }`
+        : null;
     deps.storage.saveMetaReview({
       id: metaReviewId,
       kind: "meta-failed",
@@ -200,12 +221,53 @@ const writeFailedStub = (
         // failed, the model's output is preserved here so a manual
         // re-run doesn't pay for the same call twice.
         preserved_review: preservedReview ?? null,
+        linear_stub_identifier: linearIdentifier,
+        linear_stub_url: linearUrl,
+        secondary_linear_error: secondaryLinearError,
       }),
       templateVersion: RUN_REVIEW_VERSION,
       createdAt: nowIso(),
     });
     return { kind: "failed", metaReviewId, reason };
   });
+
+const renderFailedStubMarkdown = (
+  args: RunReviewPassArgs,
+  reason: string,
+  preservedReview?: RunReview,
+): string =>
+  [
+    `**Issue**: ${args.issueIdentifier}`,
+    `**Drain**: \`${args.traceId}\``,
+    "",
+    "## Why this is a stub",
+    "",
+    "The IRA's Run Review pass failed before producing a graded review.",
+    "This issue records the gap so the meta-project view matches the",
+    "dashboard's `meta_reviews` row of kind `meta-failed`.",
+    "",
+    "## Reason",
+    "",
+    "```",
+    reason,
+    "```",
+    preservedReview
+      ? [
+          "",
+          "## Preserved partial review",
+          "",
+          "The LLM produced a parseable Run Review before downstream",
+          "persistence failed. Preserved here so a manual re-run is",
+          "not required.",
+          "",
+          "```json",
+          JSON.stringify(preservedReview, null, 2),
+          "```",
+        ].join("\n")
+      : "",
+  ]
+    .filter((line) => line !== "")
+    .join("\n");
 
 const missingCodingReport = (msg: string): CapturedCodingAgentReport => ({
   ok: false,

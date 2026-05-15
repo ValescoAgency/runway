@@ -1,5 +1,6 @@
 import { Effect } from "effect";
 import { createStorage } from "../dashboard/storage.js";
+import { loadRunwayConfigFile } from "../runway-config-file.js";
 import { createMetaDashboardRead } from "./dashboard-read.js";
 import { createMetaLinearGateway } from "./linear-meta.js";
 import { runRunReviewPass, type RunReviewPassOutcome } from "./passes/run-review.js";
@@ -9,6 +10,16 @@ import { runRunReviewPass, type RunReviewPassOutcome } from "./passes/run-review
  * verb per pass — `run`, then `drain` (VA-406), then `weekly`
  * (VA-408). The runner owns wiring (storage handle, gateway
  * construction) so the pass modules stay pure.
+ *
+ * Resolution chain for the `metaReviewModel` / `metaProjectName`
+ * fields:
+ *
+ *     env var → .runway/config.yml field → hardcoded default
+ *
+ * Env always wins so an operator can flip the model on a single
+ * invocation without editing the file. The file is the persistent
+ * default. The hardcoded fallback (`claude-sonnet-4-6`, `runway-meta`)
+ * applies when neither layer set a value.
  */
 
 import type { RunwayConfig } from "../config.js";
@@ -16,6 +27,12 @@ import type { Redacted } from "effect";
 
 export interface RunnerEnv {
   readonly config: RunwayConfig;
+  /**
+   * cwd of the runway invocation. Used to locate `.runway/config.yml`
+   * for the meta-review override chain. Defaults to `process.cwd()`
+   * in production; tests inject a tmpdir.
+   */
+  readonly cwd: string;
   /** Path to the dashboard SQLite file. Source: `RUNWAY_DASHBOARD_DB`. */
   readonly dashboardDbPath: string;
   /** Anthropic API key — `ANTHROPIC_API_KEY` env in the runway process. */
@@ -25,6 +42,41 @@ export interface RunnerEnv {
 export interface RunReviewArgs {
   readonly traceId: string;
   readonly issueIdentifier: string;
+}
+
+const DEFAULT_META_REVIEW_MODEL = "claude-sonnet-4-6";
+const DEFAULT_META_PROJECT_NAME = "runway-meta";
+
+/**
+ * VA-402: resolve the meta-review model + project name through
+ * env → file → default. Exported so tests + the dashboard (if it
+ * ever needs to surface the effective model) can compute the same
+ * value without re-implementing the chain.
+ */
+export function resolveMetaConfig(env: {
+  readonly config: RunwayConfig;
+  readonly cwd: string;
+}): {
+  readonly metaReviewModel: string;
+  readonly metaProjectName: string;
+  readonly source: { readonly model: string; readonly project: string };
+} {
+  const file = loadRunwayConfigFile(env.cwd);
+  const model = env.config.metaReviewModel
+    ? { value: env.config.metaReviewModel, source: "env" }
+    : file.metaReviewModel
+      ? { value: file.metaReviewModel, source: ".runway/config.yml" }
+      : { value: DEFAULT_META_REVIEW_MODEL, source: "default" };
+  const project = env.config.metaProjectName
+    ? { value: env.config.metaProjectName, source: "env" }
+    : file.metaProjectName
+      ? { value: file.metaProjectName, source: ".runway/config.yml" }
+      : { value: DEFAULT_META_PROJECT_NAME, source: "default" };
+  return {
+    metaReviewModel: model.value,
+    metaProjectName: project.value,
+    source: { model: model.source, project: project.source },
+  };
 }
 
 /**
@@ -39,19 +91,20 @@ export const dispatchRunReview = (
   env: RunnerEnv,
 ): Effect.Effect<RunReviewPassOutcome, never, never> =>
   Effect.gen(function* () {
+    const resolved = resolveMetaConfig(env);
     const storage = createStorage(env.dashboardDbPath);
     try {
       const dashboardRead = createMetaDashboardRead(env.dashboardDbPath);
       const metaLinear = createMetaLinearGateway({
         linearApiKey: env.config.linearApiKey as Redacted.Redacted<string>,
         linearTeam: env.config.linearTeam,
-        metaProjectName: env.config.metaProjectName,
+        metaProjectName: resolved.metaProjectName,
       });
       return yield* runRunReviewPass(
         { traceId: args.traceId, issueIdentifier: args.issueIdentifier },
         {
           anthropicApiKey: env.anthropicApiKey,
-          metaReviewModel: env.config.metaReviewModel,
+          metaReviewModel: resolved.metaReviewModel,
           dashboardRead,
           metaLinear,
           storage,

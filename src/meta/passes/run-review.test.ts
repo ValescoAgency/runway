@@ -149,7 +149,7 @@ describe("runRunReviewPass (VA-402)", () => {
     expect(f.metaLinear.createRunReviewIssue).toHaveBeenCalledTimes(1);
   });
 
-  it("writes a meta-failed stub when the LLM call exhausts its retry budget", async () => {
+  it("writes a meta-failed stub + a Linear stub when the LLM call exhausts its retry budget", async () => {
     callRunReviewMock.mockReturnValueOnce(
       Effect.fail({
         _tag: "AnthropicServerError" as const,
@@ -177,8 +177,17 @@ describe("runRunReviewPass (VA-402)", () => {
     expect(outcome.reason).toContain("LLM call failed");
     expect(f.saved).toHaveLength(1);
     expect(f.saved[0]?.kind).toBe("meta-failed");
-    // No Linear issue when the LLM never returned a structured Review.
-    expect(f.metaLinear.createRunReviewIssue).not.toHaveBeenCalled();
+    // VA-402 AC: retry-exhaustion writes BOTH a SQLite stub AND a
+    // Linear stub in `runway-meta` — the operator sees the gap in
+    // the meta-project view too.
+    expect(f.metaLinear.createRunReviewIssue).toHaveBeenCalledTimes(1);
+    const stubCall = (
+      f.metaLinear.createRunReviewIssue as ReturnType<typeof vi.fn>
+    ).mock.calls[0]?.[0];
+    expect(stubCall?.title).toMatch(/Run Review FAILED/);
+    // The stub row cross-links to the Linear stub via its content.
+    const content = JSON.parse(f.saved[0]?.contentJson ?? "{}");
+    expect(content.linear_stub_identifier).toBe("VA-1001");
   });
 
   it("writes a meta-failed stub when the LLM response fails parse (no retry on parse error)", async () => {
@@ -212,9 +221,12 @@ describe("runRunReviewPass (VA-402)", () => {
     expect(f.saved[0]?.kind).toBe("meta-failed");
     // Parse failure is NOT retryable — the LLM call only fires once.
     expect(callRunReviewMock).toHaveBeenCalledTimes(1);
+    // Parse failure still produces a Linear stub so the gap shows up
+    // in the meta-project view.
+    expect(f.metaLinear.createRunReviewIssue).toHaveBeenCalledTimes(1);
   });
 
-  it("preserves the parsed Review in the stub when Linear write fails after the LLM succeeded", async () => {
+  it("preserves the parsed Review + records secondary linear failure when Linear writes fail end-to-end", async () => {
     callRunReviewMock.mockReturnValueOnce(
       Effect.succeed({ ok: true, report: validReview }),
     );
@@ -242,6 +254,13 @@ describe("runRunReviewPass (VA-402)", () => {
     const content = JSON.parse(f.saved[0]?.contentJson ?? "{}");
     expect(content.preserved_review).not.toBeNull();
     expect(content.preserved_review.issue_identifier).toBe("VA-401");
+    // Linear was called twice — once for the success-path issue
+    // (failed) and once for the failure-path stub (also failed in
+    // this fixture). The SQLite row records the secondary failure
+    // so the operator can debug.
+    expect(f.metaLinear.createRunReviewIssue).toHaveBeenCalledTimes(2);
+    expect(content.secondary_linear_error).toContain("boom");
+    expect(content.linear_stub_identifier).toBeNull();
   });
 
   it("stubs out when the issue_process row hasn't been observed yet", async () => {
@@ -270,9 +289,11 @@ describe("runRunReviewPass (VA-402)", () => {
 
     expect(outcome.kind).toBe("failed");
     if (outcome.kind !== "failed") return;
-    expect(outcome.reason).toContain("failed to load issue_process");
+    expect(outcome.reason).toContain("failed to load context");
     expect(f.saved[0]?.kind).toBe("meta-failed");
     // LLM should never have been called.
     expect(callRunReviewMock).not.toHaveBeenCalled();
+    // Linear stub still lands so the gap appears in the meta-project.
+    expect(f.metaLinear.createRunReviewIssue).toHaveBeenCalledTimes(1);
   });
 });
