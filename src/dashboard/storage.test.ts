@@ -1161,3 +1161,76 @@ describe("createStorage — listRecentDrains (VA-392)", () => {
     expect(storage.listRecentDrains()).toHaveLength(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// VA-402: meta_reviews table contract
+// ---------------------------------------------------------------------------
+
+describe("createStorage — meta_reviews (VA-402)", () => {
+  const row = (over: Partial<Parameters<Storage["saveMetaReview"]>[0]> = {}) =>
+    ({
+      id: "review-1",
+      kind: "meta-run-review" as const,
+      scope: "VA-401",
+      drainId: "drain-abc",
+      issueId: "VA-401",
+      contentJson: '{"foo":"bar"}',
+      templateVersion: "1.0.0",
+      createdAt: "2026-05-15 23:00:00",
+      ...over,
+    });
+
+  it("upserts and lists a meta-run-review row", () => {
+    storage.saveMetaReview(row());
+    const out = storage.listMetaReviews();
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      id: "review-1",
+      kind: "meta-run-review",
+      drainId: "drain-abc",
+      issueId: "VA-401",
+      templateVersion: "1.0.0",
+    });
+  });
+
+  it("filters by kind so failure stubs don't pollute the success list", () => {
+    storage.saveMetaReview(row({ id: "ok", kind: "meta-run-review" }));
+    storage.saveMetaReview(row({ id: "stub", kind: "meta-failed" }));
+    const success = storage.listMetaReviews({ kind: "meta-run-review" });
+    expect(success).toHaveLength(1);
+    expect(success[0]?.id).toBe("ok");
+    const failed = storage.listMetaReviews({ kind: "meta-failed" });
+    expect(failed).toHaveLength(1);
+    expect(failed[0]?.id).toBe("stub");
+  });
+
+  it("filters by drainId so the Drain Review pass can read its own scope", () => {
+    storage.saveMetaReview(row({ id: "a", drainId: "drain-a" }));
+    storage.saveMetaReview(row({ id: "b", drainId: "drain-b" }));
+    const out = storage.listMetaReviews({ drainId: "drain-a" });
+    expect(out).toHaveLength(1);
+    expect(out[0]?.drainId).toBe("drain-a");
+  });
+
+  it("orders rows by created_at DESC so the freshest review is at index 0", () => {
+    storage.saveMetaReview(
+      row({ id: "old", createdAt: "2026-01-01 00:00:00" }),
+    );
+    storage.saveMetaReview(
+      row({ id: "new", createdAt: "2026-06-01 00:00:00" }),
+    );
+    const out = storage.listMetaReviews();
+    expect(out.map((r) => r.id)).toEqual(["new", "old"]);
+  });
+
+  it("preserves successive rows for the same scope (track-record per PRD)", () => {
+    // The PRD calls out that re-runs of `runway review run` against
+    // the same (drain, issue) produce a fresh row, not an update —
+    // historical Reviews are kept so the IRA's track-record is
+    // auditable. Synthetic `id` enforces this contract.
+    storage.saveMetaReview(row({ id: "review-a" }));
+    storage.saveMetaReview(row({ id: "review-b" }));
+    const out = storage.listMetaReviews({ issueId: "VA-401" });
+    expect(out).toHaveLength(2);
+  });
+});

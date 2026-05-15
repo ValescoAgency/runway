@@ -276,7 +276,71 @@ export interface Storage {
    * started one wins.
    */
   getActiveDrain(): ActiveDrain | null;
+  /**
+   * VA-402: upsert one row in `meta_reviews`. The IRA's three passes
+   * (Run Review, Drain Review, Weekly Review) all write through this
+   * single seam. PK is the synthetic `id`, so a re-run of `runway
+   * review run` on the same (drain, issue) pair produces a NEW row —
+   * historical Run Reviews are preserved for trend analysis. The
+   * skip / failed stub rows take the same shape (kind discriminates).
+   */
+  saveMetaReview(r: MetaReviewRow): void;
+  /**
+   * VA-402: read meta-reviews matching a scope filter. The IRA's
+   * Drain Review pass (VA-406) reads all per-issue rows for one
+   * drain; the dashboard UI route (VA-407) reads by `kind` or by
+   * synthetic id. Returns rows ordered by `created_at` descending so
+   * the freshest review for a given scope is at index 0.
+   */
+  listMetaReviews(
+    filter?: MetaReviewFilter,
+  ): readonly StoredMetaReview[];
   close(): void;
+}
+
+/**
+ * VA-402: one row per IRA output across the three passes. `kind`
+ * discriminates between successful reviews and the stub rows the
+ * failure / pre-filter paths emit. `template_version` is the SemVer
+ * the writing pass used; consumers (the dashboard UI, the next IRA
+ * pass) check it before parsing `content_json`.
+ *
+ *   - `meta-run-review`     — VA-402 (this slice)
+ *   - `meta-drain-review`   — VA-406
+ *   - `meta-weekly-review`  — VA-408
+ *   - `meta-skipped`        — VA-404 heuristic pre-filter skip
+ *   - `meta-failed`         — retry exhaustion stub
+ *
+ * `drain_id` / `issue_id` are populated to the appropriate scope —
+ * a Run Review row carries both; a Drain Review carries just
+ * `drain_id` (with `issue_id = null`); a Weekly Review carries
+ * neither (both null).
+ */
+export type MetaReviewKind =
+  | "meta-run-review"
+  | "meta-drain-review"
+  | "meta-weekly-review"
+  | "meta-skipped"
+  | "meta-failed";
+
+export interface MetaReviewRow {
+  readonly id: string;
+  readonly kind: MetaReviewKind;
+  readonly scope: string;
+  readonly drainId: string | null;
+  readonly issueId: string | null;
+  readonly contentJson: string;
+  readonly templateVersion: string;
+  readonly createdAt: string;
+}
+
+export interface StoredMetaReview extends MetaReviewRow {}
+
+export interface MetaReviewFilter {
+  readonly kind?: MetaReviewKind;
+  readonly drainId?: string;
+  readonly issueId?: string;
+  readonly limit?: number;
 }
 
 export interface StorageOptions {
@@ -386,6 +450,31 @@ const SCHEMA = `
 
   CREATE INDEX IF NOT EXISTS idx_log_records_trace_timestamp
     ON log_records(trace_id, timestamp_unix_nano);
+
+  -- VA-402: IRA outputs. One row per Run / Drain / Weekly review,
+  -- plus stub rows for pre-filter skips and retry exhaustions. The
+  -- dashboard UI (VA-407) renders by \`kind\`; subsequent IRA passes
+  -- read prior rows for context (Weekly reads the week's Run +
+  -- Drain reviews; Drain reads the run reviews for its drain).
+  CREATE TABLE IF NOT EXISTS meta_reviews (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    drain_id TEXT,
+    issue_id TEXT,
+    content_json TEXT NOT NULL,
+    template_version TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_meta_reviews_drain
+    ON meta_reviews(drain_id, created_at DESC);
+
+  CREATE INDEX IF NOT EXISTS idx_meta_reviews_issue
+    ON meta_reviews(issue_id, created_at DESC);
+
+  CREATE INDEX IF NOT EXISTS idx_meta_reviews_kind_created
+    ON meta_reviews(kind, created_at DESC);
 `;
 
 const DEFAULT_AGGREGATE_WINDOW = 30;
@@ -728,6 +817,25 @@ export function createStorage(
       attributes_json = excluded.attributes_json
   `);
 
+  // VA-402: meta_reviews upsert. The synthetic `id` is the PK — a
+  // re-run of `runway review run` produces a fresh row (callers
+  // generate a new id) rather than overwriting prior reviews, so
+  // the IRA's track record is preserved.
+  const insertMetaReview = db.prepare(`
+    INSERT INTO meta_reviews (
+      id, kind, scope, drain_id, issue_id, content_json,
+      template_version, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT (id) DO UPDATE SET
+      kind = excluded.kind,
+      scope = excluded.scope,
+      drain_id = excluded.drain_id,
+      issue_id = excluded.issue_id,
+      content_json = excluded.content_json,
+      template_version = excluded.template_version,
+      created_at = excluded.created_at
+  `);
+
   // VA-388: order by SDK-supplied timestamp (CAST to INTEGER so the
   // string-encoded int64 sorts numerically, not lexically) — exporter
   // retries can re-deliver out of order but the operator should see
@@ -985,6 +1093,60 @@ export function createStorage(
     db.close();
   };
 
+  const saveMetaReview = (r: MetaReviewRow): void => {
+    insertMetaReview.run(
+      r.id,
+      r.kind,
+      r.scope,
+      r.drainId,
+      r.issueId,
+      r.contentJson,
+      r.templateVersion,
+      r.createdAt,
+    );
+  };
+
+  const listMetaReviews = (
+    filter?: MetaReviewFilter,
+  ): readonly StoredMetaReview[] => {
+    const where: string[] = [];
+    const params: (string | number)[] = [];
+    if (filter?.kind) {
+      where.push(`kind = ?`);
+      params.push(filter.kind);
+    }
+    if (filter?.drainId) {
+      where.push(`drain_id = ?`);
+      params.push(filter.drainId);
+    }
+    if (filter?.issueId) {
+      where.push(`issue_id = ?`);
+      params.push(filter.issueId);
+    }
+    const limit = filter?.limit ?? 100;
+    const sql = `
+      SELECT id, kind, scope, drain_id, issue_id, content_json,
+             template_version, created_at
+      FROM meta_reviews
+      ${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?
+    `;
+    const rows = db.prepare(sql).all(...params, limit) as Array<
+      Record<string, unknown>
+    >;
+    return rows.map((row) => ({
+      id: String(row.id ?? ""),
+      kind: String(row.kind ?? "") as MetaReviewKind,
+      scope: String(row.scope ?? ""),
+      drainId: nullableStr(row.drain_id),
+      issueId: nullableStr(row.issue_id),
+      contentJson: String(row.content_json ?? ""),
+      templateVersion: String(row.template_version ?? ""),
+      createdAt: String(row.created_at ?? ""),
+    }));
+  };
+
   return {
     saveDrain,
     saveIssueProcess,
@@ -1004,6 +1166,8 @@ export function createStorage(
     appendLogRecord,
     streamLogsFor,
     getActiveDrain,
+    saveMetaReview,
+    listMetaReviews,
     close,
   };
 }

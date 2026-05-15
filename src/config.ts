@@ -103,6 +103,24 @@ export interface RunwayConfig {
    * are split across distinct identities.
    */
   readonly commentAuthorAllowlist?: readonly string[];
+  /**
+   * VA-402: the Anthropic model the IRA's Run Review pass invokes.
+   * Default `claude-sonnet-4-6` — sufficient judgment quality for
+   * structured per-run grading, cheaper than Opus. Overridable via
+   * `RUNWAY_META_REVIEW_MODEL` for operators who want stronger
+   * reasoning (and are willing to pay for it). Distinct from the
+   * impl / reviewer agent models (those run inside the sandcastle
+   * container; this one runs in the runway process).
+   */
+  readonly metaReviewModel: string;
+  /**
+   * VA-402: name of the Linear project the IRA writes its Reviews
+   * into. Defaults to `runway-meta` per the PRD; overridable for
+   * operators that already host a project under a different name.
+   * Resolved by name (not by ID) so the same env var works against
+   * any workspace.
+   */
+  readonly metaProjectName: string;
 }
 
 // Back-compat alias — existing consumers (orchestrator, gateways)
@@ -166,6 +184,12 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
   commentAuthorAllowlist: EConfig.option(
     EConfig.string("RUNWAY_COMMENT_AUTHOR_ALLOWLIST"),
   ),
+  metaReviewModel: EConfig.string("RUNWAY_META_REVIEW_MODEL").pipe(
+    EConfig.withDefault("claude-sonnet-4-6"),
+  ),
+  metaProjectName: EConfig.string("RUNWAY_META_PROJECT_NAME").pipe(
+    EConfig.withDefault("runway-meta"),
+  ),
 }).pipe(
   Effect.map(
     (raw): RunwayConfig => ({
@@ -187,6 +211,8 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
         ?.split(",")
         .map((s) => s.trim())
         .filter(Boolean),
+      metaReviewModel: raw.metaReviewModel,
+      metaProjectName: raw.metaProjectName,
     }),
   ),
 );

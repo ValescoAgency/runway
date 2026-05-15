@@ -40,6 +40,8 @@ const baseConfig = {
   maxIterations: 5,
   implTurns: 3,
   reviewRetries: 1,
+  metaReviewModel: "claude-sonnet-4-6",
+  metaProjectName: "runway-meta",
 } as const;
 
 beforeEach(() => {

@@ -51,6 +51,7 @@
   },
   "dependencies": {
     "@ai-hero/sandcastle": "^0.5.10",
+    "@anthropic-ai/sdk": "^0.96.0",
     "@effect/opentelemetry": "^0.63.0",
     "@linear/sdk": "^84.0.0",
     "@opentelemetry/api": "^1.9.1",

@@ -48,6 +48,8 @@ const config: Config = {
   maxIterations: 1,
   implTurns: 1,
   reviewRetries: 0,
+  metaReviewModel: "claude-sonnet-4-6",
+  metaProjectName: "runway-meta",
 };
 
 const issue: RunwayIssue = {
