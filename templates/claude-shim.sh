@@ -10,9 +10,12 @@
 # materialise the SSH signing key into $HOME/.config/runway/ and
 # configure git globally so every `git commit` the agent runs is
 # signed. Partial configs are treated as "off" — a half-applied
-# scaffold doesn't half-sign commits. The key file lives only inside
-# the container; when sandcastle tears it down at end of run, the
-# file goes with it.
+# scaffold doesn't half-sign commits. After the key is on disk and
+# git is configured we **unset** the signing env vars so they don't
+# inherit into claude.real (the agent process and any subprocess it
+# spawns); the file on disk is what git reads. The file lives only
+# inside the container; when sandcastle tears it down at end of run,
+# the file goes with it.
 set -euo pipefail
 exec varlock run --env-file /home/agent/workspace/.env.schema -- \
   bash -euo pipefail -c '
@@ -33,5 +36,12 @@ if [[ -n "${RUNWAY_SIGNING_SSH_PRIVKEY:-}" \
   git config --global user.name  "$RUNWAY_SIGNING_NAME"
   git config --global user.email "$RUNWAY_SIGNING_EMAIL"
 fi
+# Drop the signing vars from the env regardless of whether bootstrap
+# fired — claude.real and every subprocess it spawns must not have
+# the private key in their inherited environment. `unset` is a no-op
+# when the var is already unset, so this is safe under partial
+# scaffolds too.
+unset RUNWAY_SIGNING_SSH_PRIVKEY RUNWAY_SIGNING_SSH_PUBKEY RUNWAY_SIGNING_NAME RUNWAY_SIGNING_EMAIL
 exec /home/agent/.local/bin/claude.real "$@"
 ' -- "$@"
+

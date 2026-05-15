@@ -33,8 +33,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # materialises the SSH signing key to a 0600 file under $HOME and
 # configures git to use it. The bootstrap is a no-op when any of the
 # four are unset, so unsigned-commit scaffolds keep working.
+#
+# COPY path is relative to the .sandcastle build context (see
+# `buildAgentImage` in scaffolder-image.ts: `docker build .sandcastle`),
+# so the source is `runway-claude-shim`, not `.sandcastle/runway-claude-shim`.
 RUN mv /home/agent/.local/bin/claude /home/agent/.local/bin/claude.real
-COPY .sandcastle/runway-claude-shim /home/agent/.local/bin/claude
+COPY runway-claude-shim /home/agent/.local/bin/claude
 RUN chmod +x /home/agent/.local/bin/claude \
   && chown ${AGENT_UID}:${AGENT_GID} /home/agent/.local/bin/claude
 

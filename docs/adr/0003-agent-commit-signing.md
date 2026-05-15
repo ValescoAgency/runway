@@ -113,7 +113,11 @@ The "long-lived private key" objection from the ACs applies to (b) and
   - The runway repo (it's an op:// reference, not a literal value).
   - The container image layers (it's resolved at run time from env).
   - Any logged process environment (varlock's wrapper exposes secrets
-    only to the immediate child).
+    only to the immediate child; the claude shim then `unset`s the
+    four `RUNWAY_SIGNING_*` vars *after* writing the key to disk and
+    *before* `exec`ing `claude.real`, so the agent process and every
+    subprocess it spawns inherit an env that no longer holds the
+    private key).
   - The host's git config (signing is configured global-to-the-container,
     not on the host).
 

@@ -80,6 +80,29 @@ describe("applyVarlockLayer — VA-413 claude shim deployment", () => {
     expect(body).toContain("commit.gpgsign true");
   });
 
+  it("unsets the signing env vars before exec'ing claude.real (no key leak into agent env)", async () => {
+    await applyVarlockLayer(tmpDir, opts);
+    const body = readFileSync(
+      join(tmpDir, ".sandcastle", "runway-claude-shim"),
+      "utf8",
+    );
+    // The shim must drop the signing vars from the env so claude.real
+    // (and every subprocess the agent spawns) can't read the private
+    // key from $RUNWAY_SIGNING_SSH_PRIVKEY. Git reads the key from the
+    // on-disk file we wrote, not from env.
+    const unsetIdx = body.indexOf("unset RUNWAY_SIGNING_SSH_PRIVKEY");
+    const execIdx = body.indexOf("exec /home/agent/.local/bin/claude.real");
+    expect(unsetIdx).toBeGreaterThan(0);
+    expect(execIdx).toBeGreaterThan(0);
+    // Unset must happen BEFORE the exec, otherwise the env still
+    // inherits.
+    expect(unsetIdx).toBeLessThan(execIdx);
+    // All four signing vars must be in the unset list.
+    expect(body).toMatch(
+      /unset[^\n]*RUNWAY_SIGNING_SSH_PRIVKEY[^\n]*RUNWAY_SIGNING_SSH_PUBKEY[^\n]*RUNWAY_SIGNING_NAME[^\n]*RUNWAY_SIGNING_EMAIL/,
+    );
+  });
+
   it("invokes varlock around claude.real so secrets stay scoped", async () => {
     await applyVarlockLayer(tmpDir, opts);
     const body = readFileSync(
@@ -90,15 +113,20 @@ describe("applyVarlockLayer — VA-413 claude shim deployment", () => {
     expect(body).toContain("claude.real");
   });
 
-  it("patches the Dockerfile to COPY the shim into PATH", async () => {
+  it("patches the Dockerfile to COPY the shim into PATH (path relative to .sandcastle build context)", async () => {
     await applyVarlockLayer(tmpDir, opts);
     const dockerfile = readFileSync(
       join(tmpDir, ".sandcastle", "Dockerfile"),
       "utf8",
     );
+    // `buildAgentImage` runs `docker build .sandcastle`, so COPY
+    // sources are relative to .sandcastle/. A `COPY .sandcastle/…`
+    // would resolve to `.sandcastle/.sandcastle/…` and fail. Pin the
+    // assertion so we don't regress to the broken form.
     expect(dockerfile).toContain(
-      "COPY .sandcastle/runway-claude-shim /home/agent/.local/bin/claude",
+      "COPY runway-claude-shim /home/agent/.local/bin/claude",
     );
+    expect(dockerfile).not.toContain("COPY .sandcastle/runway-claude-shim");
     expect(dockerfile).toContain(
       "mv /home/agent/.local/bin/claude /home/agent/.local/bin/claude.real",
     );
