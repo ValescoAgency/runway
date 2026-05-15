@@ -25,6 +25,46 @@ export interface IssueProcessFilter {
   readonly limit?: number;
   /** Optional drain trace id; useful when scoping the list to a drain. */
   readonly traceId?: string;
+  /**
+   * VA-392: filter to rows whose `outcome_kind` matches one of the
+   * given kinds. The synthetic `"in-flight"` kind matches rows where
+   * `outcome_kind IS NULL` (i.e. an issue_process that hasn't reached
+   * a terminal outcome yet). An empty / undefined array means "any
+   * outcome" — the SQL doesn't add a WHERE clause for it.
+   */
+  readonly outcomes?: readonly OutcomeFilterKind[];
+  /**
+   * VA-392: lower bound on `inserted_at` (inclusive). Expects the
+   * SQLite `datetime('now')` format (`YYYY-MM-DD HH:MM:SS`); the
+   * column stores that format and lex-sorts identically to numeric
+   * ordering. Undefined means "no lower bound."
+   */
+  readonly insertedSince?: string;
+}
+
+/**
+ * VA-392: outcome chip kinds. The four AC-listed values plus the
+ * synthetic `"in-flight"` (= `outcome_kind IS NULL`) — i.e. an
+ * issue_process whose terminal outcome hasn't been recorded yet.
+ */
+export type OutcomeFilterKind =
+  | "opened"
+  | "hitl"
+  | "errored"
+  | "in-flight";
+
+/**
+ * VA-392: one entry in the recent-drains chip set. `traceId` is the
+ * drain's trace id (a drain is one trace, end-to-end); the start time
+ * is the earliest `issue_processes.start_time_unix_nano` in that
+ * trace, mirroring `getActiveDrain`'s clock. `issueCount` is the
+ * landed-so-far count so the chip can show a hint like "Drain @ 12:05
+ * (3 issues)" even before the drain finishes.
+ */
+export interface RecentDrain {
+  readonly traceId: string;
+  readonly startedAtUnixNano: string;
+  readonly issueCount: number;
 }
 
 export interface StoredIssueProcess extends IssueProcessRow {
@@ -128,6 +168,13 @@ export interface Storage {
   saveAgentIteration(a: AgentIterationRow): void;
   saveRawSpan(r: RawSpanRow): void;
   listIssueProcesses(filter?: IssueProcessFilter): readonly StoredIssueProcess[];
+  /**
+   * VA-392: recent drains for the filter-chip set. Drains are inferred
+   * from `issue_processes` grouped by `trace_id` (so both finished and
+   * in-flight drains are surfaced), ordered by earliest-start
+   * descending. The chip URL filters the list view via `?drain=<id>`.
+   */
+  listRecentDrains(limit?: number): readonly RecentDrain[];
   /**
    * VA-389: look up an issue process by its (trace_id, span_id) pair.
    * Returns undefined when the row isn't yet known — typical when the
@@ -577,20 +624,11 @@ export function createStorage(
       start_time_unix_nano, end_time_unix_nano, status_code, status_message,
       inserted_at
   `;
-  const listAll = db.prepare(`
-    SELECT ${ISSUE_PROCESS_COLUMNS}
-    FROM issue_processes
-    ORDER BY inserted_at DESC, span_id DESC
-    LIMIT ?
-  `);
-
-  const listByTrace = db.prepare(`
-    SELECT ${ISSUE_PROCESS_COLUMNS}
-    FROM issue_processes
-    WHERE trace_id = ?
-    ORDER BY inserted_at DESC, span_id DESC
-    LIMIT ?
-  `);
+  // VA-392: listIssueProcesses composes its SQL dynamically because
+  // the chip set (outcome / drain / date range) yields up to three
+  // optional WHERE clauses with variable-length placeholders. Prepared
+  // statements per shape would multiply combinatorially; one
+  // dynamically-built statement per call is the simpler trade.
 
   const getProcessStmt = db.prepare(`
     SELECT ${ISSUE_PROCESS_COLUMNS}
@@ -763,10 +801,70 @@ export function createStorage(
     filter?: IssueProcessFilter,
   ): readonly StoredIssueProcess[] => {
     const limit = filter?.limit ?? 100;
-    const rows = filter?.traceId
-      ? listByTrace.all(filter.traceId, limit)
-      : listAll.all(limit);
+    const where: string[] = [];
+    const params: unknown[] = [];
+    if (filter?.traceId) {
+      where.push(`trace_id = ?`);
+      params.push(filter.traceId);
+    }
+    if (filter?.insertedSince) {
+      where.push(`inserted_at >= ?`);
+      params.push(filter.insertedSince);
+    }
+    if (filter?.outcomes && filter.outcomes.length > 0) {
+      // VA-392: the synthetic `"in-flight"` kind matches NULL, every
+      // other kind matches the literal `outcome_kind` value. We split
+      // the two so the SQL stays standard (`IS NULL` can't appear in
+      // an `IN (...)` list).
+      const concreteKinds = filter.outcomes.filter(
+        (k): k is "opened" | "hitl" | "errored" => k !== "in-flight",
+      );
+      const includesInFlight = filter.outcomes.includes("in-flight");
+      const clauses: string[] = [];
+      if (concreteKinds.length > 0) {
+        const placeholders = concreteKinds.map(() => "?").join(", ");
+        clauses.push(`outcome_kind IN (${placeholders})`);
+        params.push(...concreteKinds);
+      }
+      if (includesInFlight) clauses.push(`outcome_kind IS NULL`);
+      if (clauses.length > 0) where.push(`(${clauses.join(" OR ")})`);
+    }
+    const whereSql = where.length === 0 ? "" : `WHERE ${where.join(" AND ")}`;
+    const sql = `
+      SELECT ${ISSUE_PROCESS_COLUMNS}
+      FROM issue_processes
+      ${whereSql}
+      ORDER BY inserted_at DESC, span_id DESC
+      LIMIT ?
+    `;
+    params.push(limit);
+    const rows = db.prepare(sql).all(...(params as never[]));
     return rows.map(rowToIssueProcess);
+  };
+
+  // VA-392: recent drains derived from `issue_processes` so both
+  // finished drains (which have a `drains` row) and in-flight ones
+  // (which don't yet — BatchSpanProcessor flushes on end) are
+  // surfaced together. The chip set is bounded so we don't keep
+  // showing ancient drains forever; default to 5.
+  const listRecentDrainsStmt = db.prepare(`
+    SELECT
+      trace_id,
+      MIN(start_time_unix_nano) AS started_at_unix_nano,
+      COUNT(*) AS issue_count
+    FROM issue_processes
+    GROUP BY trace_id
+    ORDER BY MIN(CAST(start_time_unix_nano AS INTEGER)) DESC
+    LIMIT ?
+  `);
+
+  const listRecentDrains = (limit = 5): readonly RecentDrain[] => {
+    const rows = listRecentDrainsStmt.all(limit) as Record<string, unknown>[];
+    return rows.map((r) => ({
+      traceId: String(r.trace_id ?? ""),
+      startedAtUnixNano: String(r.started_at_unix_nano ?? ""),
+      issueCount: Number(r.issue_count ?? 0),
+    }));
   };
 
   const getIssueProcess = (
@@ -893,6 +991,7 @@ export function createStorage(
     saveAgentIteration,
     saveRawSpan,
     listIssueProcesses,
+    listRecentDrains,
     getIssueProcess,
     getIssueProcessBySpanId,
     listAgentIterations,

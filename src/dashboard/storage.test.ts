@@ -1025,3 +1025,139 @@ describe("createStorage — getActiveDrain (VA-391)", () => {
     expect(storage.getActiveDrain()?.traceId).toBe("trace-running");
   });
 });
+
+// VA-392: filter chips need three things from storage — filter by
+// outcome_kind (including the synthetic "in-flight" = NULL), filter by
+// a date-range lower bound on inserted_at, and the recent-drains list
+// that backs the drain chip set.
+describe("createStorage — listIssueProcesses filters (VA-392)", () => {
+  beforeEach(() => {
+    storage.saveIssueProcess(
+      makeIssueProcess({ spanId: "ip-opened", outcomeKind: "opened" }),
+    );
+    storage.saveIssueProcess(
+      makeIssueProcess({ spanId: "ip-hitl", outcomeKind: "hitl" }),
+    );
+    storage.saveIssueProcess(
+      makeIssueProcess({ spanId: "ip-errored", outcomeKind: "errored" }),
+    );
+    storage.saveIssueProcess(
+      // outcomeKind: null → in-flight
+      makeIssueProcess({ spanId: "ip-inflight", outcomeKind: null }),
+    );
+  });
+
+  it("filters to a single outcome kind", () => {
+    const out = storage.listIssueProcesses({ outcomes: ["opened"] });
+    expect(out).toHaveLength(1);
+    expect(out[0]?.spanId).toBe("ip-opened");
+  });
+
+  it("filters to multiple outcome kinds", () => {
+    const out = storage.listIssueProcesses({ outcomes: ["hitl", "errored"] });
+    expect(out.map((r) => r.spanId).sort()).toEqual(
+      ["ip-errored", "ip-hitl"].sort(),
+    );
+  });
+
+  it("matches the synthetic 'in-flight' kind against NULL outcome_kind", () => {
+    const out = storage.listIssueProcesses({ outcomes: ["in-flight"] });
+    expect(out).toHaveLength(1);
+    expect(out[0]?.spanId).toBe("ip-inflight");
+  });
+
+  it("combines a concrete outcome with 'in-flight' via OR", () => {
+    const out = storage.listIssueProcesses({
+      outcomes: ["opened", "in-flight"],
+    });
+    expect(out.map((r) => r.spanId).sort()).toEqual(
+      ["ip-inflight", "ip-opened"].sort(),
+    );
+  });
+
+  it("respects an insertedSince lower bound (no future timestamps included)", () => {
+    // `datetime('now', '+1 day')` is comfortably after every row we
+    // just inserted, so the filter returns nothing.
+    const future = "2999-01-01 00:00:00";
+    const out = storage.listIssueProcesses({ insertedSince: future });
+    expect(out).toHaveLength(0);
+  });
+
+  it("returns every row when insertedSince is the epoch (no upper bound effect)", () => {
+    const out = storage.listIssueProcesses({
+      insertedSince: "1970-01-01 00:00:00",
+    });
+    expect(out).toHaveLength(4);
+  });
+
+  it("composes outcome + traceId + insertedSince in a single query", () => {
+    storage.saveIssueProcess(
+      makeIssueProcess({
+        traceId: "trace-other",
+        spanId: "ip-other-opened",
+        outcomeKind: "opened",
+      }),
+    );
+    const out = storage.listIssueProcesses({
+      outcomes: ["opened"],
+      traceId: "trace-other",
+      insertedSince: "1970-01-01 00:00:00",
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0]?.spanId).toBe("ip-other-opened");
+  });
+});
+
+describe("createStorage — listRecentDrains (VA-392)", () => {
+  it("groups issue_processes by trace_id with earliest start and count", () => {
+    storage.saveIssueProcess(
+      makeIssueProcess({
+        traceId: "trace-A",
+        spanId: "a1",
+        startTimeUnixNano: "1715000000000000000",
+      }),
+    );
+    storage.saveIssueProcess(
+      makeIssueProcess({
+        traceId: "trace-A",
+        spanId: "a2",
+        startTimeUnixNano: "1715000005000000000",
+      }),
+    );
+    storage.saveIssueProcess(
+      makeIssueProcess({
+        traceId: "trace-B",
+        spanId: "b1",
+        startTimeUnixNano: "1715000010000000000",
+      }),
+    );
+
+    const drains = storage.listRecentDrains();
+    expect(drains).toHaveLength(2);
+    // Ordered by earliest-start DESC — B (10s) before A (0s).
+    expect(drains[0]?.traceId).toBe("trace-B");
+    expect(drains[0]?.issueCount).toBe(1);
+    expect(drains[1]?.traceId).toBe("trace-A");
+    expect(drains[1]?.issueCount).toBe(2);
+    // The grouped start time is the trace's earliest issue_process start.
+    expect(drains[1]?.startedAtUnixNano).toBe("1715000000000000000");
+  });
+
+  it("respects the limit argument", () => {
+    for (let i = 0; i < 8; i++) {
+      storage.saveIssueProcess(
+        makeIssueProcess({
+          traceId: `trace-${i}`,
+          spanId: `ip-${i}`,
+          startTimeUnixNano: String(1715000000000000000n + BigInt(i)),
+        }),
+      );
+    }
+    const drains = storage.listRecentDrains(3);
+    expect(drains).toHaveLength(3);
+  });
+
+  it("returns an empty list when no issue_processes exist", () => {
+    expect(storage.listRecentDrains()).toHaveLength(0);
+  });
+});

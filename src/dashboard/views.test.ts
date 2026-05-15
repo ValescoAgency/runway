@@ -7,9 +7,11 @@ import type {
 } from "./storage.js";
 import {
   escapeHtml,
+  filterStateToQueryString,
   renderDetailView,
   renderListView,
   type DetailViewModel,
+  type ListFilterState,
 } from "./views.js";
 
 function row(over: Partial<StoredIssueProcess> = {}): StoredIssueProcess {
@@ -405,5 +407,165 @@ describe("renderDetailView (VA-389)", () => {
     );
     expect(html).not.toContain("<script>alert");
     expect(html).toContain("&lt;script&gt;alert");
+  });
+});
+
+// VA-392: filter-chip rendering + URL encoding.
+describe("renderListView — filter chips (VA-392)", () => {
+  const emptyState: ListFilterState = {
+    outcomes: [],
+    range: "all",
+    drain: null,
+  };
+
+  function viewModel(over: {
+    rows?: readonly StoredIssueProcess[];
+    filterState?: ListFilterState;
+    isFiltered?: boolean;
+    recentDrains?: readonly { traceId: string; startedAtUnixNano: string; issueCount: number }[];
+  } = {}): Parameters<typeof renderListView>[0] {
+    return {
+      rows: over.rows ?? [row()],
+      linearEnabled: false,
+      todoQueue: [],
+      snapshotsByIdentifier: new Map<string, LinearSnapshotRow>(),
+      activeDrain: null,
+      filterState: over.filterState ?? emptyState,
+      recentDrains: over.recentDrains ?? [],
+      isFiltered: over.isFiltered ?? false,
+    };
+  }
+
+  it("renders a chip for every outcome kind with no outcome chip active by default", () => {
+    const html = renderListView(viewModel());
+    expect(html).toContain('class="filter-chip outcome-opened"');
+    expect(html).toContain('class="filter-chip outcome-hitl"');
+    expect(html).toContain('class="filter-chip outcome-errored"');
+    expect(html).toContain('class="filter-chip outcome-in-flight"');
+    // None of the outcome chips carry the active class on the empty
+    // state (the range=all chip is active by default, by design).
+    expect(html).not.toMatch(/outcome-(opened|hitl|errored|in-flight) active"/);
+  });
+
+  it("marks the selected outcome chip as active", () => {
+    const html = renderListView(
+      viewModel({
+        filterState: { outcomes: ["hitl"], range: "all", drain: null },
+        isFiltered: true,
+      }),
+    );
+    expect(html).toContain('class="filter-chip outcome-hitl active"');
+    expect(html).not.toContain('outcome-opened active');
+  });
+
+  it("marks the selected range chip as active", () => {
+    const html = renderListView(
+      viewModel({
+        filterState: { outcomes: [], range: "7d", drain: null },
+        isFiltered: true,
+      }),
+    );
+    expect(html).toContain('class="filter-chip range-7d active"');
+  });
+
+  it("renders one chip per recent drain plus an 'all drains' reset chip", () => {
+    const html = renderListView(
+      viewModel({
+        recentDrains: [
+          {
+            traceId: "trace-x",
+            startedAtUnixNano: "1715000000000000000",
+            issueCount: 2,
+          },
+        ],
+      }),
+    );
+    expect(html).toContain(">all drains</a>");
+    expect(html).toContain("(2)");
+    expect(html).toContain('title="trace trace-x"');
+  });
+
+  it("renders the 'no rows match this filter' empty state when filtered + empty", () => {
+    const html = renderListView(
+      viewModel({
+        rows: [],
+        isFiltered: true,
+        filterState: { outcomes: ["errored"], range: "all", drain: null },
+      }),
+    );
+    expect(html).toContain("No issue processes match this filter");
+    expect(html).not.toContain("No issue processes yet.");
+  });
+
+  it("renders the original 'no data yet' empty state when unfiltered + empty", () => {
+    const html = renderListView(viewModel({ rows: [], isFiltered: false }));
+    expect(html).toContain("No issue processes yet");
+    expect(html).not.toContain("No issue processes match this filter");
+  });
+
+  it("renders a 'clear all' chip only when a filter is active", () => {
+    const off = renderListView(viewModel());
+    expect(off).not.toContain("clear all");
+    const on = renderListView(
+      viewModel({
+        filterState: { outcomes: ["hitl"], range: "all", drain: null },
+        isFiltered: true,
+      }),
+    );
+    expect(on).toContain("clear all");
+  });
+
+  it("encodes the filter state in the tbody's hx-get URL so polling preserves it", () => {
+    const html = renderListView(
+      viewModel({
+        filterState: { outcomes: ["opened"], range: "7d", drain: null },
+        isFiltered: true,
+      }),
+    );
+    expect(html).toMatch(/hx-get="\/issue-processes\?outcome=opened&amp;range=7d"/);
+  });
+
+  it("emits an htmx-indicator progress bar above the table", () => {
+    const html = renderListView(viewModel());
+    expect(html).toContain('class="progress-bar htmx-indicator"');
+    expect(html).toContain('hx-indicator="#rows-progress"');
+  });
+});
+
+describe("filterStateToQueryString (VA-392)", () => {
+  it("returns an empty string for the all-defaults state", () => {
+    expect(
+      filterStateToQueryString({ outcomes: [], range: "all", drain: null }),
+    ).toBe("");
+  });
+
+  it("serializes outcomes as a single comma-separated value", () => {
+    expect(
+      filterStateToQueryString({
+        outcomes: ["opened", "hitl"],
+        range: "all",
+        drain: null,
+      }),
+    ).toBe("?outcome=opened%2Chitl");
+  });
+
+  it("omits the range param when range=all", () => {
+    expect(
+      filterStateToQueryString({
+        outcomes: ["opened"],
+        range: "all",
+        drain: null,
+      }),
+    ).toBe("?outcome=opened");
+  });
+
+  it("URL-encodes drain trace ids", () => {
+    expect(
+      filterStateToQueryString({
+        outcomes: [],
+        range: "all",
+        drain: "trace with spaces",
+      }),
+    ).toBe("?drain=trace%20with%20spaces");
   });
 });

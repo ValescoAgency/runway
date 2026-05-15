@@ -1,11 +1,31 @@
 import type {
   ActiveDrain,
   LinearSnapshotRow,
+  OutcomeFilterKind,
   PhaseSpan,
+  RecentDrain,
   StoredAgentIteration,
   StoredIssueProcess,
   StoredLogRecord,
 } from "./storage.js";
+
+/**
+ * VA-392: filter state encoded in the list-view URL query string. Each
+ * chip group maps to one field. Empty / `"all"` / `null` mean "no
+ * constraint" — the `?` form is shareable as long as the values are
+ * present, so reloading the page re-applies the same filter set.
+ */
+export interface ListFilterState {
+  readonly outcomes: readonly OutcomeFilterKind[];
+  readonly range: "today" | "7d" | "30d" | "all";
+  readonly drain: string | null;
+}
+
+const EMPTY_FILTER_STATE: ListFilterState = {
+  outcomes: [],
+  range: "all",
+  drain: null,
+};
 
 /**
  * VA-386: minimal SSR HTML for the dashboard list view. No framework,
@@ -67,6 +87,26 @@ export interface ListViewModel {
    * the idle state by default.
    */
   readonly activeDrain?: ActiveDrain | null;
+  /**
+   * VA-392: filter chip state. The view renders chip groups for
+   * outcome / drain / date range; each chip's "active" class reflects
+   * whether the chip's value is in `filterState`. Pre-VA-392 callers
+   * default to the empty state (no chips active).
+   */
+  readonly filterState?: ListFilterState;
+  /**
+   * VA-392: recent drains for the drain chip set. The view caps the
+   * displayed count to `MAX_DRAIN_CHIPS`; the server should pass the
+   * top-N (default 5) which the view also caps defensively.
+   */
+  readonly recentDrains?: readonly RecentDrain[];
+  /**
+   * VA-392: whether the current filter state is constraining the row
+   * set. The view uses this to distinguish "no issue processes match
+   * this filter" (filtered + no rows) from "no data at all yet"
+   * (unfiltered + no rows) in the empty-state row.
+   */
+  readonly isFiltered?: boolean;
 }
 
 export function renderListView(input: ListViewModel | readonly StoredIssueProcess[]): string {
@@ -80,16 +120,32 @@ export function renderListView(input: ListViewModel | readonly StoredIssueProces
       }
     : (input as ListViewModel);
 
+  const filterState = vm.filterState ?? EMPTY_FILTER_STATE;
+  const isFiltered = vm.isFiltered ?? false;
+  const recentDrains = vm.recentDrains ?? [];
+
   const tableBody = renderIssueProcessRows({
     rows: vm.rows,
     linearEnabled: vm.linearEnabled,
     snapshotsByIdentifier: vm.snapshotsByIdentifier,
+    isFiltered,
   });
 
   const queueSection = vm.linearEnabled ? renderTodoQueue(vm.todoQueue) : "";
   // VA-391: drain summary strip renders ABOVE the queue + run list
   // so the operator sees in-flight progress at the top of the page.
   const drainStrip = renderDrainStrip(vm.activeDrain ?? null);
+  // VA-392: filter chips render between the drain strip and the table
+  // so the operator can narrow the run list without leaving the page.
+  const filterChips = renderFilterChips(filterState, recentDrains);
+
+  // VA-391/392: the fragment endpoint preserves filter state by
+  // re-passing the current query string on each poll. `hx-include`
+  // grabs all `.filter-chip` anchors' hrefs — but those are HTML
+  // links, not form fields, so we pass the params explicitly via the
+  // tbody's `hx-get`. The simpler approach is to encode the filter
+  // state directly in the `hx-get` URL.
+  const fragmentHref = `/issue-processes${filterStateToQueryString(filterState)}`;
 
   // VA-391: htmx + sse extension are loaded once at the top of the
   // page. Polling on the rows tbody refreshes the recent-runs section
@@ -111,6 +167,39 @@ export function renderListView(input: ListViewModel | readonly StoredIssueProces
     .drain-strip .strip-counter strong { color: #e5e5e5; }
     .drain-strip .counter-hitl   strong { color: #facc15; }
     .drain-strip .counter-err    strong { color: #f87171; }
+    .filters { margin: 0 0 16px; display: flex; flex-direction: column;
+               gap: 6px; font-size: 12px; }
+    .filter-row { display: flex; align-items: center; gap: 8px;
+                  flex-wrap: wrap; }
+    .filter-label { color: #9ca3af; min-width: 64px;
+                    text-transform: uppercase; letter-spacing: 0.04em;
+                    font-size: 11px; }
+    .filter-chip { display: inline-block; padding: 2px 8px;
+                   border-radius: 999px; border: 1px solid #2a2a2e;
+                   color: #d4d4d8; background: #16161a; }
+    .filter-chip:hover { border-color: #4b5563;
+                         text-decoration: none; }
+    .filter-chip.active { background: #1d4ed8; border-color: #2563eb;
+                          color: #e5e5e5; }
+    .filter-chip.outcome-opened.active   { background: #166534; border-color: #16a34a; }
+    .filter-chip.outcome-hitl.active     { background: #854d0e; border-color: #ca8a04; }
+    .filter-chip.outcome-errored.active  { background: #7f1d1d; border-color: #dc2626; }
+    .filter-chip.outcome-in-flight.active { background: #374151; border-color: #6b7280; }
+    .filter-chip.clear { color: #9ca3af; border-style: dashed; }
+    /* VA-392: htmx-indicator is the standard class htmx toggles
+       opacity on during an in-flight request. The thin bar sits
+       above the table; opacity 0 → 1 keeps layout stable. */
+    .progress-bar { height: 2px; background: #2a2a2e; border-radius: 1px;
+                    margin: 0 0 8px; overflow: hidden; opacity: 0;
+                    transition: opacity 120ms ease-in; }
+    .progress-bar.htmx-indicator.htmx-request { opacity: 1; }
+    .progress-bar::after { content: ""; display: block; width: 30%;
+                           height: 100%; background: #60a5fa;
+                           animation: runway-progress 1.2s linear infinite; }
+    @keyframes runway-progress {
+      0%   { transform: translateX(-100%); }
+      100% { transform: translateX(400%); }
+    }
   </style>
   <script src="https://unpkg.com/htmx.org@1.9.12" integrity="sha384-ujb1lZYygJmzgSwoxRggbCHcjc0rB2XoQrxeTUQyRjrOnlCoYta87iKBWq3EsdM2" crossorigin="anonymous"></script>
 </head>
@@ -118,7 +207,9 @@ export function renderListView(input: ListViewModel | readonly StoredIssueProces
   <h1>runway · issue processes</h1>
   ${drainStrip}
   ${queueSection}
+  ${filterChips}
   <h2>Recent runs</h2>
+  <div class="progress-bar htmx-indicator" id="rows-progress"></div>
   <table>
     <thead>
       <tr>
@@ -129,9 +220,10 @@ export function renderListView(input: ListViewModel | readonly StoredIssueProces
       </tr>
     </thead>
     <tbody id="issue-process-rows"
-           hx-get="/issue-processes"
+           hx-get="${escapeHtml(fragmentHref)}"
            hx-trigger="every 3s"
-           hx-swap="innerHTML">${tableBody}</tbody>
+           hx-swap="innerHTML"
+           hx-indicator="#rows-progress">${tableBody}</tbody>
   </table>
 </body>
 </html>`;
@@ -173,13 +265,157 @@ export function renderIssueProcessRows(input: {
   readonly rows: readonly StoredIssueProcess[];
   readonly linearEnabled: boolean;
   readonly snapshotsByIdentifier: ReadonlyMap<string, LinearSnapshotRow>;
+  /**
+   * VA-392: when true and `rows` is empty, the row renders a
+   * "no issue processes match this filter" message instead of the
+   * "no data at all yet" empty state. Defaults to false to keep
+   * pre-VA-392 callers on the original empty message.
+   */
+  readonly isFiltered?: boolean;
 }): string {
   if (input.rows.length === 0) {
+    if (input.isFiltered) {
+      return `<tr><td colspan="4" class="empty">No issue processes match this filter. <a href="/">Clear filters</a> to see everything.</td></tr>`;
+    }
     return `<tr><td colspan="4" class="empty">No issue processes yet. Run <code>runway run</code> with <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> pointing here to populate.</td></tr>`;
   }
   return input.rows
     .map((r) => renderRow(r, input.snapshotsByIdentifier))
     .join("");
+}
+
+// ---------------------------------------------------------------------------
+// VA-392: filter chips
+// ---------------------------------------------------------------------------
+
+/**
+ * Cap the number of drain chips rendered. Defensive — the server
+ * already bounds the query, but a stale view model from a test or a
+ * future caller shouldn't blow up the chip strip.
+ */
+const MAX_DRAIN_CHIPS = 5;
+
+const OUTCOME_CHIP_LABELS: ReadonlyMap<OutcomeFilterKind, string> = new Map([
+  ["opened", "opened"],
+  ["hitl", "hitl"],
+  ["errored", "errored"],
+  ["in-flight", "in-flight"],
+]);
+
+const RANGE_CHIP_LABELS: ReadonlyMap<ListFilterState["range"], string> = new Map(
+  [
+    ["today", "today"],
+    ["7d", "7d"],
+    ["30d", "30d"],
+    ["all", "all"],
+  ],
+);
+
+function renderFilterChips(
+  state: ListFilterState,
+  recentDrains: readonly RecentDrain[],
+): string {
+  const outcomeRow = renderOutcomeChips(state);
+  const rangeRow = renderRangeChips(state);
+  const drainRow = renderDrainChips(state, recentDrains);
+  const clearChip = isFilterStateEmpty(state)
+    ? ""
+    : `<a class="filter-chip clear" href="/">clear all</a>`;
+  return `<div class="filters">
+    <div class="filter-row"><span class="filter-label">Outcome</span>${outcomeRow}</div>
+    <div class="filter-row"><span class="filter-label">Range</span>${rangeRow}</div>
+    ${drainRow}
+    ${clearChip ? `<div class="filter-row">${clearChip}</div>` : ""}
+  </div>`;
+}
+
+function renderOutcomeChips(state: ListFilterState): string {
+  // Each chip toggles its own outcome on/off; the URL preserves the
+  // other chip groups so a click only flips one bit.
+  return Array.from(OUTCOME_CHIP_LABELS.entries())
+    .map(([kind, label]) => {
+      const active = state.outcomes.includes(kind);
+      const nextOutcomes = active
+        ? state.outcomes.filter((o) => o !== kind)
+        : [...state.outcomes, kind];
+      const href = filterStateToQueryString({ ...state, outcomes: nextOutcomes }) || "/";
+      const cls = `filter-chip outcome-${kind}${active ? " active" : ""}`;
+      return `<a class="${cls}" href="${escapeHtml(href)}">${escapeHtml(label)}</a>`;
+    })
+    .join("");
+}
+
+function renderRangeChips(state: ListFilterState): string {
+  return Array.from(RANGE_CHIP_LABELS.entries())
+    .map(([range, label]) => {
+      const active = state.range === range;
+      const href = filterStateToQueryString({ ...state, range }) || "/";
+      const cls = `filter-chip range-${range}${active ? " active" : ""}`;
+      return `<a class="${cls}" href="${escapeHtml(href)}">${escapeHtml(label)}</a>`;
+    })
+    .join("");
+}
+
+function renderDrainChips(
+  state: ListFilterState,
+  recentDrains: readonly RecentDrain[],
+): string {
+  if (recentDrains.length === 0) return "";
+  // The drain chip is a single-select; clicking the active one
+  // clears it. "all drains" is rendered as a leading chip so the
+  // operator always has a way back to the unfiltered view without
+  // hunting for the "clear all" button.
+  const allActive = state.drain === null;
+  const allHref =
+    filterStateToQueryString({ ...state, drain: null }) || "/";
+  const allChip = `<a class="filter-chip${allActive ? " active" : ""}" href="${escapeHtml(allHref)}">all drains</a>`;
+  const chips = recentDrains
+    .slice(0, MAX_DRAIN_CHIPS)
+    .map((d) => {
+      const active = state.drain === d.traceId;
+      const nextDrain = active ? null : d.traceId;
+      const href = filterStateToQueryString({ ...state, drain: nextDrain }) || "/";
+      const label = formatDrainChipLabel(d);
+      const cls = `filter-chip${active ? " active" : ""}`;
+      return `<a class="${cls}" href="${escapeHtml(href)}" title="trace ${escapeHtml(d.traceId)}">${escapeHtml(label)}</a>`;
+    })
+    .join("");
+  return `<div class="filter-row"><span class="filter-label">Drain</span>${allChip}${chips}</div>`;
+}
+
+function formatDrainChipLabel(d: RecentDrain): string {
+  const ts = formatTimestamp(parseNs(d.startedAtUnixNano));
+  const time = ts.split(" ")[1] ?? ts;
+  return `${time} (${d.issueCount})`;
+}
+
+function isFilterStateEmpty(state: ListFilterState): boolean {
+  return (
+    state.outcomes.length === 0 &&
+    state.range === "all" &&
+    state.drain === null
+  );
+}
+
+/**
+ * VA-392: encode the filter state as a URL query string the list view
+ * can be reloaded from. Empty filter state returns "" so the link
+ * collapses to "/". Outcomes serialize as a single comma-separated
+ * `outcome=` value because that keeps the URL short for the common
+ * case (most operators pick one outcome chip).
+ */
+export function filterStateToQueryString(state: ListFilterState): string {
+  const parts: string[] = [];
+  if (state.outcomes.length > 0) {
+    parts.push(`outcome=${encodeURIComponent(state.outcomes.join(","))}`);
+  }
+  if (state.range !== "all") {
+    parts.push(`range=${encodeURIComponent(state.range)}`);
+  }
+  if (state.drain) {
+    parts.push(`drain=${encodeURIComponent(state.drain)}`);
+  }
+  return parts.length === 0 ? "" : `?${parts.join("&")}`;
 }
 
 /**

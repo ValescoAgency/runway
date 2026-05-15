@@ -33,12 +33,16 @@ services:
       RUNWAY_LINEAR_TEAM: ${RUNWAY_LINEAR_TEAM:-VA}
       RUNWAY_READY_STATUS: ${RUNWAY_READY_STATUS:-Todo}
     ports:
-      # VA-385: bind host-side to 127.0.0.1 only. The dashboard's
-      # security commitment is loopback-only; without the explicit
-      # `127.0.0.1:` prefix Docker publishes to 0.0.0.0 on the host
-      # and the dashboard becomes reachable from the LAN. Container
-      # side stays 0.0.0.0 (set by `DASHBOARD_HOST` in the Dockerfile)
-      # so Docker's port-forward to the listener still works.
+      # VA-385 / VA-392: bind host-side to 127.0.0.1 only. The
+      # dashboard's security commitment is loopback-only; without the
+      # explicit `127.0.0.1:` prefix Docker publishes to 0.0.0.0 on
+      # the host and the dashboard becomes reachable from the LAN.
+      # Container side stays 0.0.0.0 (set by `DASHBOARD_HOST` in the
+      # Dockerfile) so Docker's port-forward to the listener still
+      # works. To intentionally expose to the LAN, replace `127.0.0.1`
+      # below with the desired bind address (e.g. `0.0.0.0`) — there
+      # is deliberately no env override here because publishing
+      # publicly should require editing this file.
       #
       # OTLP HTTP endpoint — `runway run` posts /v1/traces here.
       - "127.0.0.1:${OTLP_PORT:-4318}:${OTLP_PORT:-4318}"

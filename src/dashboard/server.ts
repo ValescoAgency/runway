@@ -8,7 +8,10 @@ import { createEventBus, type EventBus } from "./events.js";
 import { projectLogs, projectPayload } from "./projector.js";
 import {
   createStorage,
+  type IssueProcessFilter,
   type LinearSnapshotRow,
+  type OutcomeFilterKind,
+  type RecentDrain,
   type Storage,
   type StoredIssueProcess,
 } from "./storage.js";
@@ -17,6 +20,7 @@ import {
   renderIssueProcessRows,
   renderListView,
   renderLogsSection,
+  type ListFilterState,
 } from "./views.js";
 import type { OtlpLogsPayload, OtlpTracesPayload } from "./otlp.js";
 
@@ -171,7 +175,7 @@ async function handle(
   }
 
   if (method === "GET" && (url === "/" || url.startsWith("/?"))) {
-    handleListView(res, storage, linearEnabled);
+    handleListView(req, res, storage, linearEnabled);
     return;
   }
 
@@ -181,7 +185,7 @@ async function handle(
     method === "GET" &&
     (url === "/issue-processes" || url.startsWith("/issue-processes?"))
   ) {
-    handleIssueProcessRowsFragment(res, storage, linearEnabled);
+    handleIssueProcessRowsFragment(req, res, storage, linearEnabled);
     return;
   }
 
@@ -433,11 +437,20 @@ function handleIssueProcessStream(
  * have their own swap triggers (or sit above the polling target).
  */
 function handleIssueProcessRowsFragment(
+  req: IncomingMessage,
   res: ServerResponse,
   storage: Storage,
   linearEnabled: boolean,
 ): void {
-  const rows = storage.listIssueProcesses({ limit: 100 });
+  // VA-392: the fragment endpoint applies the same filter state as the
+  // full list view so a polled refresh doesn't reset the user's chips.
+  // The query string is the source of truth — htmx mirrors the page's
+  // URL via `hx-include` from the front-end, so a /issue-processes
+  // request lands with the same params the list page was rendered
+  // against.
+  const filterState = parseListFilterState(req.url ?? "/");
+  const filter = toIssueProcessFilter(filterState);
+  const rows = storage.listIssueProcesses(filter);
   const snapshotsByIdentifier = linearEnabled
     ? new Map<string, LinearSnapshotRow>(
         storage.listLinearSnapshots().map((s) => [s.issueIdentifier, s]),
@@ -447,6 +460,7 @@ function handleIssueProcessRowsFragment(
     rows,
     linearEnabled,
     snapshotsByIdentifier,
+    isFiltered: isFilteredState(filterState),
   });
   res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
   res.end(html);
@@ -464,11 +478,19 @@ function writeSseFrame(
 }
 
 function handleListView(
+  req: IncomingMessage,
   res: ServerResponse,
   storage: Storage,
   linearEnabled: boolean,
 ): void {
-  const rows = storage.listIssueProcesses({ limit: 100 });
+  // VA-392: filter chips state is encoded in the URL query string so
+  // the view is shareable. Parse once and reuse both for the storage
+  // query and the chip render (the latter needs to know which chips
+  // are currently active).
+  const filterState = parseListFilterState(req.url ?? "/");
+  const filter = toIssueProcessFilter(filterState);
+  const rows = storage.listIssueProcesses(filter);
+  const recentDrains = storage.listRecentDrains();
   // VA-390: only read Linear-side data when the sync is enabled. The
   // tables exist either way (the schema is unconditional), but a
   // disabled dashboard never paid for the poller so the rows would be
@@ -491,9 +513,120 @@ function handleListView(
     todoQueue,
     snapshotsByIdentifier,
     activeDrain,
+    filterState,
+    recentDrains,
+    isFiltered: isFilteredState(filterState),
   });
   res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
   res.end(html);
+}
+
+// ---------------------------------------------------------------------------
+// VA-392: URL ↔ filter state plumbing.
+// ---------------------------------------------------------------------------
+
+const VALID_OUTCOMES: readonly OutcomeFilterKind[] = [
+  "opened",
+  "hitl",
+  "errored",
+  "in-flight",
+];
+const VALID_RANGES: readonly ListFilterState["range"][] = [
+  "all",
+  "today",
+  "7d",
+  "30d",
+];
+
+/**
+ * VA-392: parse the list view's filter state out of the URL query
+ * string. The state is intentionally permissive — invalid values
+ * silently fall back to "no filter" rather than 400-ing, so a stale
+ * bookmark from a previous slice still renders.
+ */
+export function parseListFilterState(url: string): ListFilterState {
+  // `URL` needs a base; the dashboard never cares about it.
+  const parsed = new URL(url, "http://localhost");
+  const params = parsed.searchParams;
+
+  // `outcome=opened,hitl` or `outcome=opened&outcome=hitl` — both work.
+  const rawOutcomes = params
+    .getAll("outcome")
+    .flatMap((v) => v.split(","))
+    .map((v) => v.trim())
+    .filter((v) => v.length > 0);
+  const outcomes = rawOutcomes.filter((v): v is OutcomeFilterKind =>
+    (VALID_OUTCOMES as readonly string[]).includes(v),
+  );
+
+  const rangeRaw = (params.get("range") ?? "all").trim();
+  const range = (VALID_RANGES as readonly string[]).includes(rangeRaw)
+    ? (rangeRaw as ListFilterState["range"])
+    : "all";
+
+  const drain = params.get("drain")?.trim() || null;
+
+  return { outcomes, range, drain };
+}
+
+function isFilteredState(state: ListFilterState): boolean {
+  return (
+    state.outcomes.length > 0 ||
+    state.range !== "all" ||
+    state.drain !== null
+  );
+}
+
+/**
+ * VA-392: convert filter state into a storage filter. The date-range
+ * chip resolves to an `insertedSince` lower bound; the drain chip to
+ * `traceId`; outcomes pass through. `range=all` becomes no lower bound.
+ */
+function toIssueProcessFilter(state: ListFilterState): IssueProcessFilter {
+  const filter: {
+    -readonly [K in keyof IssueProcessFilter]: IssueProcessFilter[K];
+  } = { limit: 100 };
+  if (state.outcomes.length > 0) filter.outcomes = state.outcomes;
+  if (state.drain) filter.traceId = state.drain;
+  const since = resolveInsertedSince(state.range);
+  if (since) filter.insertedSince = since;
+  return filter;
+}
+
+/**
+ * VA-392: translate the date-range chip into a SQLite `datetime('now')`
+ * formatted lower bound. The column stores `YYYY-MM-DD HH:MM:SS` in
+ * UTC, so the cutoff is computed in UTC too. `today` is the current
+ * UTC calendar day's 00:00:00 — matching how an operator typically
+ * thinks of "today" when scanning the dashboard.
+ */
+function resolveInsertedSince(
+  range: ListFilterState["range"],
+): string | null {
+  if (range === "all") return null;
+  const now = new Date();
+  if (range === "today") {
+    return formatSqliteDatetime(
+      new Date(
+        Date.UTC(
+          now.getUTCFullYear(),
+          now.getUTCMonth(),
+          now.getUTCDate(),
+          0,
+          0,
+          0,
+        ),
+      ),
+    );
+  }
+  const days = range === "7d" ? 7 : 30;
+  const cutoff = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+  return formatSqliteDatetime(cutoff);
+}
+
+function formatSqliteDatetime(d: Date): string {
+  const pad = (n: number): string => n.toString().padStart(2, "0");
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
 }
 
 /**
@@ -619,11 +752,18 @@ export async function main(): Promise<void> {
   const sqlitePath = process.env.SQLITE_PATH ?? "/data/runway.sqlite";
   const otlpPort = parsePort("OTLP_PORT", "4318");
   const dashboardPort = parsePort("DASHBOARD_PORT", "3001");
-  // VA-385: explicit security commitment — loopback by default. The
-  // Dockerfile sets `DASHBOARD_HOST=0.0.0.0` so Docker's port-forward
-  // can reach the listener; stand-alone (e.g. `runway dash`) gets
-  // 127.0.0.1 without configuration.
-  const host = process.env.DASHBOARD_HOST?.trim() || "127.0.0.1";
+  // VA-385/VA-392: explicit security commitment — loopback by default.
+  // VA-392 splits the single `DASHBOARD_HOST` into two env vars so the
+  // OTLP receiver and dashboard UI can bind independently (e.g. OTLP
+  // on the docker bridge interface while the UI stays loopback). The
+  // legacy `DASHBOARD_HOST` is honored as a fallback for both so
+  // older docker-compose configs keep working. The Dockerfile sets
+  // `DASHBOARD_HOST=0.0.0.0` so Docker's port-forward can reach the
+  // listener; stand-alone (e.g. `runway dash`) gets 127.0.0.1 without
+  // configuration.
+  const legacyHost = process.env.DASHBOARD_HOST?.trim() || "127.0.0.1";
+  const otlpHost = process.env.OTLP_BIND?.trim() || legacyHost;
+  const dashboardHost = process.env.DASHBOARD_BIND?.trim() || legacyHost;
   // VA-399: rolling-window size for the evaluator aggregates view.
   // Defaults to 30 drains; operators bump it for longer-baseline IRA
   // comparisons. Missing/invalid → fall through to the storage layer's
@@ -665,14 +805,26 @@ export async function main(): Promise<void> {
     );
   }
 
-  const otlp = await startServer({ storage, port: otlpPort, host, linearEnabled });
+  const otlp = await startServer({
+    storage,
+    port: otlpPort,
+    host: otlpHost,
+    linearEnabled,
+  });
+  // The two listeners can share a server only when both port AND host
+  // match — different bind addresses need different listeners.
   const dashboard =
-    dashboardPort === otlpPort
+    dashboardPort === otlpPort && dashboardHost === otlpHost
       ? otlp
-      : await startServer({ storage, port: dashboardPort, host, linearEnabled });
+      : await startServer({
+          storage,
+          port: dashboardPort,
+          host: dashboardHost,
+          linearEnabled,
+        });
 
   console.log(
-    `[runway dashboard] OTLP ${host}:${otlp.port} · dashboard ${host}:${dashboard.port}; sqlite=${sqlitePath}`,
+    `[runway dashboard] OTLP ${otlpHost}:${otlp.port} · dashboard ${dashboardHost}:${dashboard.port}; sqlite=${sqlitePath}`,
   );
 
   const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
