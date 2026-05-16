@@ -58,12 +58,23 @@ export interface RunwayConfig {
    * orchestrator startup.
    */
   readonly baseBranch?: string;
-  readonly readyStatus: string;
-  readonly inProgressStatus: string;
-  readonly inReviewStatus: string;
-  // VA-354: default to the Flightplan canonical state label
-  // `ready-for-human`. Workspaces that use a different label
-  // override via `RUNWAY_HITL_LABEL`.
+  /**
+   * VA-423: label that marks an issue as "ready for the agent to
+   * pick up." Default `ready-for-agent` matches the flightplan
+   * v1.1.0 contract. Runway's drain queue filters by this label
+   * instead of workflow status because Linear's GitHub integration
+   * auto-mutates status when a PR cross-references an issue —
+   * draining the queue silently every time someone mentions the
+   * issue from a PR. Labels are not touched by that integration.
+   * Override via `RUNWAY_READY_LABEL`.
+   */
+  readonly readyLabel: string;
+  // VA-354 / VA-423: default to `ready-for-human`. Runway adopts
+  // flightplan's `ready-for-agent` for drain pickup but keeps
+  // `ready-for-human` for HITL (not flightplan's canonical
+  // `needs-human`). One convention across our triage / to-prd /
+  // to-issues / gstack skills wins over matching any single tool's
+  // canonical exactly. Override via `RUNWAY_HITL_LABEL`.
   readonly hitlLabel: string;
   readonly maxIterations: number;
   /**
@@ -167,14 +178,8 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
   ),
   linearProject: EConfig.option(EConfig.string("RUNWAY_LINEAR_PROJECT")),
   baseBranch: EConfig.option(EConfig.string("RUNWAY_BASE_BRANCH")),
-  readyStatus: EConfig.string("RUNWAY_READY_STATUS").pipe(
-    EConfig.withDefault("Todo"),
-  ),
-  inProgressStatus: EConfig.string("RUNWAY_IN_PROGRESS_STATUS").pipe(
-    EConfig.withDefault("In Progress"),
-  ),
-  inReviewStatus: EConfig.string("RUNWAY_IN_REVIEW_STATUS").pipe(
-    EConfig.withDefault("In Review"),
+  readyLabel: EConfig.string("RUNWAY_READY_LABEL").pipe(
+    EConfig.withDefault("ready-for-agent"),
   ),
   hitlLabel: EConfig.string("RUNWAY_HITL_LABEL").pipe(
     EConfig.withDefault("ready-for-human"),
@@ -233,9 +238,7 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
       linearTeam: raw.linearTeam,
       linearProject: Option.getOrUndefined(raw.linearProject),
       baseBranch: Option.getOrUndefined(raw.baseBranch),
-      readyStatus: raw.readyStatus,
-      inProgressStatus: raw.inProgressStatus,
-      inReviewStatus: raw.inReviewStatus,
+      readyLabel: raw.readyLabel,
       hitlLabel: raw.hitlLabel,
       maxIterations: raw.maxIterations,
       implTurns: raw.implTurns,

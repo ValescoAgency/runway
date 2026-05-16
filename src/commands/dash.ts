@@ -21,7 +21,7 @@ import { execa, type ExecaError } from "execa";
  *
  * Verb-agnostic env passthrough: when set in the caller's environment,
  * `LINEAR_API_KEY`, `LINEAR_POLL_INTERVAL_SECONDS`, `RUNWAY_LINEAR_TEAM`,
- * `RUNWAY_READY_STATUS` are forwarded into the container via `-e`.
+ * `RUNWAY_READY_LABEL` are forwarded into the container via `-e`.
  * Absent → the container falls back to the same defaults as
  * `docker-compose.yml` (Linear sync disabled, etc.).
  */
@@ -41,7 +41,7 @@ const FORWARDED_ENV_KEYS = [
   "LINEAR_API_KEY",
   "LINEAR_POLL_INTERVAL_SECONDS",
   "RUNWAY_LINEAR_TEAM",
-  "RUNWAY_READY_STATUS",
+  "RUNWAY_READY_LABEL",
 ] as const;
 
 export interface DashOptions {
@@ -90,7 +90,7 @@ LINEAR SYNC (optional)
   When LINEAR_API_KEY is set in the caller's environment, \`runway dash
   up\` forwards it into the container so the dashboard polls Linear and
   surfaces the Todo queue. LINEAR_POLL_INTERVAL_SECONDS,
-  RUNWAY_LINEAR_TEAM, and RUNWAY_READY_STATUS are forwarded too when
+  RUNWAY_LINEAR_TEAM, and RUNWAY_READY_LABEL are forwarded too when
   set. Absent → the dashboard runs without Linear surfaces.
 
 OTEL EXPORTER

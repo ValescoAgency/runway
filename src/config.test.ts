@@ -14,7 +14,9 @@ describe("VA-359 — Effect.Config + Redacted secrets", () => {
     });
     // Defaults applied.
     expect(cfg.linearTeam).toBe("VA");
-    expect(cfg.readyStatus).toBe("Todo");
+    // VA-423: queue is label-gated; `ready-for-agent` is the flightplan
+    // v1.1.0 contract.
+    expect(cfg.readyLabel).toBe("ready-for-agent");
     expect(cfg.hitlLabel).toBe("ready-for-human");
     expect(cfg.maxIterations).toBe(5);
     expect(cfg.implTurns).toBe(3);
@@ -116,15 +118,15 @@ describe("VA-359 — Effect.Config + Redacted secrets", () => {
     ).toThrow(/non-negative integer/);
   });
 
-  it("env-driven overrides for status names and HITL label apply", () => {
+  it("env-driven overrides for ready label, team, and HITL label apply", () => {
     const cfg = loadConfig({
       LINEAR_API_KEY: "lin_test",
       RUNWAY_LINEAR_TEAM: "FLIGHT",
-      RUNWAY_READY_STATUS: "Backlog",
+      RUNWAY_READY_LABEL: "agent-ready",
       RUNWAY_HITL_LABEL: "needs-review",
     });
     expect(cfg.linearTeam).toBe("FLIGHT");
-    expect(cfg.readyStatus).toBe("Backlog");
+    expect(cfg.readyLabel).toBe("agent-ready");
     expect(cfg.hitlLabel).toBe("needs-review");
   });
 

@@ -2,7 +2,6 @@ import { Effect, Layer, Logger, RateLimiter } from "effect";
 import { ConfigLive, ConfigTag } from "../config.js";
 import { createLinearGateway } from "../linear.js";
 import { createGithubGateway } from "../github.js";
-import { remoteRefExists } from "../git.js";
 import {
   assertSandcastleInitialised,
   drainQueue,
@@ -148,17 +147,24 @@ ENVIRONMENT
                               branch (the branch runway diffs against
                               and targets with PRs). Detected from
                               origin/HEAD when unset.
-  RUNWAY_READY_STATUS         default "Todo"
-  RUNWAY_IN_PROGRESS_STATUS   default "In Progress" — also the
-                              auxiliary drain bucket (VA-421): runway
-                              accepts issues in this status when no
-                              agent/<id> branch exists on origin, so
-                              Linear's GitHub auto-transitions (e.g.
-                              an unrelated PR mentioning the issue in
-                              its body) can't silently drop the issue
-                              from the queue.
-  RUNWAY_IN_REVIEW_STATUS     default "In Review"
-  RUNWAY_HITL_LABEL           default "ready-for-human"
+  RUNWAY_READY_LABEL          default "ready-for-agent" — the
+                              flightplan v1.1.0 contract. Runway's
+                              drain queue filters by this label, not
+                              by workflow status, because Linear's
+                              GitHub integration auto-mutates status
+                              on PR cross-references. Labels are
+                              immune to that integration. Runway
+                              removes the label on pickup (the
+                              atomic claim signal).
+  RUNWAY_HITL_LABEL           default "ready-for-human" — applied
+                              when the agent or reviewer can't
+                              finish, AND when a run fails outright.
+                              Runway never re-applies the ready
+                              label on failure (terminal failures
+                              shouldn't retry indefinitely); an
+                              operator triages and re-applies
+                              the ready label manually if the
+                              cause was transient.
   RUNWAY_MAX_ITERATIONS       default 5  — outer impl re-prompt loop
                               (only fires when the agent fails to
                               signal IMPL: DONE / BLOCKED at all)
@@ -213,22 +219,14 @@ export async function runCommand(argv: readonly string[]): Promise<void> {
       ? `team ${config.linearTeam} / project ${config.linearProject}`
       : `team ${config.linearTeam}`;
     yield* Effect.logInfo(
-      `draining queue from ${scope} (status="${config.readyStatus}") against ${cwd}`,
+      `draining queue from ${scope} (label="${config.readyLabel}") against ${cwd}`,
     );
 
     const linearLimiter = yield* RateLimiter.make({
       limit: 30,
       interval: "1 minute",
     });
-    // VA-421: inject a git-side predicate so `fetchReady` can accept
-    // In-Progress issues whose `agent/<id>` branch hasn't yet been
-    // pushed to origin. Closes the Linear-auto-transition loophole
-    // where an unrelated PR-body mention silently drops an issue from
-    // the drain queue.
-    const linear = createLinearGateway(config, linearLimiter, {
-      remoteAgentBranchExists: (branch) =>
-        Effect.runPromise(remoteRefExists(cwd, branch)),
-    });
+    const linear = createLinearGateway(config, linearLimiter);
     const github = createGithubGateway();
     return yield* drainQueue(
       { config, linear, github, cwd },

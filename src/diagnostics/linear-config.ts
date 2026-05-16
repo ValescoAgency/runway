@@ -9,10 +9,15 @@ import {
 
 /**
  * Multi-result adapter. A single `validateLinearConfig()` API call
- * drives the team / state / label sub-checks — splitting these into
+ * drives the team + label sub-checks — splitting these into
  * separate adapters would hit Linear's API N× per `runway doctor`
  * run, which is rude and slow. The checks share the result of one
- * call, so they live as one adapter that emits 1-5 CheckResults.
+ * call, so they live as one adapter that emits 1-3 CheckResults.
+ *
+ * VA-423: workflow-state checks retired alongside the status-mutation
+ * model. Runway's queue contract is label-gated; the doctor verifies
+ * the team plus the two labels (`ready-for-agent`, `ready-for-human`)
+ * that drive pickup and HITL routing.
  *
  * Early-exits with a single "skipped" result when LINEAR_API_KEY is
  * unset (the env section already failed; we don't re-fail here).
@@ -68,7 +73,7 @@ export const linearConfigDiagnostic: Diagnostic = {
       });
       results.push({
         status: "skip",
-        label: "workflow states",
+        label: "ready label",
         detail: "skipped (team missing)",
       });
       results.push({
@@ -85,50 +90,30 @@ export const linearConfigDiagnostic: Diagnostic = {
       detail: `id=${result.team.id}`,
     });
 
-    for (const [configured, state] of [
-      [config.readyStatus, result.readyStatus],
-      [config.inProgressStatus, result.inProgressStatus],
-      [config.inReviewStatus, result.inReviewStatus],
+    for (const [role, envVar, configured, label] of [
+      ["ready", "RUNWAY_READY_LABEL", config.readyLabel, result.readyLabel],
+      ["HITL", "RUNWAY_HITL_LABEL", config.hitlLabel, result.hitlLabel],
     ] as const) {
-      if (state.kind === "ok") {
+      const checkName = `${role} label "${configured}"`;
+      if (label.kind === "ok") {
         results.push({
           status: "ok",
-          label: `workflow state "${configured}"`,
+          label: checkName,
           detail: "present",
         });
-      } else if (state.kind === "skipped") {
+      } else if (label.kind === "skipped") {
         results.push({
           status: "skip",
-          label: `workflow state "${configured}"`,
-          detail: state.reason,
+          label: checkName,
+          detail: label.reason,
         });
       } else {
         results.push({
           status: "fail",
-          label: `workflow state "${configured}"`,
-          detail: `not found on team; available: ${formatList(state.available)}`,
+          label: checkName,
+          detail: `not found on team — set ${envVar} or create the label. Available: ${formatList(label.available)}`,
         });
       }
-    }
-
-    if (result.hitlLabel.kind === "ok") {
-      results.push({
-        status: "ok",
-        label: `HITL label "${config.hitlLabel}"`,
-        detail: "present",
-      });
-    } else if (result.hitlLabel.kind === "skipped") {
-      results.push({
-        status: "skip",
-        label: `HITL label "${config.hitlLabel}"`,
-        detail: result.hitlLabel.reason,
-      });
-    } else {
-      results.push({
-        status: "fail",
-        label: `HITL label "${config.hitlLabel}"`,
-        detail: `not found on team — set RUNWAY_HITL_LABEL or create the label. Available: ${formatList(result.hitlLabel.available)}`,
-      });
     }
 
     return results;

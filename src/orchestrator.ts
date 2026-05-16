@@ -56,7 +56,14 @@ export interface OrchestratorResult {
 
 export interface IssueOutcome {
   readonly identifier: string;
-  readonly kind: "opened" | "hitl" | "reverted" | "errored";
+  // VA-423: the `reverted` outcome retired with the status-mutation
+  // model — every failure now lands on `ready-for-human` via the
+  // HITL path. Distinct buckets remain for the dashboard and the
+  // exit summary: `opened` = PR opened, `hitl` = planned HITL or
+  // crashed-into-HITL, `errored` = same as HITL on the data side
+  // but flagged separately so a per-run "things actually crashed"
+  // count survives.
+  readonly kind: "opened" | "hitl" | "errored";
   readonly detail: string;
 }
 
@@ -186,10 +193,13 @@ export const drainQueue = (
       commentAuthorAllowlist,
     };
 
-    // VA-344: never re-pick an issue in the same invocation, even if
-    // VA-342 reverted it to `Todo`. Without this, a deterministic
-    // startup failure (broken .env.schema, missing image, expired
-    // token) would loop on the same issue until --max was exhausted.
+    // VA-344: never re-pick an issue in the same invocation. After
+    // VA-423, the `ready-for-agent` label is stripped on pickup so
+    // a fresh `fetchReady` shouldn't re-surface a just-attempted
+    // issue anyway — but a same-invocation guard is still cheap
+    // insurance against a Linear eventual-consistency edge re-
+    // returning the issue before the label-removal write has
+    // propagated.
     const seen = new Set<string>();
     const outcomes: IssueOutcome[] = [];
     let attempts = 0;
@@ -240,7 +250,6 @@ export const drainQueue = (
           processed.left,
           issue,
           runDeps,
-          branch,
         );
         yield* Effect.annotateCurrentSpan({
           "runway.outcome.kind": failureOutcome.kind,
@@ -250,12 +259,10 @@ export const drainQueue = (
           // from "crashed and routed to HITL" (kind=hitl,
           // errored=true) on the dashboard row.
           "runway.outcome.errored": true,
-          // VA-387: only "errored" failure outcomes land on HITL.
-          // "reverted" outcomes go back to Todo and never reach a
-          // human, so `runway.hitl.reason` would be misleading.
-          ...(failureOutcome.kind === "errored"
-            ? { "runway.hitl.reason": failureOutcome.detail }
-            : {}),
+          // VA-387 / VA-423: failure outcomes always land on HITL now;
+          // surface the reason as `runway.hitl.reason` for the
+          // dashboard detail pane.
+          "runway.hitl.reason": failureOutcome.detail,
         });
         return { errored: true, outcome: failureOutcome };
       }).pipe(
@@ -346,7 +353,13 @@ const processIssue = (
           )
     );
 
-    yield* linear.transition(issue.id, config.inProgressStatus);
+    // VA-423: claim the issue atomically by removing the
+    // `ready-for-agent` label. This is the signal that takes the
+    // issue out of the drain queue — Linear's GitHub integration
+    // will move the workflow status to `In Progress` automatically
+    // when the PR is opened (and to `Done` when it merges), so
+    // runway no longer issues any state mutations of its own.
+    yield* linear.removeLabel(issue.id, config.readyLabel);
     yield* linear.comment(
       issue.id,
       `Runway picked up this issue. Branch: \`${branch}\`.`,
@@ -470,9 +483,7 @@ const printExitSummary = (
           ? "APPROVED → PR opened"
           : o.kind === "hitl"
             ? "HITL"
-            : o.kind === "reverted"
-              ? "REVERTED → Todo"
-              : "INFRA_ERROR";
+            : "INFRA_ERROR";
       console.log(`  ${o.identifier}  ${tag}  ${o.detail}`);
     }
   });

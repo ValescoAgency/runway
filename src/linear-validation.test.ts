@@ -3,17 +3,20 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Mock @linear/sdk so validateLinearConfig doesn't try to hit the
 // network. We replace LinearClient with a constructor whose returned
-// instance exposes the three resource methods we use.
+// instance exposes the resource methods we use.
+//
+// VA-423: workflow-state checks retired — runway's queue contract is
+// label-gated and runway no longer issues state mutations, so the
+// doctor verifies team + labels only.
 
 const teamsMock = vi.fn();
-const workflowStatesMock = vi.fn();
 const issueLabelsMock = vi.fn();
 
 vi.mock("@linear/sdk", () => {
   class LinearClient {
     teams = teamsMock;
-    workflowStates = workflowStatesMock;
     issueLabels = issueLabelsMock;
+    workflowStates = vi.fn();
     issues = vi.fn();
     issue = vi.fn();
     updateIssue = vi.fn();
@@ -28,9 +31,7 @@ const { validateLinearConfig } = await import("./linear.js");
 const config = {
   linearApiKey: Redacted.make("k"),
   linearTeam: "VA",
-  readyStatus: "Todo",
-  inProgressStatus: "In Progress",
-  inReviewStatus: "In Review",
+  readyLabel: "ready-for-agent",
   hitlLabel: "ready-for-human",
   maxIterations: 5,
   implTurns: 3,
@@ -41,7 +42,6 @@ const config = {
 
 beforeEach(() => {
   teamsMock.mockReset();
-  workflowStatesMock.mockReset();
   issueLabelsMock.mockReset();
 });
 
@@ -49,28 +49,20 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("validateLinearConfig (VA-354)", () => {
+describe("validateLinearConfig (VA-354 / VA-423)", () => {
   it("returns kind=missing for the team and skips downstream checks when the team key is wrong", async () => {
     teamsMock.mockResolvedValueOnce({ nodes: [] });
 
     const out = await validateLinearConfig(config);
     expect(out.team).toEqual({ kind: "missing", key: "VA" });
-    expect(out.readyStatus.kind).toBe("skipped");
+    expect(out.readyLabel.kind).toBe("skipped");
     expect(out.hitlLabel.kind).toBe("skipped");
-    // Workflow states / labels lookups never ran.
-    expect(workflowStatesMock).not.toHaveBeenCalled();
+    // Labels lookup never ran.
     expect(issueLabelsMock).not.toHaveBeenCalled();
   });
 
   it("flags a missing HITL label and surfaces available labels for triage", async () => {
     teamsMock.mockResolvedValueOnce({ nodes: [{ id: "team-1" }] });
-    workflowStatesMock.mockResolvedValueOnce({
-      nodes: [
-        { name: "Todo" },
-        { name: "In Progress" },
-        { name: "In Review" },
-      ],
-    });
     issueLabelsMock.mockResolvedValueOnce({
       nodes: [
         { name: "ready-for-agent" },
@@ -84,7 +76,10 @@ describe("validateLinearConfig (VA-354)", () => {
       hitlLabel: "needs-human",
     });
     expect(out.team).toEqual({ kind: "ok", id: "team-1" });
-    expect(out.readyStatus).toEqual({ kind: "ok", name: "Todo" });
+    expect(out.readyLabel).toEqual({
+      kind: "ok",
+      name: "ready-for-agent",
+    });
     expect(out.hitlLabel).toEqual({
       kind: "missing",
       name: "needs-human",
@@ -92,47 +87,48 @@ describe("validateLinearConfig (VA-354)", () => {
     });
   });
 
-  it("returns all-ok when every configured name exists", async () => {
+  it("returns all-ok when every configured label exists", async () => {
     teamsMock.mockResolvedValueOnce({ nodes: [{ id: "team-1" }] });
-    workflowStatesMock.mockResolvedValueOnce({
-      nodes: [
-        { name: "Todo" },
-        { name: "In Progress" },
-        { name: "In Review" },
-      ],
-    });
     issueLabelsMock.mockResolvedValueOnce({
-      nodes: [{ name: "ready-for-human" }, { name: "needs-info" }],
+      nodes: [
+        { name: "ready-for-agent" },
+        { name: "ready-for-human" },
+        { name: "needs-info" },
+      ],
     });
 
     const out = await validateLinearConfig(config);
     expect(out.team.kind).toBe("ok");
-    expect(out.readyStatus.kind).toBe("ok");
-    expect(out.inProgressStatus.kind).toBe("ok");
-    expect(out.inReviewStatus.kind).toBe("ok");
+    expect(out.readyLabel.kind).toBe("ok");
     expect(out.hitlLabel.kind).toBe("ok");
   });
 
-  it("flags a missing workflow state with the team's actual state names", async () => {
+  it("flags a missing ready label with the team's actual label names", async () => {
     teamsMock.mockResolvedValueOnce({ nodes: [{ id: "team-1" }] });
-    workflowStatesMock.mockResolvedValueOnce({
-      nodes: [{ name: "Backlog" }, { name: "Doing" }, { name: "Done" }],
+    issueLabelsMock.mockResolvedValueOnce({
+      nodes: [{ name: "Bug" }, { name: "Feature" }, { name: "ready-for-human" }],
     });
-    issueLabelsMock.mockResolvedValueOnce({ nodes: [] });
 
     const out = await validateLinearConfig(config);
-    expect(out.readyStatus).toEqual({
+    expect(out.readyLabel).toEqual({
       kind: "missing",
-      name: "Todo",
-      available: ["Backlog", "Doing", "Done"],
+      name: "ready-for-agent",
+      available: ["Bug", "Feature", "ready-for-human"],
     });
   });
 });
 
-describe("config default (VA-354)", () => {
-  it("defaults hitlLabel to ready-for-human (Flightplan canonical)", async () => {
+describe("config defaults (VA-354 / VA-423)", () => {
+  it("defaults readyLabel to ready-for-agent (flightplan v1.1.0 contract)", async () => {
     // VA-411: pass an explicit env so a host-exported
-    // `RUNWAY_HITL_LABEL` can't flip the assertion.
+    // `RUNWAY_READY_LABEL` can't flip the assertion.
+    const { loadConfig } = await import("./config.js");
+    expect(loadConfig({ LINEAR_API_KEY: "test" }).readyLabel).toBe(
+      "ready-for-agent",
+    );
+  });
+
+  it("defaults hitlLabel to ready-for-human", async () => {
     const { loadConfig } = await import("./config.js");
     expect(loadConfig({ LINEAR_API_KEY: "test" }).hitlLabel).toBe(
       "ready-for-human",

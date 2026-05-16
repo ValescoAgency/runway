@@ -1,5 +1,5 @@
 import { Effect, Redacted } from "effect";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { Config } from "./config.js";
 import type { FailureRoutingDeps } from "./hitl.js";
 import {
@@ -9,27 +9,30 @@ import {
   type RunwayIssue,
 } from "./linear.js";
 
-// VA-355 + VA-358: focused tests for the failure-routing module.
-// These hit flagHitl and handleProcessFailure directly — not via
-// drainQueue — so the assertions describe each function's contract
+// VA-355 + VA-358 + VA-423: focused tests for the failure-routing
+// module. These hit flagHitl and handleProcessFailure directly — not
+// via drainQueue — so the assertions describe each function's contract
 // rather than the composer's end-to-end behaviour.
-const execaMock = vi.fn();
-vi.mock("execa", () => ({ execa: execaMock }));
+//
+// VA-423 collapsed the revert-vs-HITL fork into a single flagHitl
+// path: every per-issue failure (startup OR mid-run) lands on
+// `ready-for-human`. Runway no longer re-applies `ready-for-agent`
+// because terminal failures shouldn't retry indefinitely.
 
 const { flagHitl, handleProcessFailure } = await import("./hitl.js");
 
 const run = <A>(eff: Effect.Effect<A, never, never>) => Effect.runPromise(eff);
 
 type MockedLinear = {
-  transition: ReturnType<typeof vi.fn>;
   applyLabel: ReturnType<typeof vi.fn>;
+  removeLabel: ReturnType<typeof vi.fn>;
   comment: ReturnType<typeof vi.fn>;
 };
 
 function makeLinear(): MockedLinear {
   return {
-    transition: vi.fn().mockReturnValue(Effect.succeed(undefined)),
     applyLabel: vi.fn().mockReturnValue(Effect.succeed(undefined)),
+    removeLabel: vi.fn().mockReturnValue(Effect.succeed(undefined)),
     comment: vi.fn().mockReturnValue(Effect.succeed(undefined)),
   };
 }
@@ -41,10 +44,8 @@ function asLinear(m: MockedLinear): LinearGateway {
 const config: Config = {
   linearApiKey: Redacted.make("test-key"),
   linearTeam: "VA",
-  readyStatus: "Todo",
-  inProgressStatus: "In Progress",
-  inReviewStatus: "In Review",
-  hitlLabel: "needs-human",
+  readyLabel: "ready-for-agent",
+  hitlLabel: "ready-for-human",
   maxIterations: 1,
   implTurns: 1,
   reviewRetries: 0,
@@ -60,20 +61,12 @@ const issue: RunwayIssue = {
   labels: [],
 };
 
-// FailureRoutingDeps is the wider shape — it structurally satisfies
-// HitlDeps too, so flagHitl tests can pass it without ceremony.
 function depsWith(linear: MockedLinear): FailureRoutingDeps {
   return {
     config,
     linear: asLinear(linear),
-    cwd: "/tmp/repo",
-    baseBranch: "main",
   };
 }
-
-beforeEach(() => {
-  execaMock.mockReset();
-});
 
 describe("flagHitl (VA-355)", () => {
   it("posts the rejection reason as a comment BEFORE applying the label, so a missing label doesn't swallow the reason", async () => {
@@ -93,7 +86,10 @@ describe("flagHitl (VA-355)", () => {
     expect(commentBody).toMatch(/TOCTOU race in provisionHousehold/);
 
     // Label applied with the configured value.
-    expect(linear.applyLabel).toHaveBeenCalledWith("issue-123", "needs-human");
+    expect(linear.applyLabel).toHaveBeenCalledWith(
+      "issue-123",
+      "ready-for-human",
+    );
   });
 
   it("posts a follow-up note when the label apply fails — the substantive reason still landed", async () => {
@@ -102,8 +98,8 @@ describe("flagHitl (VA-355)", () => {
       Effect.fail(
         new LinearNotFound({
           resource: "label",
-          identifier: "needs-human",
-          message: 'Linear label "needs-human" not found on team xyz',
+          identifier: "ready-for-human",
+          message: 'Linear label "ready-for-human" not found on team xyz',
         }),
       ),
     );
@@ -153,21 +149,8 @@ describe("flagHitl (VA-355)", () => {
   });
 });
 
-describe("handleProcessFailure (VA-342 + VA-358)", () => {
-  // Default execa router: only the rev-list count call matters here.
-  function routeExeca(revListCount: string): void {
-    execaMock.mockImplementation((bin: string, args: readonly string[]) => {
-      if (bin !== "git" || args[0] !== "rev-list") {
-        return Promise.reject(
-          new Error(`unexpected execa call: ${bin} ${args.join(" ")}`),
-        );
-      }
-      return Promise.resolve({ exitCode: 0, stdout: revListCount });
-    });
-  }
-
-  it("reverts to readyStatus when the agent produced no commits — infrastructure failure", async () => {
-    routeExeca("0");
+describe("handleProcessFailure (VA-358 + VA-423)", () => {
+  it("flags HITL with `ready-for-human` on any failure (startup OR mid-run — no revert path)", async () => {
     const linear = makeLinear();
 
     const outcome = await run(
@@ -175,24 +158,27 @@ describe("handleProcessFailure (VA-342 + VA-358)", () => {
         new Error("missing image"),
         issue,
         depsWith(linear),
-        "agent/va-312",
       ),
     );
 
-    expect(outcome).toEqual({ kind: "reverted", detail: "missing image" });
+    expect(outcome).toEqual({ kind: "errored", detail: "missing image" });
+    // VA-423 AC: failures flip to `ready-for-human`; runway does NOT
+    // re-apply `ready-for-agent`.
+    expect(linear.applyLabel).toHaveBeenCalledWith(
+      "issue-123",
+      "ready-for-human",
+    );
+    expect(linear.applyLabel).not.toHaveBeenCalledWith(
+      "issue-123",
+      "ready-for-agent",
+    );
 
-    // Revert transition fired, no HITL label.
-    expect(linear.transition).toHaveBeenCalledWith("issue-123", "Todo");
-    expect(linear.applyLabel).not.toHaveBeenCalled();
-
-    // The revert comment names the destination state.
-    const commentBody = String(linear.comment.mock.calls[0]?.[1]);
-    expect(commentBody).toMatch(/reverting to .*Todo/);
-    expect(commentBody).toMatch(/missing image/);
+    // The HITL comment carries the error detail.
+    const bodies = linear.comment.mock.calls.map((c) => String(c[1]));
+    expect(bodies.some((b) => /missing image/.test(b))).toBe(true);
   });
 
-  it("flags HITL when the agent crashed after producing commits — mid-run failure stays In Progress", async () => {
-    routeExeca("3");
+  it("treats a mid-run crash identically — no separate revert branch", async () => {
     const linear = makeLinear();
 
     const outcome = await run(
@@ -200,43 +186,16 @@ describe("handleProcessFailure (VA-342 + VA-358)", () => {
         new Error("review pass crashed"),
         issue,
         depsWith(linear),
-        "agent/va-312",
       ),
     );
 
-    expect(outcome).toEqual({ kind: "errored", detail: "review pass crashed" });
-
-    // No revert transition — the issue stays In Progress so the human
-    // reviewer can pick up where the agent left off.
-    expect(linear.transition).not.toHaveBeenCalled();
-
-    // HITL label applied via flagHitl.
-    expect(linear.applyLabel).toHaveBeenCalledWith("issue-123", "needs-human");
-
-    // The HITL comment carries the error detail.
-    const bodies = linear.comment.mock.calls.map((c) => String(c[1]));
-    expect(bodies.some((b) => /review pass crashed/.test(b))).toBe(true);
-  });
-
-  it("treats a git rev-list failure as no commits (defensive revert path)", async () => {
-    // If we can't ask git whether commits exist, assume not — that
-    // routes to revert rather than stranding the issue In Progress.
-    execaMock.mockImplementation(() =>
-      Promise.reject(new Error("git binary missing")),
+    expect(outcome).toEqual({
+      kind: "errored",
+      detail: "review pass crashed",
+    });
+    expect(linear.applyLabel).toHaveBeenCalledWith(
+      "issue-123",
+      "ready-for-human",
     );
-    const linear = makeLinear();
-
-    const outcome = await run(
-      handleProcessFailure(
-        new Error("agent kaboom"),
-        issue,
-        depsWith(linear),
-        "agent/va-312",
-      ),
-    );
-
-    expect(outcome.kind).toBe("reverted");
-    expect(linear.transition).toHaveBeenCalledWith("issue-123", "Todo");
-    expect(linear.applyLabel).not.toHaveBeenCalled();
   });
 });

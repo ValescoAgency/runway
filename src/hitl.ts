@@ -1,6 +1,5 @@
 import { Effect } from "effect";
 import type { Config } from "./config.js";
-import { hasCommits } from "./git.js";
 import type { LinearError, LinearGateway, RunwayIssue } from "./linear.js";
 
 /**
@@ -14,36 +13,36 @@ export interface HitlDeps {
 }
 
 /**
- * Deps for `handleProcessFailure`. Extends HitlDeps because the
- * routing decision ends in a flagHitl call on the "produced commits"
- * branch; adds `cwd` + `baseBranch` for the `hasCommits` predicate
- * that drives the revert-vs-HITL choice.
+ * Deps for `handleProcessFailure`. VA-423 collapsed the
+ * revert-vs-HITL fork into a single flagHitl path, so the failure
+ * router no longer needs `cwd` / `baseBranch` (it used to consult
+ * `hasCommits` to decide between revert-to-Todo and HITL). Kept
+ * as an alias so call sites that already pass the wider shape
+ * don't break.
  */
-export interface FailureRoutingDeps extends HitlDeps {
-  readonly cwd: string;
-  readonly baseBranch: string;
-}
+export type FailureRoutingDeps = HitlDeps;
 
 /**
- * What handleProcessFailure hands back to the composer:
+ * What handleProcessFailure hands back to the composer.
  *
- *   reverted — agent never produced commits; we reverted the issue to
- *              readyStatus so the next drain can retry it cleanly.
- *   errored  — agent crashed mid-run after producing real work; we
- *              flagged the issue for human review and left the branch
- *              + In-Progress state intact for triage.
+ * VA-423 retired the `reverted` outcome — runway no longer flips
+ * issues back to a `ready` state on startup failure. Every per-issue
+ * failure (startup or mid-run) lands on `ready-for-human` so a
+ * persistent infra problem can't loop the same issue forever; the
+ * operator triages and re-applies `ready-for-agent` if appropriate.
  */
-export type ProcessFailureOutcome =
-  | { readonly kind: "reverted"; readonly detail: string }
-  | { readonly kind: "errored"; readonly detail: string };
+export type ProcessFailureOutcome = {
+  readonly kind: "errored";
+  readonly detail: string;
+};
 
 /**
  * VA-355: comment is the load-bearing artifact, label is metadata.
  * Post the comment FIRST so the substantive reason lands on the
- * issue even if the label apply later fails (Flightplan workspaces
- * hitting the `needs-human` default, transient Linear errors, etc.).
- * On full failure (comment didn't even post), dump the reason to
- * stderr with a clear banner so the operator sees it terminal-side.
+ * issue even if the label apply later fails (transient Linear errors,
+ * a workspace that hasn't yet created the label, etc.). On full
+ * failure (comment didn't even post), dump the reason to stderr with
+ * a clear banner so the operator sees it terminal-side.
  */
 export const flagHitl = (
   issue: RunwayIssue,
@@ -113,26 +112,23 @@ export const flagHitl = (
   });
 
 /**
- * VA-358: routes a per-issue processIssue failure. Zero-commit
- * failures (agent crashed before writing anything — missing image,
- * varlock failure, container failed to boot) revert the issue to
- * readyStatus so the next drain can retry cleanly. Mid-run failures
- * (agent committed real work then crashed) flag for human review and
- * leave the branch + In-Progress state intact for triage.
- *
- * `In Progress` is reserved for "agent has committed to the branch":
- * if we left the issue there after a clean startup failure, the next
- * drain wouldn't pick it up via fetchReady (it's no longer in the
- * ready state) and the operator would have to manually nudge it.
+ * VA-358 / VA-423: route a per-issue processIssue failure to HITL.
+ * Both startup failures (agent crashed before writing anything —
+ * missing image, varlock failure, container failed to boot) and
+ * mid-run failures (agent committed real work then crashed) flip
+ * the issue to `ready-for-human` so a human triages it. Runway
+ * does NOT re-apply `ready-for-agent` on failure — terminal
+ * failures should not retry indefinitely, and a re-apply path
+ * would silently reopen the door to the same crash. If the
+ * operator confirms the failure was transient (e.g. a quota blip),
+ * they re-apply `ready-for-agent` manually.
  */
 export const handleProcessFailure = (
   error: unknown,
   issue: RunwayIssue,
   deps: FailureRoutingDeps,
-  branch: string,
 ): Effect.Effect<ProcessFailureOutcome, never, never> =>
   Effect.gen(function* () {
-    const { config, linear, cwd, baseBranch } = deps;
     const errDetail = errMsg(error);
     yield* Effect.logError(`error on ${issue.identifier}`).pipe(
       Effect.annotateLogs({
@@ -141,31 +137,13 @@ export const handleProcessFailure = (
       }),
     );
 
-    const startedRealWork = yield* hasCommits(cwd, baseBranch, branch).pipe(
-      Effect.catchAll(() => Effect.succeed(false)),
-    );
-
-    if (!startedRealWork) {
-      yield* runSwallow(
-        linear.transition(issue.id, config.readyStatus),
-        `${issue.identifier}: revert transition to ${config.readyStatus}`,
-      );
-      yield* runSwallow(
-        linear.comment(
-          issue.id,
-          `Runway hit a startup failure before the agent produced any commits — reverting to \`${config.readyStatus}\` for retry:\n\n\`\`\`\n${errDetail}\n\`\`\``,
-        ),
-        `${issue.identifier}: revert-comment`,
-      );
-      return { kind: "reverted", detail: errDetail };
-    }
-
     // VA-355: comment first with the substantive reason, label
     // second (best-effort). If we labeled first and the label
-    // didn't exist (Flightplan workspaces hitting the `needs-human`
-    // default — see VA-354), the orchestrator's catch would never
-    // get to the reason and the operator would see an infrastructure
-    // error in Linear with no clue what the agent actually found.
+    // didn't exist (workspaces that haven't yet created
+    // `ready-for-human`, transient API errors, etc.), the
+    // orchestrator's catch would never get to the reason and the
+    // operator would see a generic infrastructure error in Linear
+    // with no clue what the agent actually found.
     yield* flagHitl(
       issue,
       deps,

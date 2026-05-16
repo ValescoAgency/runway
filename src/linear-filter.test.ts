@@ -1,15 +1,16 @@
 import { Effect, Redacted } from "effect";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// VA-394: `fetchReady` must skip issues that runway cannot or should
-// not pick up — either because they're blocked by a non-terminal
-// blocker (sequential dependency safety) or because they carry the
-// HITL label (triage marked them human-only, or a prior drain
-// already escaped them).
+// VA-394 / VA-423: `fetchReady` must skip issues that runway cannot or
+// should not pick up — either because they're blocked by a non-terminal
+// blocker (sequential dependency safety), they carry the HITL label
+// (triage marked them human-only, or a prior drain already escaped
+// them), they happen to have lost the `ready-for-agent` label between
+// the GraphQL filter and the per-candidate read (eventual consistency),
+// or they're a parent PRD with sub-issues.
 
 const issuesMock = vi.fn();
 const teamsMock = vi.fn();
-const workflowStatesMock = vi.fn();
 const projectsMock = vi.fn();
 const issueLabelsMock = vi.fn();
 const issueGetMock = vi.fn();
@@ -18,7 +19,7 @@ vi.mock("@linear/sdk", () => {
   class LinearClient {
     issues = issuesMock;
     teams = teamsMock;
-    workflowStates = workflowStatesMock;
+    workflowStates = vi.fn();
     projects = projectsMock;
     issueLabels = issueLabelsMock;
     issue = issueGetMock;
@@ -33,10 +34,8 @@ const { createLinearGateway } = await import("./linear.js");
 const baseConfig = {
   linearApiKey: Redacted.make("test"),
   linearTeam: "VA",
-  readyStatus: "Todo",
-  inProgressStatus: "In Progress",
-  inReviewStatus: "In Review",
-  hitlLabel: "needs-human",
+  readyLabel: "ready-for-agent",
+  hitlLabel: "ready-for-human",
   maxIterations: 5,
   implTurns: 3,
   reviewRetries: 1,
@@ -47,7 +46,6 @@ const baseConfig = {
 beforeEach(() => {
   issuesMock.mockReset();
   teamsMock.mockReset();
-  workflowStatesMock.mockReset();
   projectsMock.mockReset();
   issueLabelsMock.mockReset();
   issueGetMock.mockReset();
@@ -62,6 +60,13 @@ interface FakeIssueArgs {
   readonly identifier: string;
   readonly title: string;
   readonly description?: string | null;
+  /**
+   * Labels on the issue. Defaults to `["ready-for-agent"]` so the
+   * VA-423 client-side label check (`if (!labels.includes(readyLabel))
+   * continue`) doesn't filter out fixtures that don't explicitly
+   * exercise the label code-path. Tests that want to assert on the
+   * dual-label / no-label skip behavior pass an explicit list.
+   */
   readonly labels?: readonly string[];
   readonly inverseRelations?: readonly {
     readonly type: string;
@@ -78,6 +83,7 @@ interface FakeIssueArgs {
 }
 
 function fakeIssue(args: FakeIssueArgs) {
+  const labels = args.labels ?? ["ready-for-agent"];
   return {
     id: args.id,
     identifier: args.identifier,
@@ -87,7 +93,7 @@ function fakeIssue(args: FakeIssueArgs) {
     createdAt: args.createdAt ?? "2026-01-01T00:00:00.000Z",
     labels: () =>
       Promise.resolve({
-        nodes: (args.labels ?? []).map((name, i) => ({
+        nodes: labels.map((name, i) => ({
           id: `lbl-${args.id}-${i}`,
           name,
         })),
@@ -114,16 +120,13 @@ function fakeIssue(args: FakeIssueArgs) {
   };
 }
 
-function stubTeamAndState() {
+function stubTeam() {
   teamsMock.mockResolvedValueOnce({ nodes: [{ id: "team-1", key: "VA" }] });
-  workflowStatesMock.mockResolvedValueOnce({
-    nodes: [{ id: "state-todo", name: "Todo" }],
-  });
 }
 
-describe("VA-394 — fetchReady eligibility filters", () => {
+describe("VA-394 / VA-423 — fetchReady eligibility filters", () => {
   it("excludes an issue blocked by a non-terminal blocker", async () => {
-    stubTeamAndState();
+    stubTeam();
     issuesMock.mockResolvedValueOnce({
       nodes: [
         fakeIssue({
@@ -149,7 +152,7 @@ describe("VA-394 — fetchReady eligibility filters", () => {
   });
 
   it("includes an issue whose blockers are all in terminal state", async () => {
-    stubTeamAndState();
+    stubTeam();
     issuesMock.mockResolvedValueOnce({
       nodes: [
         fakeIssue({
@@ -170,21 +173,21 @@ describe("VA-394 — fetchReady eligibility filters", () => {
     expect(result.map((i) => i.identifier)).toEqual(["VA-3"]);
   });
 
-  it("excludes an issue carrying the HITL label", async () => {
-    stubTeamAndState();
+  it("VA-423 AC: skips an issue carrying both `ready-for-agent` and `ready-for-human` (treat as ready-for-human)", async () => {
+    stubTeam();
     issuesMock.mockResolvedValueOnce({
       nodes: [
         fakeIssue({
           id: "issue-d",
           identifier: "VA-4",
-          title: "human only",
-          labels: ["needs-human"],
+          title: "agent-ready but also human-marked",
+          labels: ["ready-for-agent", "ready-for-human"],
         }),
         fakeIssue({
           id: "issue-e",
           identifier: "VA-5",
           title: "agent ok",
-          labels: ["Feature"],
+          labels: ["ready-for-agent", "Feature"],
         }),
       ],
     });
@@ -195,20 +198,51 @@ describe("VA-394 — fetchReady eligibility filters", () => {
     expect(result.map((i) => i.identifier)).toEqual(["VA-5"]);
   });
 
-  it("respects a custom hitlLabel from config", async () => {
-    stubTeamAndState();
+  it("VA-423 AC: skips an issue carrying neither label (defensive — covers eventual consistency between GraphQL filter and per-candidate read)", async () => {
+    stubTeam();
+    issuesMock.mockResolvedValueOnce({
+      nodes: [
+        fakeIssue({
+          id: "issue-no-labels",
+          identifier: "VA-NO-LABEL",
+          title: "label-less ghost",
+          labels: [],
+        }),
+        fakeIssue({
+          id: "issue-irrelevant",
+          identifier: "VA-IRR",
+          title: "different labels only",
+          labels: ["Bug", "tracked"],
+        }),
+        fakeIssue({
+          id: "issue-ok",
+          identifier: "VA-OK",
+          title: "still carries the ready label",
+          labels: ["ready-for-agent"],
+        }),
+      ],
+    });
+
+    const gateway = createLinearGateway(baseConfig);
+    const result = await Effect.runPromise(gateway.fetchReady());
+
+    expect(result.map((i) => i.identifier)).toEqual(["VA-OK"]);
+  });
+
+  it("respects a custom hitlLabel from config (skipping the configured marker even when ready-for-agent is present)", async () => {
+    stubTeam();
     issuesMock.mockResolvedValueOnce({
       nodes: [
         fakeIssue({
           id: "issue-f",
           identifier: "VA-6",
-          title: "custom label",
-          labels: ["ready-for-human"],
+          title: "custom human marker",
+          labels: ["ready-for-agent", "needs-attention"],
         }),
       ],
     });
 
-    const customConfig = { ...baseConfig, hitlLabel: "ready-for-human" };
+    const customConfig = { ...baseConfig, hitlLabel: "needs-attention" };
     const gateway = createLinearGateway(customConfig);
     const result = await Effect.runPromise(gateway.fetchReady());
 
@@ -216,7 +250,7 @@ describe("VA-394 — fetchReady eligibility filters", () => {
   });
 
   it("ignores non-blocks relation types (duplicate, related)", async () => {
-    stubTeamAndState();
+    stubTeam();
     issuesMock.mockResolvedValueOnce({
       nodes: [
         fakeIssue({
@@ -237,8 +271,8 @@ describe("VA-394 — fetchReady eligibility filters", () => {
     expect(result.map((i) => i.identifier)).toEqual(["VA-7"]);
   });
 
-  it("includes an issue with no labels and no relations (the common case)", async () => {
-    stubTeamAndState();
+  it("includes an issue carrying ready-for-agent and no extras (the common case)", async () => {
+    stubTeam();
     issuesMock.mockResolvedValueOnce({
       nodes: [
         fakeIssue({
@@ -254,6 +288,40 @@ describe("VA-394 — fetchReady eligibility filters", () => {
 
     expect(result.map((i) => i.identifier)).toEqual(["VA-8"]);
   });
+
+  it("VA-423: the GraphQL filter handed to client.issues() narrows by `labels.name = readyLabel`", async () => {
+    stubTeam();
+    issuesMock.mockResolvedValueOnce({ nodes: [] });
+
+    const gateway = createLinearGateway(baseConfig);
+    await Effect.runPromise(gateway.fetchReady());
+
+    expect(issuesMock).toHaveBeenCalledTimes(1);
+    const filterArg = issuesMock.mock.calls[0]?.[0]?.filter;
+    expect(filterArg).toMatchObject({
+      team: { id: { eq: "team-1" } },
+      labels: { name: { eq: "ready-for-agent" } },
+    });
+    // No `state` filter — labels-as-state is the whole point of
+    // VA-423; the absence is load-bearing.
+    expect(filterArg).not.toHaveProperty("state");
+  });
+
+  it("VA-423: the GraphQL filter honors a custom `readyLabel`", async () => {
+    stubTeam();
+    issuesMock.mockResolvedValueOnce({ nodes: [] });
+
+    const gateway = createLinearGateway({
+      ...baseConfig,
+      readyLabel: "agent-ready",
+    });
+    await Effect.runPromise(gateway.fetchReady());
+
+    const filterArg = issuesMock.mock.calls[0]?.[0]?.filter;
+    expect(filterArg).toMatchObject({
+      labels: { name: { eq: "agent-ready" } },
+    });
+  });
 });
 
 // VA-420: the SDK's `IssueOrderBy` enum doesn't expose `priority`, and
@@ -264,7 +332,7 @@ describe("VA-394 — fetchReady eligibility filters", () => {
 // then by `createdAt` ASC within a bucket.
 describe("VA-420 — fetchReady drain order", () => {
   it("drains higher Linear priority before lower priority", async () => {
-    stubTeamAndState();
+    stubTeam();
     // SDK returns newest-first (createdAt DESC default); the JS sort
     // must override that with priority-first ordering.
     issuesMock.mockResolvedValueOnce({
@@ -305,7 +373,7 @@ describe("VA-420 — fetchReady drain order", () => {
   });
 
   it("breaks ties within a priority bucket by createdAt ASC (oldest first)", async () => {
-    stubTeamAndState();
+    stubTeam();
     issuesMock.mockResolvedValueOnce({
       nodes: [
         fakeIssue({
@@ -339,7 +407,7 @@ describe("VA-420 — fetchReady drain order", () => {
   });
 
   it("sorts No-priority (Linear priority=0) behind every prioritised bucket", async () => {
-    stubTeamAndState();
+    stubTeam();
     issuesMock.mockResolvedValueOnce({
       nodes: [
         fakeIssue({
@@ -379,146 +447,13 @@ describe("VA-420 — fetchReady drain order", () => {
   });
 });
 
-describe("VA-421 — fetchReady accepts In-Progress when no remote agent branch", () => {
-  function stubTeamTodoAndInProgress() {
-    teamsMock.mockResolvedValueOnce({ nodes: [{ id: "team-1", key: "VA" }] });
-    // findStateId is called twice (Todo, then In Progress) when the
-    // gateway is built with `remoteAgentBranchExists`. Tests that
-    // exercise the VA-421 path stub both lookups in that order.
-    workflowStatesMock.mockResolvedValueOnce({
-      nodes: [{ id: "state-todo", name: "Todo" }],
-    });
-    workflowStatesMock.mockResolvedValueOnce({
-      nodes: [{ id: "state-inprog", name: "In Progress" }],
-    });
-  }
-
-  it("accepts an In-Progress issue when origin/agent/<id> does not exist", async () => {
-    stubTeamTodoAndInProgress();
-    // First issues() call — Todo bucket (empty).
-    issuesMock.mockResolvedValueOnce({ nodes: [] });
-    // Second issues() call — In-Progress bucket (one auto-transitioned issue).
-    issuesMock.mockResolvedValueOnce({
-      nodes: [
-        fakeIssue({
-          id: "issue-ip-1",
-          identifier: "VA-417",
-          title: "in-progress, but never drained",
-        }),
-      ],
-    });
-
-    const remoteAgentBranchExists = vi.fn().mockResolvedValue(false);
-    const gateway = createLinearGateway(baseConfig, null, {
-      remoteAgentBranchExists,
-    });
-    const result = await Effect.runPromise(gateway.fetchReady());
-
-    expect(result.map((i) => i.identifier)).toEqual(["VA-417"]);
-    expect(remoteAgentBranchExists).toHaveBeenCalledWith("agent/va-417");
-  });
-
-  it("skips an In-Progress issue when origin/agent/<id> exists", async () => {
-    stubTeamTodoAndInProgress();
-    issuesMock.mockResolvedValueOnce({ nodes: [] });
-    issuesMock.mockResolvedValueOnce({
-      nodes: [
-        fakeIssue({
-          id: "issue-ip-2",
-          identifier: "VA-500",
-          title: "real work in flight",
-        }),
-      ],
-    });
-
-    const remoteAgentBranchExists = vi.fn().mockResolvedValue(true);
-    const gateway = createLinearGateway(baseConfig, null, {
-      remoteAgentBranchExists,
-    });
-    const result = await Effect.runPromise(gateway.fetchReady());
-
-    expect(result).toEqual([]);
-    expect(remoteAgentBranchExists).toHaveBeenCalledWith("agent/va-500");
-  });
-
-  it("skips an In-Progress issue with the HITL label without consulting git", async () => {
-    stubTeamTodoAndInProgress();
-    issuesMock.mockResolvedValueOnce({ nodes: [] });
-    issuesMock.mockResolvedValueOnce({
-      nodes: [
-        fakeIssue({
-          id: "issue-ip-hitl",
-          identifier: "VA-600",
-          title: "in-progress + HITL",
-          labels: ["needs-human"],
-        }),
-      ],
-    });
-
-    const remoteAgentBranchExists = vi.fn().mockResolvedValue(false);
-    const gateway = createLinearGateway(baseConfig, null, {
-      remoteAgentBranchExists,
-    });
-    const result = await Effect.runPromise(gateway.fetchReady());
-
-    expect(result).toEqual([]);
-    // HITL filter runs before the git check — predicate never fires.
-    expect(remoteAgentBranchExists).not.toHaveBeenCalled();
-  });
-
-  it("does not consult git for Todo candidates (no behavior change on the common path)", async () => {
-    stubTeamTodoAndInProgress();
-    issuesMock.mockResolvedValueOnce({
-      nodes: [
-        fakeIssue({
-          id: "issue-todo",
-          identifier: "VA-700",
-          title: "plain todo",
-        }),
-      ],
-    });
-    issuesMock.mockResolvedValueOnce({ nodes: [] });
-
-    const remoteAgentBranchExists = vi.fn().mockResolvedValue(true);
-    const gateway = createLinearGateway(baseConfig, null, {
-      remoteAgentBranchExists,
-    });
-    const result = await Effect.runPromise(gateway.fetchReady());
-
-    expect(result.map((i) => i.identifier)).toEqual(["VA-700"]);
-    expect(remoteAgentBranchExists).not.toHaveBeenCalled();
-  });
-
-  it("omits the In-Progress query entirely when no predicate is provided (legacy callers)", async () => {
-    // No In-Progress state lookup — only Todo. Matches stubTeamAndState
-    // (the pre-VA-421 helper).
-    stubTeamAndState();
-    issuesMock.mockResolvedValueOnce({
-      nodes: [
-        fakeIssue({
-          id: "issue-todo-legacy",
-          identifier: "VA-800",
-          title: "legacy todo",
-        }),
-      ],
-    });
-
-    const gateway = createLinearGateway(baseConfig);
-    const result = await Effect.runPromise(gateway.fetchReady());
-
-    expect(result.map((i) => i.identifier)).toEqual(["VA-800"]);
-    // Sanity: only one issues() call was made — no In-Progress bucket.
-    expect(issuesMock).toHaveBeenCalledTimes(1);
-  });
-});
-
 // VA-425: parent PRDs / umbrella tickets that have child sub-issues
 // describe scope across multiple deliverables; the right unit of agent
 // work is the child. `fetchReady` skips parents so the agent doesn't
 // latch onto one user story and falsely close the umbrella.
 describe("VA-425 — fetchReady skips parent issues with children", () => {
   it("includes an issue with no children (the common case)", async () => {
-    stubTeamAndState();
+    stubTeam();
     issuesMock.mockResolvedValueOnce({
       nodes: [
         fakeIssue({
@@ -537,7 +472,7 @@ describe("VA-425 — fetchReady skips parent issues with children", () => {
   });
 
   it("skips an issue with one or more children (parent PRD)", async () => {
-    stubTeamAndState();
+    stubTeam();
     issuesMock.mockResolvedValueOnce({
       nodes: [
         fakeIssue({
@@ -562,7 +497,7 @@ describe("VA-425 — fetchReady skips parent issues with children", () => {
   });
 
   it("includes child issues themselves (a child with no children of its own is eligible)", async () => {
-    stubTeamAndState();
+    stubTeam();
     issuesMock.mockResolvedValueOnce({
       nodes: [
         fakeIssue({
@@ -578,38 +513,5 @@ describe("VA-425 — fetchReady skips parent issues with children", () => {
     const result = await Effect.runPromise(gateway.fetchReady());
 
     expect(result.map((i) => i.identifier)).toEqual(["VA-CHILD"]);
-  });
-
-  it("VA-421 interaction: skips an In-Progress parent with children regardless of remote agent branch state", async () => {
-    teamsMock.mockResolvedValueOnce({ nodes: [{ id: "team-1", key: "VA" }] });
-    workflowStatesMock.mockResolvedValueOnce({
-      nodes: [{ id: "state-todo", name: "Todo" }],
-    });
-    workflowStatesMock.mockResolvedValueOnce({
-      nodes: [{ id: "state-inprog", name: "In Progress" }],
-    });
-    issuesMock.mockResolvedValueOnce({ nodes: [] });
-    issuesMock.mockResolvedValueOnce({
-      nodes: [
-        fakeIssue({
-          id: "issue-ip-parent",
-          identifier: "VA-PARENT",
-          title: "in-progress PRD with children",
-          childCount: 3,
-        }),
-      ],
-    });
-
-    // Predicate would say "no agent branch — accept it" — but the
-    // child-skip rule fires first and the issue is skipped anyway.
-    const remoteAgentBranchExists = vi.fn().mockResolvedValue(false);
-    const gateway = createLinearGateway(baseConfig, null, {
-      remoteAgentBranchExists,
-    });
-    const result = await Effect.runPromise(gateway.fetchReady());
-
-    expect(result).toEqual([]);
-    // Child-skip short-circuits before the git probe runs.
-    expect(remoteAgentBranchExists).not.toHaveBeenCalled();
   });
 });

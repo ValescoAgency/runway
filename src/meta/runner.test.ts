@@ -27,9 +27,7 @@ afterEach(() => {
 const baseConfig = (over: Partial<RunwayConfig> = {}): RunwayConfig => ({
   linearApiKey: Redacted.make("k"),
   linearTeam: "VA",
-  readyStatus: "Todo",
-  inProgressStatus: "In Progress",
-  inReviewStatus: "In Review",
+  readyLabel: "ready-for-agent",
   hitlLabel: "ready-for-human",
   maxIterations: 5,
   implTurns: 3,

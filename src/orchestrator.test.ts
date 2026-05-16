@@ -45,8 +45,8 @@ const drainQueue = (
 
 type MockedLinear = {
   fetchReady: ReturnType<typeof vi.fn>;
-  transition: ReturnType<typeof vi.fn>;
   applyLabel: ReturnType<typeof vi.fn>;
+  removeLabel: ReturnType<typeof vi.fn>;
   comment: ReturnType<typeof vi.fn>;
   fetchComments: ReturnType<typeof vi.fn>;
   viewer: ReturnType<typeof vi.fn>;
@@ -63,10 +63,14 @@ function makeLinear(): MockedLinear {
   // assertions' implicit expectations (no prior-feedback noise in
   // existing fixtures). Tests exercising prior-feedback behavior
   // override with `.mockReturnValueOnce(...)`.
+  //
+  // VA-423: `transition` is gone (runway no longer mutates Linear
+  // workflow state); `removeLabel` is the new pickup-time claim
+  // primitive — every drain pickup calls it with `config.readyLabel`.
   return {
     fetchReady: vi.fn(),
-    transition: vi.fn().mockReturnValue(Effect.succeed(undefined)),
     applyLabel: vi.fn().mockReturnValue(Effect.succeed(undefined)),
+    removeLabel: vi.fn().mockReturnValue(Effect.succeed(undefined)),
     comment: vi.fn().mockReturnValue(Effect.succeed(undefined)),
     fetchComments: vi.fn().mockReturnValue(Effect.succeed([])),
     viewer: vi
@@ -91,10 +95,8 @@ function makeGithub(): GithubGateway {
 const config: Config = {
   linearApiKey: Redacted.make("test-key"),
   linearTeam: "VA",
-  readyStatus: "Todo",
-  inProgressStatus: "In Progress",
-  inReviewStatus: "In Review",
-  hitlLabel: "needs-human",
+  readyLabel: "ready-for-agent",
+  hitlLabel: "ready-for-human",
   maxIterations: 1,
   implTurns: 1,
   // VA-418: default review-retries budget for tests is 0 — the
@@ -154,11 +156,14 @@ function routeExeca(opts: { revListCount: string }): void {
 // Tests — VA-344 attempt-count + seen-this-run loop guard
 // ---------------------------------------------------------------------------
 
-describe("drainQueue --max semantics (VA-344)", () => {
-  it("counts every attempt — including reverted ones — so --max bounds the loop", async () => {
-    // Three issues; the first deterministically fails on every attempt
-    // (sandcastle rejects) and produces zero commits, so VA-342 reverts
-    // it to Todo. Without VA-344 the loop would re-pick it forever.
+describe("drainQueue --max semantics (VA-344 / VA-423)", () => {
+  it("counts every attempt so --max bounds the loop, even when fetchReady keeps re-surfacing failed issues", async () => {
+    // Three issues; sandcastle rejects on every attempt. VA-423: the
+    // pickup-time `removeLabel(readyLabel)` would normally take an
+    // issue out of the next drain's queue, but the fake `fetchReady`
+    // ignores that side-effect and keeps re-returning the full list,
+    // simulating a Linear eventual-consistency window. The
+    // same-invocation `seen` guard must filter the repeats out.
     routeExeca({ revListCount: "0" });
 
     const a: RunwayIssue = { id: "a", identifier: "VA-1", title: "a", description: "", labels: [] };
@@ -168,8 +173,6 @@ describe("drainQueue --max semantics (VA-344)", () => {
     sandcastleRunMock.mockRejectedValue(new Error("kapow"));
 
     const linear = makeLinear();
-    // Every fetchReady returns the full queue — `a` keeps coming back
-    // because VA-342 reverts it. The seen-set must filter it out.
     linear.fetchReady.mockReturnValue(Effect.succeed([a, b, c]));
 
     const result = await drainQueue(
@@ -185,11 +188,11 @@ describe("drainQueue --max semantics (VA-344)", () => {
     });
 
     // Each issue was attempted exactly once — confirmed by the
-    // distinct In-Progress transitions.
-    const inProgress = linear.transition.mock.calls
-      .filter((c) => c[1] === "In Progress")
+    // distinct `removeLabel(readyLabel)` pickup signals.
+    const picked = linear.removeLabel.mock.calls
+      .filter((c) => c[1] === "ready-for-agent")
       .map((c) => c[0]);
-    expect(inProgress.sort()).toEqual(["a", "b", "c"]);
+    expect(picked.sort()).toEqual(["a", "b", "c"]);
   });
 
   it("--max 1 against a single broken issue: one attempt then exit", async () => {
@@ -211,12 +214,13 @@ describe("drainQueue --max semantics (VA-344)", () => {
       errored: 1,
     });
 
-    // One pickup, one revert. No second attempt despite `fetchReady`
-    // still surfacing the issue.
-    const inProgress = linear.transition.mock.calls.filter(
-      (c) => c[1] === "In Progress",
+    // One pickup. No second attempt despite `fetchReady` still
+    // surfacing the issue (the seen-set short-circuits before the
+    // claim removeLabel fires a second time).
+    const picked = linear.removeLabel.mock.calls.filter(
+      (c) => c[1] === "ready-for-agent",
     );
-    expect(inProgress).toHaveLength(1);
+    expect(picked).toHaveLength(1);
   });
 });
 
@@ -252,7 +256,7 @@ describe("drainQueue impl marker behaviour (VA-350)", () => {
     });
     // sandcastle.run was called once (impl) — not twice (impl + review).
     expect(sandcastleRunMock).toHaveBeenCalledTimes(1);
-    expect(linear.applyLabel).toHaveBeenCalledWith("issue-123", "needs-human");
+    expect(linear.applyLabel).toHaveBeenCalledWith("issue-123", "ready-for-human");
     const commentBodies = linear.comment.mock.calls.map((c) => String(c[1]));
     expect(commentBodies.some((b) => /issue ambiguous/.test(b))).toBe(true);
   });
@@ -605,7 +609,7 @@ describe("drainQueue review-rejection retry loop (VA-418)", () => {
     // operator can see how many attempts we burned.
     expect(hitlComment).toMatch(/Ran out of review retries \(2 attempts\)/);
     expect(hitlComment).toMatch(/still doesn't handle DST/);
-    expect(linear.applyLabel).toHaveBeenCalledWith("issue-123", "needs-human");
+    expect(linear.applyLabel).toHaveBeenCalledWith("issue-123", "ready-for-human");
   });
 
   it("on REJECTED-HITL, escalates immediately — no second impl attempt", async () => {
@@ -868,9 +872,9 @@ describe("drainQueue finalize-time rebase (VA-419)", () => {
     expect(github.pushBranch).not.toHaveBeenCalled();
     expect(github.openPullRequest).not.toHaveBeenCalled();
 
-    // HITL plumbing: needs-human label applied, comment names the base
+    // HITL plumbing: ready-for-human label applied, comment names the base
     // branch + conflicted files + quotes the APPROVED verdict.
-    expect(linear.applyLabel).toHaveBeenCalledWith("issue-123", "needs-human");
+    expect(linear.applyLabel).toHaveBeenCalledWith("issue-123", "ready-for-human");
     const commentBodies = linear.comment.mock.calls.map((c) => String(c[1]));
     const hitlComment = commentBodies.find((b) =>
       /flagged for human review/.test(b),
@@ -969,7 +973,7 @@ describe("drainQueue finalize-time rebase (VA-419)", () => {
     expect(github.pushBranch).not.toHaveBeenCalled();
     expect(github.openPullRequest).not.toHaveBeenCalled();
 
-    expect(linear.applyLabel).toHaveBeenCalledWith("issue-123", "needs-human");
+    expect(linear.applyLabel).toHaveBeenCalledWith("issue-123", "ready-for-human");
     const commentBodies = linear.comment.mock.calls.map((c) => String(c[1]));
     const hitlComment = commentBodies.find((b) =>
       /flagged for human review/.test(b),

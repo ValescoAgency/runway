@@ -6,10 +6,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // `identifier`, wrong type for `id`, etc.) and assert that
 // `fetchReady` rejects with a typed `LinearSchemaError` rather than a
 // downstream `cannot read property` runtime crash.
+//
+// VA-423: queue is now label-gated — no workflowStates lookup; the
+// happy-path issues must carry the configured `readyLabel` for the
+// eligibility check to admit them.
 
 const issuesMock = vi.fn();
 const teamsMock = vi.fn();
-const workflowStatesMock = vi.fn();
 const projectsMock = vi.fn();
 const issueLabelsMock = vi.fn();
 const issueGetMock = vi.fn();
@@ -20,7 +23,7 @@ vi.mock("@linear/sdk", () => {
   class LinearClient {
     issues = issuesMock;
     teams = teamsMock;
-    workflowStates = workflowStatesMock;
+    workflowStates = vi.fn();
     projects = projectsMock;
     issueLabels = issueLabelsMock;
     issue = issueGetMock;
@@ -35,9 +38,7 @@ const { createLinearGateway } = await import("./linear.js");
 const config = {
   linearApiKey: Redacted.make("test"),
   linearTeam: "VA",
-  readyStatus: "Todo",
-  inProgressStatus: "In Progress",
-  inReviewStatus: "In Review",
+  readyLabel: "ready-for-agent",
   hitlLabel: "ready-for-human",
   maxIterations: 5,
   implTurns: 3,
@@ -49,7 +50,6 @@ const config = {
 beforeEach(() => {
   issuesMock.mockReset();
   teamsMock.mockReset();
-  workflowStatesMock.mockReset();
   projectsMock.mockReset();
   issueLabelsMock.mockReset();
   issueGetMock.mockReset();
@@ -64,9 +64,6 @@ describe("VA-360 — Linear SDK response schemas", () => {
   it("fetchReady rejects with LinearSchemaError when an issue node is missing the `identifier` field", async () => {
     teamsMock.mockResolvedValueOnce({
       nodes: [{ id: "team-1", key: "VA" }],
-    });
-    workflowStatesMock.mockResolvedValueOnce({
-      nodes: [{ id: "state-todo", name: "Todo" }],
     });
     // Drifted issue: no `identifier` field. Pre-VA-360, the
     // orchestrator would later trip on `i.identifier` as undefined
@@ -100,9 +97,6 @@ describe("VA-360 — Linear SDK response schemas", () => {
     teamsMock.mockResolvedValueOnce({
       nodes: [{ id: "team-1", key: "VA" }],
     });
-    workflowStatesMock.mockResolvedValueOnce({
-      nodes: [{ id: "state-todo", name: "Todo" }],
-    });
     issuesMock.mockResolvedValueOnce({
       nodes: [
         {
@@ -124,38 +118,21 @@ describe("VA-360 — Linear SDK response schemas", () => {
     }
   });
 
-  it("transition rejects with LinearSchemaError when a workflow state node is missing `id`", async () => {
-    issueGetMock.mockResolvedValueOnce({
-      team: Promise.resolve({ id: "team-1", key: "VA" }),
-    });
-    // Drifted state node — no `id`.
-    workflowStatesMock.mockResolvedValueOnce({
-      nodes: [{ name: "In Progress" }],
-    });
-
-    const gateway = createLinearGateway(config);
-    const result = await Effect.runPromise(
-      gateway.transition("issue-1", "In Progress").pipe(Effect.either),
-    );
-    expect(Either.isLeft(result)).toBe(true);
-    if (Either.isLeft(result)) {
-      expect(result.left._tag).toBe("LinearSchemaError");
-    }
-  });
-
   it("happy path still works — well-formed nodes decode cleanly", async () => {
     teamsMock.mockResolvedValueOnce({
       nodes: [{ id: "team-1", key: "VA" }],
     });
-    workflowStatesMock.mockResolvedValueOnce({
-      nodes: [{ id: "state-todo", name: "Todo" }],
-    });
-    // VA-394 + VA-425: `fetchReady` calls `.labels()`,
+    // VA-394 + VA-425 / VA-423: `fetchReady` calls `.labels()`,
     // `.inverseRelations()`, and `.children()` on each candidate to
-    // apply eligibility filters — the happy path needs to mock them
-    // returning empty sets so the candidate passes the filters
-    // unchanged.
+    // apply eligibility filters — the happy path needs to mock them,
+    // and `labels()` must include the configured `readyLabel`
+    // (`ready-for-agent`) so the candidate isn't filtered out by the
+    // VA-423 client-side check.
     const emptyConnection = () => Promise.resolve({ nodes: [] });
+    const readyLabelConnection = () =>
+      Promise.resolve({
+        nodes: [{ id: "lbl-ready", name: "ready-for-agent" }],
+      });
     issuesMock.mockResolvedValueOnce({
       nodes: [
         {
@@ -165,7 +142,7 @@ describe("VA-360 — Linear SDK response schemas", () => {
           description: "an issue",
           priority: 0,
           createdAt: "2026-01-01T00:00:00.000Z",
-          labels: emptyConnection,
+          labels: readyLabelConnection,
           inverseRelations: emptyConnection,
           children: emptyConnection,
         },
@@ -176,7 +153,7 @@ describe("VA-360 — Linear SDK response schemas", () => {
           description: null,
           priority: 0,
           createdAt: "2026-01-02T00:00:00.000Z",
-          labels: emptyConnection,
+          labels: readyLabelConnection,
           inverseRelations: emptyConnection,
           children: emptyConnection,
         },
@@ -191,14 +168,14 @@ describe("VA-360 — Linear SDK response schemas", () => {
         identifier: "VA-1",
         title: "First",
         description: "an issue",
-        labels: [],
+        labels: ["ready-for-agent"],
       },
       {
         id: "issue-2",
         identifier: "VA-2",
         title: "Second",
         description: "",
-        labels: [],
+        labels: ["ready-for-agent"],
       },
     ]);
   });
@@ -354,6 +331,54 @@ describe("VA-416 — applyLabel resolves workspace-scope labels, not just team-s
     if (Either.isLeft(result)) {
       expect(result.left._tag).toBe("LinearNotFound");
     }
+    expect(updateIssueMock).not.toHaveBeenCalled();
+  });
+});
+
+// VA-423: pickup-time claim signal. The orchestrator calls
+// `removeLabel(issueId, config.readyLabel)` once an issue is chosen
+// so the next drain doesn't re-pick it. Idempotent — a no-op write
+// when the label is already absent.
+describe("VA-423 — removeLabel claim signal", () => {
+  it("issues an updateIssue write with the label filtered out of the labelIds set", async () => {
+    updateIssueMock.mockResolvedValueOnce({});
+    issueGetMock.mockResolvedValueOnce({
+      labels: vi.fn().mockResolvedValueOnce({
+        nodes: [
+          { id: "lbl-ready", name: "ready-for-agent" },
+          { id: "lbl-other", name: "Bug" },
+        ],
+      }),
+    });
+
+    const gateway = createLinearGateway(config);
+    const result = await Effect.runPromise(
+      gateway
+        .removeLabel("issue-uuid", "ready-for-agent")
+        .pipe(Effect.either),
+    );
+    expect(Either.isRight(result)).toBe(true);
+    expect(updateIssueMock).toHaveBeenCalledWith("issue-uuid", {
+      labelIds: ["lbl-other"],
+    });
+  });
+
+  it("is a no-op when the label is already absent (idempotent re-run / operator-removed)", async () => {
+    issueGetMock.mockResolvedValueOnce({
+      labels: vi.fn().mockResolvedValueOnce({
+        nodes: [{ id: "lbl-other", name: "Bug" }],
+      }),
+    });
+
+    const gateway = createLinearGateway(config);
+    const result = await Effect.runPromise(
+      gateway
+        .removeLabel("issue-uuid", "ready-for-agent")
+        .pipe(Effect.either),
+    );
+    expect(Either.isRight(result)).toBe(true);
+    // No write issued at all — the gateway short-circuits before the
+    // updateIssue call when nothing needs to change.
     expect(updateIssueMock).not.toHaveBeenCalled();
   });
 });
