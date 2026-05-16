@@ -33,6 +33,7 @@ import {
   computeVerdict,
   parsePredictedEffectFromBody,
   parseSourceMetaReviewIdentifiers,
+  parseSourceMetaReviewLinks,
 } from "../attribution.js";
 import {
   categoryFromIssueIdentifier,
@@ -258,12 +259,24 @@ export const runWeeklyReviewPass = (
       shippedComputed,
     );
 
+    // VA-409: per-theme URL maps used by the *What we shipped*
+    // renderer to emit `[VA-1001](url)` markdown links instead of
+    // bare identifiers (per the AC: "source meta-issue links").
+    // Schema-level `ShippedPromotion` only carries identifiers; the
+    // URLs are parsed off the shipped issue body and threaded here.
+    const shippedSourceUrlMaps = buildShippedSourceUrlMaps(shippedComputed);
+
     // 6) Weekly Review issue in runway-meta with provenance disclaimer
     //    + cross-links to the filed promotions.
     const weeklyIssueResult = yield* deps.metaLinear
       .createWeeklyReviewIssue({
         title: `Weekly Review: ${shortWindowLabel(args)}`,
-        body: renderWeeklyReviewMarkdown(finalReport, args, filings),
+        body: renderWeeklyReviewMarkdown(
+          finalReport,
+          args,
+          filings,
+          shippedSourceUrlMaps,
+        ),
       })
       .pipe(Effect.either);
     if (weeklyIssueResult._tag === "Left") {
@@ -401,6 +414,13 @@ interface ComputedShippedPromotion {
   readonly linearTitle: string;
   readonly category: string;
   readonly sourceMetaReviewIdentifiers: readonly string[];
+  /**
+   * Per-identifier URL lookup parsed off the shipped issue body's
+   * `**Source meta-reviews**` line. Used by the *What we shipped*
+   * renderer to emit markdown links per the AC. Empty when the body
+   * only carried bare identifiers (legacy issues / hand-edits).
+   */
+  readonly sourceMetaReviewUrlMap: ReadonlyMap<string, string>;
   readonly predictedEffect: PredictedEffect | null;
   readonly observed: ObservedMetric;
   readonly verdict: Verdict;
@@ -417,6 +437,7 @@ const computeShippedPromotionVerdicts = (
       const predictedEffect = parsePredictedEffectFromBody(entry.body);
       const category = categoryFromIssueIdentifier(entry.identifier);
       const sourceIds = parseSourceMetaReviewIdentifiers(entry.body);
+      const sourceUrlMap = parseSourceMetaReviewLinks(entry.body);
 
       if (predictedEffect === null) {
         // Pre-VA-409 issue with no readable predicted-effect surface,
@@ -429,6 +450,7 @@ const computeShippedPromotionVerdicts = (
           linearTitle: entry.title,
           category,
           sourceMetaReviewIdentifiers: sourceIds,
+          sourceMetaReviewUrlMap: sourceUrlMap,
           predictedEffect: null,
           observed: { metric: null, value: null, sample_size: 0 },
           verdict: "QUALITATIVE",
@@ -470,6 +492,7 @@ const computeShippedPromotionVerdicts = (
         linearTitle: entry.title,
         category,
         sourceMetaReviewIdentifiers: sourceIds,
+        sourceMetaReviewUrlMap: sourceUrlMap,
         predictedEffect,
         observed: {
           metric: metricToRead,
@@ -516,6 +539,20 @@ const readMetric = (
  * appended with their default comment so all shipped issues land in
  * the *What we shipped* section.
  */
+/**
+ * VA-409: collapse `ComputedShippedPromotion[]` into a `theme_key →
+ * (identifier → url)` map so the *What we shipped* renderer can look
+ * up the source meta-review URL when it has only the schema-level
+ * `ShippedPromotion` shape (which doesn't carry the URLs).
+ */
+const buildShippedSourceUrlMaps = (
+  shipped: readonly ComputedShippedPromotion[],
+): ReadonlyMap<string, ReadonlyMap<string, string>> => {
+  const out = new Map<string, ReadonlyMap<string, string>>();
+  for (const s of shipped) out.set(s.themeKey, s.sourceMetaReviewUrlMap);
+  return out;
+};
+
 const reconcileShippedPromotions = (
   llmReport: WeeklyReview,
   shippedComputed: readonly ComputedShippedPromotion[],
@@ -958,6 +995,10 @@ const renderWeeklyReviewMarkdown = (
   review: WeeklyReview,
   args: WeeklyReviewPassArgs,
   filings: readonly PromotionFiling[],
+  shippedSourceUrlMaps: ReadonlyMap<
+    string,
+    ReadonlyMap<string, string>
+  > = new Map(),
 ): string => {
   const lines: string[] = [];
   lines.push(`**Window**: \`${args.startIso}\` → \`${args.endIso}\``);
@@ -987,7 +1028,8 @@ const renderWeeklyReviewMarkdown = (
     lines.push("## What we shipped");
     lines.push("");
     for (const s of review.shipped_promotions) {
-      lines.push(renderShippedPromotion(s));
+      const urlMap = shippedSourceUrlMaps.get(s.theme_key);
+      lines.push(renderShippedPromotion(s, urlMap));
       lines.push("");
     }
   }
@@ -1033,14 +1075,25 @@ const renderWeeklyReviewMarkdown = (
   return lines.join("\n");
 };
 
-const renderShippedPromotion = (s: ShippedPromotion): string => {
+const renderShippedPromotion = (
+  s: ShippedPromotion,
+  sourceUrlMap?: ReadonlyMap<string, string>,
+): string => {
   const lines: string[] = [];
   lines.push(`### ${s.linear_title} — [${s.linear_identifier}](${s.linear_url}) — \`${s.verdict}\``);
   lines.push("");
   if (s.source_meta_review_identifiers.length > 0) {
-    lines.push(
-      `**Source meta-reviews**: ${s.source_meta_review_identifiers.join(", ")}`,
-    );
+    // VA-409 AC: "source meta-issue links" — render each identifier
+    // as a markdown link when the URL is known (parsed off the
+    // shipped issue body's `**Source meta-reviews**` line). Falls
+    // back to plain identifier text when no URL is available.
+    const rendered = s.source_meta_review_identifiers
+      .map((id) => {
+        const url = sourceUrlMap?.get(id);
+        return url ? `[${id}](${url})` : id;
+      })
+      .join(", ");
+    lines.push(`**Source meta-reviews**: ${rendered}`);
     lines.push("");
   }
   // Predicted line — claim + optional structured attribution.
@@ -1157,6 +1210,7 @@ const shortWindowLabel = (args: WeeklyReviewPassArgs): string => {
 
 export const __testing = {
   SYSTEM_PROMPT,
+  buildShippedSourceUrlMaps,
   composeUserPrompt,
   buildSourceUrlMap,
   computeShippedPromotionVerdicts,

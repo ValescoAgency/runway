@@ -40,6 +40,32 @@ export function parseSourceMetaReviewIdentifiers(
 }
 
 /**
+ * VA-409: companion to `parseSourceMetaReviewIdentifiers` — returns a
+ * `identifier → url` map for every markdown-link pair on the `**Source
+ * meta-reviews**` line. The *What we shipped* renderer uses this to
+ * emit `[VA-1001](url)` markdown links per the AC ("source meta-issue
+ * links"). Bodies that only carry bare identifiers (legacy issues,
+ * hand-edits) yield an empty map, and the renderer falls back to
+ * plain identifier text.
+ */
+export function parseSourceMetaReviewLinks(
+  body: string,
+): ReadonlyMap<string, string> {
+  const map = new Map<string, string>();
+  const lineMatch = /\*\*Source meta-reviews\*\*:\s*([^\n]+)/.exec(body);
+  if (!lineMatch || !lineMatch[1]) return map;
+  const line = lineMatch[1];
+  const linkRe = /\[([^\]]+)\]\(([^)]+)\)/g;
+  let m: RegExpExecArray | null;
+  while ((m = linkRe.exec(line)) !== null) {
+    const id = m[1]?.trim();
+    const url = m[2]?.trim();
+    if (id && url) map.set(id, url);
+  }
+  return map;
+}
+
+/**
  * VA-409: attribution loop — pure functions that grade shipped
  * promotions against their predicted effects.
  *

@@ -3,6 +3,7 @@ import {
   computeVerdict,
   parsePredictedEffectFromBody,
   parseSourceMetaReviewIdentifiers,
+  parseSourceMetaReviewLinks,
 } from "./attribution.js";
 import {
   RUNWAY_META_PREDICTED_EFFECT_MARKER,
@@ -317,5 +318,26 @@ describe("parseSourceMetaReviewIdentifiers (VA-409)", () => {
 
   it("returns empty array when the line is absent", () => {
     expect(parseSourceMetaReviewIdentifiers("no marker here")).toEqual([]);
+  });
+});
+
+describe("parseSourceMetaReviewLinks (VA-409)", () => {
+  it("returns identifier → url map for every markdown-link pair", () => {
+    const body = [
+      "**Source meta-reviews**: [VA-1001](https://linear.app/x/issue/VA-1001), [VA-1002](https://linear.app/x/issue/VA-1002)",
+    ].join("\n");
+    const map = parseSourceMetaReviewLinks(body);
+    expect(map.size).toBe(2);
+    expect(map.get("VA-1001")).toBe("https://linear.app/x/issue/VA-1001");
+    expect(map.get("VA-1002")).toBe("https://linear.app/x/issue/VA-1002");
+  });
+
+  it("returns empty map for bare identifier line (no URLs to extract)", () => {
+    const body = "**Source meta-reviews**: VA-1001, VA-1002";
+    expect(parseSourceMetaReviewLinks(body).size).toBe(0);
+  });
+
+  it("returns empty map when no source meta-reviews line is present", () => {
+    expect(parseSourceMetaReviewLinks("hand edited body").size).toBe(0);
   });
 });

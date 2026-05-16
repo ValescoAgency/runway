@@ -612,38 +612,58 @@ export function createMetaLinearGateway(
               // bucket; `canceled` is intentionally excluded since the
               // change was abandoned, not shipped. The `completedAt`
               // filter mirrors the gateway doc-comment — we use
-              // Linear's IssueFilter `completedAt: { gte }` to push the
-              // time predicate to the server.
-              const issues = await client.issues({
-                filter: {
-                  team: { id: { eq: teamId } },
-                  labels: { some: { name: { eq: "runway-meta-promoted" } } },
-                  state: { type: { eq: "completed" } },
-                  completedAt: { gte: new Date(sinceIso) },
-                },
-                first: 50,
-              });
+              // Linear's IssueFilter `completedAt: { gte }` to push
+              // the time predicate to the server.
+              //
+              // Pagination: drains can produce many promotions and
+              // an unusually long inter-weekly cadence can backlog
+              // shipped issues past a single page. We follow Linear's
+              // cursor-based pagination (`endCursor` +
+              // `hasNextPage`) until the server says there's nothing
+              // more. A hard ceiling of 10 pages × 50 issues = 500
+              // keeps a buggy iterator from spinning forever — well
+              // above any realistic weekly shipping cadence and
+              // a clear sign of operator action if hit.
+              const PAGE_SIZE = 50;
+              const MAX_PAGES = 10;
               const out: ShippedPromotedQueueEntry[] = [];
-              for (const issue of issues.nodes) {
-                if (!issue.identifier || !issue.url) continue;
-                const body =
-                  typeof issue.description === "string"
-                    ? issue.description
-                    : "";
-                const completedAt = issue.completedAt
-                  ? issue.completedAt instanceof Date
-                    ? issue.completedAt.toISOString()
-                    : String(issue.completedAt)
-                  : null;
-                if (!completedAt) continue;
-                out.push({
-                  identifier: issue.identifier,
-                  url: issue.url,
-                  title: issue.title ?? "(untitled)",
-                  body,
-                  themeKey: extractThemeKey(body),
-                  completedAt,
+              let cursor: string | undefined = undefined;
+              for (let page = 0; page < MAX_PAGES; page += 1) {
+                const issues = await client.issues({
+                  filter: {
+                    team: { id: { eq: teamId } },
+                    labels: { some: { name: { eq: "runway-meta-promoted" } } },
+                    state: { type: { eq: "completed" } },
+                    completedAt: { gte: new Date(sinceIso) },
+                  },
+                  first: PAGE_SIZE,
+                  ...(cursor !== undefined ? { after: cursor } : {}),
                 });
+                for (const issue of issues.nodes) {
+                  if (!issue.identifier || !issue.url) continue;
+                  const body =
+                    typeof issue.description === "string"
+                      ? issue.description
+                      : "";
+                  const completedAt = issue.completedAt
+                    ? issue.completedAt instanceof Date
+                      ? issue.completedAt.toISOString()
+                      : String(issue.completedAt)
+                    : null;
+                  if (!completedAt) continue;
+                  out.push({
+                    identifier: issue.identifier,
+                    url: issue.url,
+                    title: issue.title ?? "(untitled)",
+                    body,
+                    themeKey: extractThemeKey(body),
+                    completedAt,
+                  });
+                }
+                if (!issues.pageInfo.hasNextPage) break;
+                const next = issues.pageInfo.endCursor;
+                if (typeof next !== "string" || next.length === 0) break;
+                cursor = next;
               }
               return out;
             },

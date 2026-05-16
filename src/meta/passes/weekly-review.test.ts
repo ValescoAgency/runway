@@ -554,7 +554,7 @@ describe("runWeeklyReviewPass (VA-408)", () => {
     );
   };
 
-  it("HELD verdict: observed metric meets the predicted threshold", async () => {
+  it("HELD verdict: observed metric meets the predicted threshold + renders source links", async () => {
     const f = buildFixtures();
     wireShipped(
       f,
@@ -578,7 +578,7 @@ describe("runWeeklyReviewPass (VA-408)", () => {
                 threshold_value: 0.08,
               },
             },
-            sources: ["VA-1001"],
+            sources: ["VA-1001", "VA-1002"],
           }),
         },
       ],
@@ -621,6 +621,15 @@ describe("runWeeklyReviewPass (VA-408)", () => {
     }).mock.calls[0]?.[0]?.body;
     expect(bodyArg).toContain("## What we shipped");
     expect(bodyArg).toContain("`HELD`");
+    // VA-409 AC: source meta-issues render as markdown links — the
+    // URL was parsed off the shipped issue body's `**Source meta-
+    // reviews**` line.
+    expect(bodyArg).toContain(
+      "[VA-1001](https://linear.app/x/issue/VA-1001)",
+    );
+    expect(bodyArg).toContain(
+      "[VA-1002](https://linear.app/x/issue/VA-1002)",
+    );
   });
 
   it("PARTIAL verdict: observed moved toward threshold but didn't reach", async () => {
