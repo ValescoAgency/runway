@@ -1,6 +1,10 @@
 import { Effect, Redacted } from "effect";
 import { loadConfig } from "../config.js";
-import { dispatchDrainReview, dispatchRunReview } from "../meta/runner.js";
+import {
+  dispatchDrainReview,
+  dispatchRunReview,
+  dispatchWeeklyReview,
+} from "../meta/runner.js";
 
 /**
  * VA-402: `runway review` subcommand family. Verbs:
@@ -32,6 +36,7 @@ export function printReviewUsage(): void {
 USAGE
   runway review run --drain <trace-id> --issue <identifier> [--force]
   runway review drain --id <trace-id>
+  runway review weekly [--start <iso>] [--end <iso>]
 
 OPTIONS — run
   --drain <trace-id>     the drain's OTLP trace id (32 hex chars)
@@ -41,15 +46,26 @@ OPTIONS — run
 OPTIONS — drain
   --id <trace-id>        the drain's OTLP trace id (32 hex chars)
 
+OPTIONS — weekly
+  --start <iso>          start of the window (default: 7 days ago, exclusive on --end)
+  --end <iso>            end of the window (default: now)
+
 ENV
   ANTHROPIC_API_KEY            required — Claude API key for the IRA call
   RUNWAY_DASHBOARD_DB          dashboard SQLite path (default: ./runway-dashboard.db)
-  RUNWAY_META_REVIEW_MODEL     override the Anthropic model (default: claude-sonnet-4-6)
+  RUNWAY_META_REVIEW_MODEL     override the Run / Drain Review model (default: claude-sonnet-4-6)
+  RUNWAY_META_WEEKLY_MODEL     override the Weekly Review model (default: claude-opus-4-7)
   RUNWAY_META_PROJECT_NAME     override the Linear meta-project name (default: runway-meta)
   RUNWAY_REVIEW_DELAY_HOURS    minimum drain age before grading (default: 18; 12-24h band per PRD VA-403)
   RUNWAY_REPO_PROJECT_NAME     optional — Linear project where severity-critical Drain
-                               Review escalations are filed (default: team-only)
+                               Review escalations + Weekly Review promotions are filed
+                               (default: team-only)
   GITHUB_TOKEN                 optional — authenticates GitHub API for hindsight PR fetch
+
+EXIT CODES
+  0  success (run/drain reviews stub-and-continue on failure)
+  1  Weekly Review failed loud after retry exhaustion (PRD VA-408)
+  2  invalid arguments
 `);
 }
 
@@ -66,6 +82,10 @@ export async function reviewCommand(argv: readonly string[]): Promise<void> {
   }
   if (verb === "drain") {
     await drainVerb(rest);
+    return;
+  }
+  if (verb === "weekly") {
+    await weeklyVerb(rest);
     return;
   }
   console.error(`[runway review] unknown verb: ${verb}`);
@@ -201,6 +221,108 @@ type ParseResult =
 type DrainParseResult =
   | { kind: "ok"; traceId: string }
   | { kind: "error"; message: string };
+
+type WeeklyParseResult =
+  | { kind: "ok"; startIso: string; endIso: string }
+  | { kind: "error"; message: string };
+
+async function weeklyVerb(rest: readonly string[]): Promise<void> {
+  const parsed = parseWeeklyArgs(rest, Date.now());
+  if (parsed.kind === "error") {
+    console.error(`[runway review weekly] ${parsed.message}`);
+    printReviewUsage();
+    process.exit(2);
+  }
+
+  const config = loadConfig();
+  const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+  if (!anthropicApiKey) {
+    console.error(
+      "[runway review weekly] ANTHROPIC_API_KEY is required — set it in the environment before running.",
+    );
+    process.exit(2);
+  }
+  const dashboardDbPath =
+    process.env.RUNWAY_DASHBOARD_DB ?? "./runway-dashboard.db";
+
+  const outcome = await Effect.runPromise(
+    dispatchWeeklyReview(
+      { startIso: parsed.startIso, endIso: parsed.endIso },
+      {
+        config,
+        cwd: process.cwd(),
+        dashboardDbPath,
+        anthropicApiKey,
+        githubToken: process.env.GITHUB_TOKEN,
+      },
+    ),
+  );
+
+  if (outcome.kind === "review") {
+    console.log(
+      `[runway review weekly] ok — meta_review=${outcome.metaReviewId} linear=${outcome.linearIdentifier} (${outcome.linearUrl}) promotions=${outcome.promotionsFiled}/${outcome.promotionsPlanned}`,
+    );
+    return;
+  }
+  if (outcome.kind === "no-reviews") {
+    console.log(
+      `[runway review weekly] no Run / Drain Reviews in window — nothing to summarize. ${outcome.reason}`,
+    );
+    return;
+  }
+  // VA-408 AC: "exit code is non-zero after retry exhaustion".
+  console.error(`[runway review weekly] FAILED-LOUD — ${outcome.reason}`);
+  process.exit(1);
+}
+
+/**
+ * VA-408: argv parser for `runway review weekly [--start <iso>]
+ * [--end <iso>]`. Both flags optional — default window is the
+ * trailing 7 days ending at `nowMs`. Supports space-separated and
+ * `=`-form. `nowMs` is parameterized so tests can drive a stable
+ * clock; production calls pass `Date.now()`.
+ */
+export function parseWeeklyArgs(
+  argv: readonly string[],
+  nowMs: number,
+): WeeklyParseResult {
+  let startIso: string | undefined;
+  let endIso: string | undefined;
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === undefined) continue;
+    const split = consumeFlag(arg, argv, i);
+    if (!split) continue;
+    if (split.name === "--start") {
+      startIso = split.value;
+      i = split.advance;
+    } else if (split.name === "--end") {
+      endIso = split.value;
+      i = split.advance;
+    } else {
+      return { kind: "error", message: `unknown flag: ${split.name}` };
+    }
+  }
+  const resolvedEndIso = endIso ?? new Date(nowMs).toISOString();
+  const resolvedStartIso =
+    startIso ?? new Date(nowMs - 7 * 24 * 60 * 60 * 1000).toISOString();
+  // Permissive: trust the operator's ISO string. Date.parse will
+  // surface a malformed input as NaN; reject explicitly so the
+  // operator doesn't get a Z-shaped Linear query later.
+  if (Number.isNaN(Date.parse(resolvedStartIso))) {
+    return { kind: "error", message: `--start is not a valid ISO date: ${resolvedStartIso}` };
+  }
+  if (Number.isNaN(Date.parse(resolvedEndIso))) {
+    return { kind: "error", message: `--end is not a valid ISO date: ${resolvedEndIso}` };
+  }
+  if (Date.parse(resolvedStartIso) >= Date.parse(resolvedEndIso)) {
+    return {
+      kind: "error",
+      message: `--start (${resolvedStartIso}) must be before --end (${resolvedEndIso})`,
+    };
+  }
+  return { kind: "ok", startIso: resolvedStartIso, endIso: resolvedEndIso };
+}
 
 /**
  * VA-406: argv parser for `runway review drain --id <trace-id>`.

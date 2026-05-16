@@ -16,6 +16,10 @@ import {
   type DrainReviewPassOutcome,
 } from "./passes/drain-review.js";
 import { runRunReviewPass, type RunReviewPassOutcome } from "./passes/run-review.js";
+import {
+  runWeeklyReviewPass,
+  type WeeklyReviewPassOutcome,
+} from "./passes/weekly-review.js";
 
 /**
  * VA-402: dispatch for the `runway review` subcommand family. One
@@ -68,6 +72,10 @@ export interface RunReviewArgs {
 const DEFAULT_META_REVIEW_MODEL = "claude-sonnet-4-6";
 const DEFAULT_META_PROJECT_NAME = "runway-meta";
 const DEFAULT_META_REVIEW_DELAY_HOURS = 18;
+// VA-408: PRD-spec default. Weekly Review benefits from deeper
+// reasoning across many Reviews; operators concerned about cost can
+// override to a Sonnet model via env or `.runway/config.yml`.
+const DEFAULT_META_WEEKLY_MODEL = "claude-opus-4-7";
 // VA-405: match the dashboard's default `DASHBOARD_AGGREGATE_WINDOW`
 // so a stock dashboard + a stock IRA see the same denominator. The
 // IRA computes its own aggregates (parameterized on the raw event
@@ -101,12 +109,20 @@ export function resolveMetaConfig(env: {
    * escalation issue; just put it on the team."
    */
   readonly runwayRepoProjectName: string | undefined;
+  /**
+   * VA-408: Weekly Review's separate model knob. Default `claude-opus-4-7`
+   * (deeper reasoning across many Reviews); operators override via
+   * `RUNWAY_META_WEEKLY_MODEL` env or `metaWeeklyModel` in
+   * `.runway/config.yml`.
+   */
+  readonly metaWeeklyModel: string;
   readonly source: {
     readonly model: string;
     readonly project: string;
     readonly delayHours: string;
     readonly thresholds: string;
     readonly runwayRepoProject: string;
+    readonly weeklyModel: string;
   };
 } {
   const file = loadRunwayConfigFile(env.cwd);
@@ -138,18 +154,25 @@ export function resolveMetaConfig(env: {
     file.runwayRepoProjectName,
     undefined,
   );
+  const weeklyModel = resolveLayered(
+    env.config.metaWeeklyModel,
+    file.metaWeeklyModel,
+    DEFAULT_META_WEEKLY_MODEL,
+  );
   return {
     metaReviewModel: model.value,
     metaProjectName: project.value,
     metaReviewDelayHours: delay.value,
     metaFilterThresholds: thresholds.value,
     runwayRepoProjectName: runwayRepoProject.value,
+    metaWeeklyModel: weeklyModel.value,
     source: {
       model: model.source,
       project: project.source,
       delayHours: delay.source,
       thresholds: thresholds.source,
       runwayRepoProject: runwayRepoProject.source,
+      weeklyModel: weeklyModel.source,
     },
   };
 }
@@ -299,6 +322,56 @@ export const dispatchDrainReview = (
           dashboardRead,
           metaLinear,
           storage,
+        },
+      );
+    } finally {
+      storage.close();
+    }
+  });
+
+export interface WeeklyReviewArgs {
+  /** ISO 8601 start of the window (inclusive). */
+  readonly startIso: string;
+  /** ISO 8601 end of the window (exclusive). */
+  readonly endIso: string;
+}
+
+/**
+ * VA-408: invoke the Weekly Review pass end-to-end. Same lifetime
+ * management as `dispatchRunReview` / `dispatchDrainReview` (open
+ * storage, build gateways, run pass, close in `finally`). The CLI
+ * verb `runway review weekly [--start <iso> --end <iso>]` routes
+ * through here.
+ *
+ * Unlike Run / Drain Review, this pass returns a `failed-loud` variant
+ * on retry exhaustion — the CLI maps that to `process.exit(1)` so
+ * cron MAILTO / GitHub Actions step failure surfaces it. PRD: "no
+ * silent failure".
+ */
+export const dispatchWeeklyReview = (
+  args: WeeklyReviewArgs,
+  env: RunnerEnv,
+): Effect.Effect<WeeklyReviewPassOutcome, never, never> =>
+  Effect.gen(function* () {
+    const resolved = resolveMetaConfig(env);
+    const storage = createStorage(env.dashboardDbPath);
+    try {
+      const dashboardRead = createMetaDashboardRead(env.dashboardDbPath);
+      const metaLinear = createMetaLinearGateway({
+        linearApiKey: env.config.linearApiKey as Redacted.Redacted<string>,
+        linearTeam: env.config.linearTeam,
+        metaProjectName: resolved.metaProjectName,
+        runwayRepoProjectName: resolved.runwayRepoProjectName,
+      });
+      return yield* runWeeklyReviewPass(
+        { startIso: args.startIso, endIso: args.endIso },
+        {
+          anthropicApiKey: env.anthropicApiKey,
+          metaWeeklyModel: resolved.metaWeeklyModel,
+          dashboardRead,
+          metaLinear,
+          storage,
+          cwd: env.cwd,
         },
       );
     } finally {

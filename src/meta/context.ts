@@ -8,12 +8,23 @@ import {
   type DrainMetaRow,
   type MetaDashboardRead,
   type MetaReadError,
+  type WindowedMetaRow,
 } from "./dashboard-read.js";
 import {
   fetchHindsightSignals,
   type GitHubHindsightGateway,
   type LinearHindsightGateway,
 } from "./hindsight.js";
+import type {
+  MetaLinearError,
+  MetaLinearGateway,
+  OpenPromotedQueueEntry,
+} from "./linear-meta.js";
+import {
+  loadOutOfScopeEntries,
+  type OutOfScopeEntry,
+  type OutOfScopeReadError,
+} from "./out-of-scope.js";
 import type { HindsightSignals } from "./templates.js";
 
 /**
@@ -116,11 +127,25 @@ export type LoadContextArgs =
       // distinct.
       readonly pass: "drain-review";
       readonly traceId: string;
+    }
+  | {
+      // VA-408: weekly-review pass context — Run + Drain Reviews in
+      // the [startIso, endIso) window, prior 4 Weekly Reviews,
+      // .out-of-scope/ rationales, and the open promoted-queue.
+      // Loaded in parallel across the dashboard + Linear gateways.
+      readonly pass: "weekly-review";
+      readonly startIso: string;
+      readonly endIso: string;
+      readonly cwd: string;
+      readonly metaLinear: MetaLinearGateway;
+      /** Default 4 per PRD. */
+      readonly priorWeeklyLimit?: number;
     };
 
 export type LoadContextResult =
   | { readonly pass: "run-review"; readonly context: RunReviewContext }
-  | { readonly pass: "drain-review"; readonly context: DrainReviewContext };
+  | { readonly pass: "drain-review"; readonly context: DrainReviewContext }
+  | { readonly pass: "weekly-review"; readonly context: WeeklyReviewContext };
 
 /**
  * VA-406: per-drain context payload. Mirrors the shape Run Review
@@ -132,6 +157,40 @@ export interface DrainReviewContext {
   readonly traceId: string;
   readonly issueProcesses: readonly CapturedIssueProcess[];
   readonly metaRows: readonly DrainMetaRow[];
+}
+
+/**
+ * VA-408: weekly-review context payload. The pass composes its prompt
+ * from this; the promoter reads `runReviews` directly for
+ * Recommendation extraction.
+ *
+ * The Linear-side queue read (`openPromotedQueue`) and the FS-side
+ * out-of-scope read are loaded best-effort: a transient Linear error
+ * or a missing `.out-of-scope/` directory degrade to empty arrays
+ * rather than failing the whole pass. The trade-off is that a Linear
+ * outage during the queue read could allow a re-promotion of a theme
+ * with an open issue — acceptable cost for keeping the Weekly Review
+ * from silently no-firing.
+ */
+export interface WeeklyReviewContext {
+  readonly startIso: string;
+  readonly endIso: string;
+  readonly runReviews: readonly WindowedMetaRow[];
+  readonly drainReviews: readonly WindowedMetaRow[];
+  readonly priorWeeklyReviews: readonly WindowedMetaRow[];
+  readonly outOfScopeEntries: readonly OutOfScopeEntry[];
+  readonly openPromotedQueue: readonly OpenPromotedQueueEntry[];
+  /**
+   * Per-source error reporting — when a degraded load happened the
+   * pass logs which source produced the empty array. Null means the
+   * source loaded cleanly. The IRA's prompt can call out the gap so
+   * the operator knows whether the empty queue is real or due to a
+   * transient gateway failure.
+   */
+  readonly degradedSources: {
+    readonly outOfScope: string | null;
+    readonly openPromotedQueue: string | null;
+  };
 }
 
 /**
@@ -153,7 +212,80 @@ export const loadContextFor = (
       return loadDrainReviewContext(args, gateway).pipe(
         Effect.map((context) => ({ pass: "drain-review" as const, context })),
       );
+    case "weekly-review":
+      return loadWeeklyReviewContext(args, gateway).pipe(
+        Effect.map((context) => ({ pass: "weekly-review" as const, context })),
+      );
   }
+};
+
+const DEFAULT_PRIOR_WEEKLY_LIMIT = 4;
+
+const loadWeeklyReviewContext = (
+  args: {
+    readonly startIso: string;
+    readonly endIso: string;
+    readonly cwd: string;
+    readonly metaLinear: MetaLinearGateway;
+    readonly priorWeeklyLimit?: number;
+  },
+  gateway: MetaDashboardRead,
+): Effect.Effect<WeeklyReviewContext, MetaReadError> =>
+  Effect.gen(function* () {
+    const priorWeeklyLimit =
+      args.priorWeeklyLimit ?? DEFAULT_PRIOR_WEEKLY_LIMIT;
+    // VA-408: five reads in parallel — three dashboard-SQLite, one
+    // FS, one Linear. SQLite is single-threaded but the Effect
+    // scheduler runs the async wrappers concurrently. FS + Linear
+    // are best-effort: a failure degrades to an empty array with the
+    // error message preserved in `degradedSources`.
+    const [
+      runReviews,
+      drainReviews,
+      priorWeekly,
+      outOfScopeResult,
+      openQueueResult,
+    ] = yield* Effect.all(
+      [
+        gateway.loadRunReviewsInWindow(args.startIso, args.endIso),
+        gateway.loadDrainReviewsInWindow(args.startIso, args.endIso),
+        gateway.loadRecentWeeklyReviews(priorWeeklyLimit),
+        loadOutOfScopeEntries(args.cwd).pipe(Effect.either),
+        args.metaLinear.listOpenPromotedQueue().pipe(Effect.either),
+      ],
+      { concurrency: "unbounded" },
+    );
+    const outOfScopeEntries =
+      outOfScopeResult._tag === "Right" ? outOfScopeResult.right : [];
+    const openPromotedQueue =
+      openQueueResult._tag === "Right" ? openQueueResult.right : [];
+    return {
+      startIso: args.startIso,
+      endIso: args.endIso,
+      runReviews,
+      drainReviews,
+      priorWeeklyReviews: priorWeekly,
+      outOfScopeEntries,
+      openPromotedQueue,
+      degradedSources: {
+        outOfScope:
+          outOfScopeResult._tag === "Left"
+            ? formatDegradedError("out-of-scope", outOfScopeResult.left)
+            : null,
+        openPromotedQueue:
+          openQueueResult._tag === "Left"
+            ? formatDegradedError("openPromotedQueue", openQueueResult.left)
+            : null,
+      },
+    } satisfies WeeklyReviewContext;
+  });
+
+const formatDegradedError = (
+  source: string,
+  err: OutOfScopeReadError | MetaLinearError,
+): string => {
+  const message = "message" in err ? err.message : String(err);
+  return `${source}: ${message}`;
 };
 
 const loadDrainReviewContext = (

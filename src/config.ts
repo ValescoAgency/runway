@@ -163,6 +163,14 @@ export interface RunwayConfig {
    * `.runway/config.yml` → undefined. Source: `RUNWAY_REPO_PROJECT_NAME`.
    */
   readonly runwayRepoProjectName?: string;
+  /**
+   * VA-408: env-only signal for the Weekly Review pass model.
+   * Resolution chain: env → `.runway/config.yml` → `"claude-opus-4-7"`
+   * default. The Weekly pass benefits from deeper reasoning across
+   * many Reviews — the PRD's `metaWeeklyModel` knob. Source:
+   * `RUNWAY_META_WEEKLY_MODEL`.
+   */
+  readonly metaWeeklyModel?: string;
 }
 
 // Back-compat alias — existing consumers (orchestrator, gateways)
@@ -242,6 +250,7 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
   runwayRepoProjectName: EConfig.option(
     EConfig.string("RUNWAY_REPO_PROJECT_NAME"),
   ),
+  metaWeeklyModel: EConfig.option(EConfig.string("RUNWAY_META_WEEKLY_MODEL")),
 }).pipe(
   Effect.map(
     (raw): RunwayConfig => ({
@@ -268,6 +277,7 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
         Option.getOrUndefined(raw.metaFilterThresholdsJson),
       ),
       runwayRepoProjectName: Option.getOrUndefined(raw.runwayRepoProjectName),
+      metaWeeklyModel: Option.getOrUndefined(raw.metaWeeklyModel),
     }),
   ),
 );

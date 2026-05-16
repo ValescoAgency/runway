@@ -578,3 +578,132 @@ describe("MetaDashboardRead.loadDrainMetaRows (VA-406)", () => {
     expect(rows[0]?.contentJson).toContain("VA-1");
   });
 });
+
+describe("MetaDashboardRead.loadRunReviewsInWindow (VA-408)", () => {
+  function seed(
+    id: string,
+    kind: "meta-run-review" | "meta-skipped" | "meta-failed" | "meta-drain-review" | "meta-weekly-review",
+    createdAt: string,
+  ): void {
+    storage.saveMetaReview({
+      id,
+      kind,
+      scope: id,
+      drainId: kind === "meta-weekly-review" ? null : "trace-x",
+      issueId: kind === "meta-weekly-review" ? null : "VA-100",
+      contentJson: `{"id":"${id}"}`,
+      templateVersion: "1.0.0",
+      createdAt,
+    });
+  }
+
+  it("returns rows in [start, end) ordered ascending by created_at", async () => {
+    seed("a", "meta-run-review", "2026-05-10 00:00:00");
+    seed("b", "meta-run-review", "2026-05-12 00:00:00");
+    seed("c", "meta-run-review", "2026-05-14 00:00:00");
+    seed("d", "meta-run-review", "2026-05-18 00:00:00"); // outside window
+
+    const rows = await Effect.runPromise(
+      gateway.loadRunReviewsInWindow("2026-05-11 00:00:00", "2026-05-17 00:00:00"),
+    );
+    expect(rows.map((r) => r.id)).toEqual(["b", "c"]);
+  });
+
+  it("includes skipped and failed kinds — coverage gaps are narrative material", async () => {
+    seed("ok-1", "meta-run-review", "2026-05-12 00:00:00");
+    seed("skipped-1", "meta-skipped", "2026-05-13 00:00:00");
+    seed("failed-1", "meta-failed", "2026-05-14 00:00:00");
+
+    const rows = await Effect.runPromise(
+      gateway.loadRunReviewsInWindow("2026-05-11 00:00:00", "2026-05-17 00:00:00"),
+    );
+    expect(rows.map((r) => r.kind)).toEqual([
+      "meta-run-review",
+      "meta-skipped",
+      "meta-failed",
+    ]);
+  });
+
+  it("excludes drain-review and weekly-review rows", async () => {
+    seed("drain-1", "meta-drain-review", "2026-05-13 00:00:00");
+    seed("weekly-1", "meta-weekly-review", "2026-05-14 00:00:00");
+
+    const rows = await Effect.runPromise(
+      gateway.loadRunReviewsInWindow("2026-05-11 00:00:00", "2026-05-17 00:00:00"),
+    );
+    expect(rows).toHaveLength(0);
+  });
+});
+
+describe("MetaDashboardRead.loadDrainReviewsInWindow (VA-408)", () => {
+  it("returns only drain-review rows in [start, end)", async () => {
+    storage.saveMetaReview({
+      id: "drain-1",
+      kind: "meta-drain-review",
+      scope: "trace-1",
+      drainId: "trace-1",
+      issueId: null,
+      contentJson: "{}",
+      templateVersion: "1.0.0",
+      createdAt: "2026-05-13 00:00:00",
+    });
+    storage.saveMetaReview({
+      id: "run-1",
+      kind: "meta-run-review",
+      scope: "trace-1",
+      drainId: "trace-1",
+      issueId: "VA-1",
+      contentJson: "{}",
+      templateVersion: "1.0.0",
+      createdAt: "2026-05-13 12:00:00",
+    });
+
+    const rows = await Effect.runPromise(
+      gateway.loadDrainReviewsInWindow("2026-05-11 00:00:00", "2026-05-17 00:00:00"),
+    );
+    expect(rows.map((r) => r.id)).toEqual(["drain-1"]);
+    expect(rows[0]?.kind).toBe("meta-drain-review");
+  });
+});
+
+describe("MetaDashboardRead.loadRecentWeeklyReviews (VA-408)", () => {
+  it("returns the N freshest rows in descending created_at order", async () => {
+    for (let i = 1; i <= 6; i += 1) {
+      storage.saveMetaReview({
+        id: `weekly-${i}`,
+        kind: "meta-weekly-review",
+        scope: `week-${i}`,
+        drainId: null,
+        issueId: null,
+        contentJson: `{"n":${i}}`,
+        templateVersion: "1.0.0",
+        // Sortable string timestamps so the order is deterministic.
+        createdAt: `2026-05-${String(i + 9).padStart(2, "0")} 00:00:00`,
+      });
+    }
+
+    const rows = await Effect.runPromise(gateway.loadRecentWeeklyReviews(4));
+    expect(rows.map((r) => r.id)).toEqual([
+      "weekly-6",
+      "weekly-5",
+      "weekly-4",
+      "weekly-3",
+    ]);
+  });
+
+  it("returns [] when limit is 0", async () => {
+    storage.saveMetaReview({
+      id: "weekly-1",
+      kind: "meta-weekly-review",
+      scope: "w",
+      drainId: null,
+      issueId: null,
+      contentJson: "{}",
+      templateVersion: "1.0.0",
+      createdAt: "2026-05-12 00:00:00",
+    });
+
+    const rows = await Effect.runPromise(gateway.loadRecentWeeklyReviews(0));
+    expect(rows).toHaveLength(0);
+  });
+});

@@ -425,6 +425,174 @@ export function parseDrainReview(text: string): ReportParseResult<DrainReview> {
 }
 
 // ---------------------------------------------------------------------------
+// Weekly Review (v1.0.0) — IRA's weekly cadence pass (VA-408)
+// ---------------------------------------------------------------------------
+
+export const WEEKLY_REVIEW_VERSION = "1.0.0";
+export const WEEKLY_REVIEW_FENCE_TAG = "runway-weekly-review";
+
+/**
+ * VA-408: rates block shared by `WeeklyReviewSchema.rates` and the
+ * delta-vs-prior-week shape. Throughput is a count (not a percentage),
+ * the rest are 0–100% values. The delta variant carries SIGNED numbers —
+ * a `-3.2` in `success_pct` means the success rate dropped 3.2
+ * percentage points vs last week. Delta is nullable because the first
+ * Weekly Review for a fresh workspace has no prior week to diff against.
+ */
+const WeeklyRatesSchema = z.object({
+  throughput: z.number().nonnegative(),
+  success_pct: z.number().min(0).max(100),
+  hitl_pct: z.number().min(0).max(100),
+  revert_pct: z.number().min(0).max(100),
+  infra_error_pct: z.number().min(0).max(100),
+});
+
+const WeeklyRatesDeltaSchema = z.object({
+  throughput: z.number(),
+  success_pct: z.number(),
+  hitl_pct: z.number(),
+  revert_pct: z.number(),
+  infra_error_pct: z.number(),
+});
+
+/**
+ * VA-408: PRD-spec promotion category. Mirrors the Linear label set the
+ * runway-repo project uses to triage new issues.
+ */
+const PromotionCategorySchema = z.enum(["Bug", "Feature", "Improvement"]);
+
+/**
+ * VA-408: predicted-effect block per promotion. Falsifiability is the
+ * load-bearing contract — every promotion declares the claim it makes
+ * and the minimum sample of post-ship runs needed to validate it. The
+ * next Weekly Review's attribution loop (VA-409) reads this block back
+ * to grade HELD / PARTIAL / MISSED after the change ships.
+ */
+const PredictedEffectSchema = z.object({
+  claim: z.string().min(1),
+  min_sample_size: z.number().int().positive(),
+  // Free-text description of the sample — e.g. "post-ship runs of
+  // refactor-class issues". The attribution loop reads this to know
+  // which runs count toward the n=X threshold.
+  sample_description: z.string().min(1),
+});
+
+/**
+ * VA-408: machine-readable marker the promoter stamps into every
+ * promoted runway-repo issue body. The next Weekly Review's queue-
+ * defer logic reads it back to match new themes against open
+ * promotions without re-running the LLM.
+ */
+export const RUNWAY_META_THEME_KEY_MARKER = "runway-meta-theme-key";
+
+const PromotionSchema = z.object({
+  // The promoter's stable theme key, echoed back in the parsed payload.
+  // Stamped into the runway-repo issue body so the next Weekly Review
+  // can match against the open promoted queue.
+  theme_key: z.string().min(1),
+  target: RecommendationTargetSchema,
+  category: PromotionCategorySchema,
+  // Short title for the runway-repo issue (the LLM's job — turning a
+  // recommendation into a shippable phrasing).
+  title: z.string().min(1),
+  // Multi-line change spec for the issue body. Markdown.
+  change_spec: z.string().min(1),
+  // Acceptance criteria as a list of bullet strings. The runway-repo
+  // issue body renders these as a markdown checklist.
+  acceptance_criteria: z.array(z.string().min(1)).min(1),
+  // VA-NNN identifiers of the Run / Drain Reviews that corroborated
+  // this theme. The promoter computed this; the LLM echoes it back.
+  source_meta_review_identifiers: z.array(z.string().min(1)),
+  predicted_effect: PredictedEffectSchema,
+  corroboration_count: z.number().int().min(2),
+  recommendation_confidence: RecommendationConfidenceSchema,
+});
+
+/**
+ * VA-408: one entry in the *Noted but not promoted* overflow block.
+ * `reason` discriminates between the cases — operators triaging the
+ * Weekly Review want to know which themes are pending vs which lost
+ * the ranking vs which match a prior rejection.
+ */
+const NotedThemeReasonSchema = z.enum([
+  "budget-cap",
+  "deferred-open-promotion",
+  "out-of-scope",
+  "low-confidence",
+]);
+
+const NotedThemeSchema = z.object({
+  theme_key: z.string().min(1),
+  target: RecommendationTargetSchema,
+  description: z.string().min(1),
+  corroboration_count: z.number().int().min(1),
+  reason: NotedThemeReasonSchema,
+  // Populated when `reason === "deferred-open-promotion"` — the
+  // identifier of the open promoted issue the new theme is deferring
+  // behind. Null otherwise.
+  deferred_behind: z.string().nullable(),
+});
+
+/**
+ * VA-408: one recurring-theme observation the IRA surfaces in prose.
+ * Lighter shape than `PromotionSchema` — themes that didn't reach the
+ * corroboration threshold (>= 2 Run Reviews) still get a one-liner so
+ * the operator can spot pre-emergent patterns before they harden.
+ */
+const RecurringThemeSchema = z.object({
+  target: RecommendationTargetSchema,
+  description: z.string().min(1),
+  corroboration_count: z.number().int().min(1),
+});
+
+const WeeklyReviewSchema = z.object({
+  template_version: z.string(),
+  // ISO8601 boundaries of the week. The cron-driven cadence sets the
+  // window; ad-hoc `runway review weekly` invocations may pick custom
+  // windows for backfill / replay.
+  time_window: z.object({
+    start_iso: z.string().min(1),
+    end_iso: z.string().min(1),
+  }),
+  // Aggregates: throughput, success / HITL / revert / infra-error
+  // rates. The LLM computes these off the raw Reviews surface — the
+  // model has qualitative grounding for "what counts as a HITL escape"
+  // that a mechanical denominator could miss.
+  rates: WeeklyRatesSchema,
+  // Delta vs prior week. Null on the first weekly review for a fresh
+  // workspace (no prior week to diff against).
+  rates_delta_vs_prior_week: WeeklyRatesDeltaSchema.nullable(),
+  // Free-form prose summarizing the week. The operator reads this on
+  // a Sunday evening — readability matters more than rigid structure.
+  narrative: z.string(),
+  recurring_themes: z.array(RecurringThemeSchema),
+  // Top-5 promotions per the PRD's hard cap. Enforced at the schema
+  // level so a malformed LLM response can't slip 6+ promotions past.
+  promotions: z.array(PromotionSchema).max(5),
+  noted_but_not_promoted: z.array(NotedThemeSchema),
+});
+
+export type WeeklyRates = z.infer<typeof WeeklyRatesSchema>;
+export type WeeklyRatesDelta = z.infer<typeof WeeklyRatesDeltaSchema>;
+export type PromotionCategory = z.infer<typeof PromotionCategorySchema>;
+export type PredictedEffect = z.infer<typeof PredictedEffectSchema>;
+export type Promotion = z.infer<typeof PromotionSchema>;
+export type NotedThemeReason = z.infer<typeof NotedThemeReasonSchema>;
+export type NotedTheme = z.infer<typeof NotedThemeSchema>;
+export type RecurringTheme = z.infer<typeof RecurringThemeSchema>;
+export type WeeklyReview = z.infer<typeof WeeklyReviewSchema>;
+
+export function parseWeeklyReview(
+  text: string,
+): ReportParseResult<WeeklyReview> {
+  return parseReport(text, {
+    fenceTag: WEEKLY_REVIEW_FENCE_TAG,
+    schema: WeeklyReviewSchema,
+    expectedMajor: parseMajor(WEEKLY_REVIEW_VERSION),
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Generic parser — fence extraction → JSON parse → version handshake
 // → schema validation
 // ---------------------------------------------------------------------------

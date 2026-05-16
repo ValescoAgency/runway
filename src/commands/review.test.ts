@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseDrainArgs, parseRunArgs } from "./review.js";
+import { parseDrainArgs, parseRunArgs, parseWeeklyArgs } from "./review.js";
 
 // VA-402: argv parser tests for `runway review run`. Lock the
 // space-separated form, the `=` form, and the error cases — the
@@ -145,6 +145,72 @@ describe("parseDrainArgs (VA-406)", () => {
 
   it("errors on an unknown flag", () => {
     const r = parseDrainArgs(["--id=deadbeef", "--what", "huh"]);
+    expect(r.kind).toBe("error");
+    if (r.kind !== "error") return;
+    expect(r.message).toContain("--what");
+  });
+});
+
+describe("parseWeeklyArgs (VA-408)", () => {
+  // Frozen clock — Friday 2026-05-15 12:00:00 UTC.
+  const NOW_MS = Date.parse("2026-05-15T12:00:00.000Z");
+
+  it("defaults to a trailing 7-day window when no flags are passed", () => {
+    const r = parseWeeklyArgs([], NOW_MS);
+    expect(r.kind).toBe("ok");
+    if (r.kind !== "ok") return;
+    expect(r.endIso).toBe("2026-05-15T12:00:00.000Z");
+    expect(r.startIso).toBe("2026-05-08T12:00:00.000Z");
+  });
+
+  it("accepts explicit --start and --end (space form)", () => {
+    const r = parseWeeklyArgs(
+      [
+        "--start",
+        "2026-05-01T00:00:00.000Z",
+        "--end",
+        "2026-05-08T00:00:00.000Z",
+      ],
+      NOW_MS,
+    );
+    expect(r.kind).toBe("ok");
+    if (r.kind !== "ok") return;
+    expect(r.startIso).toBe("2026-05-01T00:00:00.000Z");
+    expect(r.endIso).toBe("2026-05-08T00:00:00.000Z");
+  });
+
+  it("accepts the = form for both flags", () => {
+    const r = parseWeeklyArgs(
+      ["--start=2026-05-01T00:00:00.000Z", "--end=2026-05-08T00:00:00.000Z"],
+      NOW_MS,
+    );
+    expect(r.kind).toBe("ok");
+  });
+
+  it("errors when --start is not a valid ISO date", () => {
+    const r = parseWeeklyArgs(["--start", "not-a-date"], NOW_MS);
+    expect(r.kind).toBe("error");
+    if (r.kind !== "error") return;
+    expect(r.message).toContain("--start");
+  });
+
+  it("errors when --start >= --end", () => {
+    const r = parseWeeklyArgs(
+      [
+        "--start",
+        "2026-05-08T00:00:00.000Z",
+        "--end",
+        "2026-05-01T00:00:00.000Z",
+      ],
+      NOW_MS,
+    );
+    expect(r.kind).toBe("error");
+    if (r.kind !== "error") return;
+    expect(r.message).toContain("must be before");
+  });
+
+  it("errors on an unknown flag", () => {
+    const r = parseWeeklyArgs(["--what", "huh"], NOW_MS);
     expect(r.kind).toBe("error");
     if (r.kind !== "error") return;
     expect(r.message).toContain("--what");
