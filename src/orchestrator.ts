@@ -47,6 +47,14 @@ export interface OrchestratorResult {
   readonly hitl: number;
   readonly errored: number;
   /**
+   * VA-423: count of issues skipped because the
+   * `ready-for-agent` label was already removed at claim time
+   * (another runner won the race). Tracked separately from
+   * `errored` because nothing actually went wrong — the issue is
+   * being handled by the winning run.
+   */
+  readonly skipped: number;
+  /**
    * VA-355: per-issue verdict trail so the operator can scan
    * `runway run`'s exit summary without opening Linear. Order matches
    * the order in which issues were picked up.
@@ -56,7 +64,16 @@ export interface OrchestratorResult {
 
 export interface IssueOutcome {
   readonly identifier: string;
-  readonly kind: "opened" | "hitl" | "reverted" | "errored";
+  // VA-423: the `reverted` outcome retired with the status-mutation
+  // model — every failure now lands on `ready-for-human` via the
+  // HITL path. The `skipped` variant is the lost-claim-race signal
+  // (another runner removed `ready-for-agent` between fetchReady
+  // and the pickup write). Distinct buckets remain for the
+  // dashboard and the exit summary: `opened` = PR opened, `hitl` =
+  // planned HITL or crashed-into-HITL, `errored` = same as HITL on
+  // the data side but flagged separately so a per-run "things
+  // actually crashed" count survives, `skipped` = lost race.
+  readonly kind: "opened" | "hitl" | "errored" | "skipped";
   readonly detail: string;
 }
 
@@ -84,8 +101,15 @@ type ProcessIssueError =
   | { readonly _tag?: string; readonly message: string };
 
 interface ProcessOutcome {
-  readonly kind: "opened" | "hitl";
-  /** PR URL for "opened", or the rejection/HITL reason for "hitl". */
+  readonly kind: "opened" | "hitl" | "skipped";
+  /**
+   * - `opened`: PR URL.
+   * - `hitl`: the rejection / HITL reason.
+   * - `skipped`: VA-423 lost-claim-race reason ("another runner
+   *   already removed `ready-for-agent`"). The orchestrator does
+   *   none of the visible per-issue side-effects (no pickup
+   *   comment, no agent branch push) on this branch.
+   */
   readonly detail: string;
 }
 
@@ -186,16 +210,20 @@ export const drainQueue = (
       commentAuthorAllowlist,
     };
 
-    // VA-344: never re-pick an issue in the same invocation, even if
-    // VA-342 reverted it to `Todo`. Without this, a deterministic
-    // startup failure (broken .env.schema, missing image, expired
-    // token) would loop on the same issue until --max was exhausted.
+    // VA-344: never re-pick an issue in the same invocation. After
+    // VA-423, the `ready-for-agent` label is stripped on pickup so
+    // a fresh `fetchReady` shouldn't re-surface a just-attempted
+    // issue anyway — but a same-invocation guard is still cheap
+    // insurance against a Linear eventual-consistency edge re-
+    // returning the issue before the label-removal write has
+    // propagated.
     const seen = new Set<string>();
     const outcomes: IssueOutcome[] = [];
     let attempts = 0;
     let opened = 0;
     let hitl = 0;
     let errored = 0;
+    let skipped = 0;
 
     while (attempts < max) {
       const queue = yield* linear.fetchReady().pipe(
@@ -232,7 +260,9 @@ export const drainQueue = (
             "runway.outcome.detail": result.detail,
             ...(result.kind === "opened"
               ? { "runway.pr.url": result.detail }
-              : { "runway.hitl.reason": result.detail }),
+              : result.kind === "hitl"
+                ? { "runway.hitl.reason": result.detail }
+                : {}),
           });
           return { errored: false, outcome: result };
         }
@@ -240,7 +270,6 @@ export const drainQueue = (
           processed.left,
           issue,
           runDeps,
-          branch,
         );
         yield* Effect.annotateCurrentSpan({
           "runway.outcome.kind": failureOutcome.kind,
@@ -250,12 +279,10 @@ export const drainQueue = (
           // from "crashed and routed to HITL" (kind=hitl,
           // errored=true) on the dashboard row.
           "runway.outcome.errored": true,
-          // VA-387: only "errored" failure outcomes land on HITL.
-          // "reverted" outcomes go back to Todo and never reach a
-          // human, so `runway.hitl.reason` would be misleading.
-          ...(failureOutcome.kind === "errored"
-            ? { "runway.hitl.reason": failureOutcome.detail }
-            : {}),
+          // VA-387 / VA-423: failure outcomes always land on HITL now;
+          // surface the reason as `runway.hitl.reason` for the
+          // dashboard detail pane.
+          "runway.hitl.reason": failureOutcome.detail,
         });
         return { errored: true, outcome: failureOutcome };
       }).pipe(
@@ -281,6 +308,7 @@ export const drainQueue = (
       } else {
         if (resolved.outcome.kind === "opened") opened += 1;
         if (resolved.outcome.kind === "hitl") hitl += 1;
+        if (resolved.outcome.kind === "skipped") skipped += 1;
       }
       outcomes.push({
         identifier: issue.identifier,
@@ -298,6 +326,7 @@ export const drainQueue = (
       "runway.drain.opened": opened,
       "runway.drain.hitl": hitl,
       "runway.drain.errored": errored,
+      "runway.drain.skipped": skipped,
     });
 
     return {
@@ -305,6 +334,7 @@ export const drainQueue = (
       opened,
       hitl,
       errored,
+      skipped,
       outcomes,
     } satisfies OrchestratorResult;
   }).pipe(Effect.withSpan("drainQueue"));
@@ -322,6 +352,29 @@ const processIssue = (
   Effect.gen(function* () {
     const { config, linear, commentAuthorAllowlist } = deps;
     const branch = `agent/${issue.identifier.toLowerCase()}`;
+
+    // VA-423: claim the issue by removing the `ready-for-agent`
+    // label BEFORE any other side-effect. The gateway returns
+    // `removed: false` when the label was already absent at read
+    // time — another runner picked the issue between fetchReady and
+    // here, or an operator removed the label. Bail out before the
+    // pickup comment / agent branch push so the losing runner
+    // doesn't post visible bookkeeping for work it didn't do.
+    //
+    // Linear's GitHub integration will move the workflow status to
+    // `In Progress` automatically when the winner's PR opens (and
+    // to `Done` when it merges), so runway no longer issues any
+    // state mutations of its own.
+    const claim = yield* linear.removeLabel(issue.id, config.readyLabel);
+    if (!claim.removed) {
+      yield* Effect.logInfo(
+        `${issue.identifier}: lost claim race — \`${config.readyLabel}\` was already absent at pickup; skipping`,
+      );
+      return {
+        kind: "skipped" as const,
+        detail: `claim race lost: \`${config.readyLabel}\` already absent at pickup`,
+      };
+    }
 
     // VA-383: fetch prior comments BEFORE posting "Runway picked up
     // this issue" so we don't see our own bookkeeping. The allowlist
@@ -346,7 +399,6 @@ const processIssue = (
           )
     );
 
-    yield* linear.transition(issue.id, config.inProgressStatus);
     yield* linear.comment(
       issue.id,
       `Runway picked up this issue. Branch: \`${branch}\`.`,
@@ -470,8 +522,8 @@ const printExitSummary = (
           ? "APPROVED → PR opened"
           : o.kind === "hitl"
             ? "HITL"
-            : o.kind === "reverted"
-              ? "REVERTED → Todo"
+            : o.kind === "skipped"
+              ? "SKIPPED (claim race lost)"
               : "INFRA_ERROR";
       console.log(`  ${o.identifier}  ${tag}  ${o.detail}`);
     }

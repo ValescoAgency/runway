@@ -165,13 +165,15 @@ export const remoteRefExists = (
 
 /**
  * VA-358: Whether the agent branch has any commits beyond `base`.
- * Used by failure-routing to distinguish "agent crashed mid-run,
- * after producing real work" (→ HITL) from "agent crashed during
- * startup, no work done" (→ revert to readyStatus). Runs with
- * `reject: false` so a missing branch / non-zero exit comes back as
- * an empty stdout (NaN > 0 → false) rather than an Effect failure;
- * the Effect only fails if execa itself throws (e.g., git binary
- * missing), and callers typically swallow that too.
+ * After VA-423 the failure-router no longer consults this predicate
+ * (every failure flips to `ready-for-human` regardless), but
+ * `pruneStaleAgentBranch` still uses it to decide whether a leftover
+ * `agent/<id>` ref carries real work worth resetting vs. an empty
+ * placeholder safe to delete. Runs with `reject: false` so a missing
+ * branch / non-zero exit comes back as an empty stdout (NaN > 0 →
+ * false) rather than an Effect failure; the Effect only fails if
+ * execa itself throws (e.g., git binary missing), and callers
+ * typically swallow that too.
  */
 export const hasCommits = (
   repoPath: string,

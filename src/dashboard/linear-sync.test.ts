@@ -12,32 +12,32 @@ import { createStorage, type Storage } from "./storage.js";
 // directly so the contract between poller and adapter stays explicit.
 
 interface FakeAdapter extends LinearAdapter {
-  todoQueueCalls: number;
+  readyQueueCalls: number;
   refreshStatusCalls: ReadonlyArray<readonly string[]>;
-  /** Queue returned by the next `getTodoQueue` invocation. */
+  /** Queue returned by the next `getReadyQueue` invocation. */
   nextQueue: readonly LinearSnapshot[];
   /** Snapshots returned by the next `refreshStatus` invocation. */
   nextRefresh: readonly LinearSnapshot[];
-  /** When true, the next `getTodoQueue` rejects. */
-  failGetTodoQueue: boolean;
+  /** When true, the next `getReadyQueue` rejects. */
+  failGetReadyQueue: boolean;
   /** When true, the next `refreshStatus` rejects. */
   failRefreshStatus: boolean;
 }
 
 function makeFakeAdapter(): FakeAdapter {
   // VA-390: keep the fake minimal and inspectable. Tests reach into
-  // `todoQueueCalls` / `refreshStatusCalls` to assert call shape,
+  // `readyQueueCalls` / `refreshStatusCalls` to assert call shape,
   // and set `nextQueue` / `nextRefresh` to drive return values.
   const state: FakeAdapter = {
-    todoQueueCalls: 0,
+    readyQueueCalls: 0,
     refreshStatusCalls: [],
     nextQueue: [],
     nextRefresh: [],
-    failGetTodoQueue: false,
+    failGetReadyQueue: false,
     failRefreshStatus: false,
-    async getTodoQueue() {
-      state.todoQueueCalls += 1;
-      if (state.failGetTodoQueue) throw new Error("linear getTodoQueue boom");
+    async getReadyQueue() {
+      state.readyQueueCalls += 1;
+      if (state.failGetReadyQueue) throw new Error("linear getReadyQueue boom");
       return state.nextQueue;
     },
     async refreshStatus(ids) {
@@ -75,7 +75,7 @@ function silentLogger(): (
 // deterministically.
 const LONG_INTERVAL = 3600;
 
-describe("startLinearSync — getTodoQueue tick (VA-390)", () => {
+describe("startLinearSync — getReadyQueue tick (VA-390)", () => {
   it("stores the Todo queue with sequential queue_position values", async () => {
     const adapter = makeFakeAdapter();
     adapter.nextQueue = [
@@ -126,7 +126,7 @@ describe("startLinearSync — getTodoQueue tick (VA-390)", () => {
       "VA-2",
     ]);
 
-    // VA-1 moved to In Progress between polls. The next getTodoQueue
+    // VA-1 moved to In Progress between polls. The next getReadyQueue
     // returns only VA-2, and VA-1 must vanish from the queue preview
     // even though we never explicitly deleted its row.
     adapter.nextQueue = [
@@ -141,9 +141,9 @@ describe("startLinearSync — getTodoQueue tick (VA-390)", () => {
     expect(all.find((s) => s.issueIdentifier === "VA-1")?.queuePosition).toBeNull();
   });
 
-  it("survives a getTodoQueue error and still calls refreshStatus on the same tick", async () => {
+  it("survives a getReadyQueue error and still calls refreshStatus on the same tick", async () => {
     const adapter = makeFakeAdapter();
-    adapter.failGetTodoQueue = true;
+    adapter.failGetReadyQueue = true;
     adapter.nextRefresh = [
       {
         identifier: "VA-7",
@@ -162,7 +162,7 @@ describe("startLinearSync — getTodoQueue tick (VA-390)", () => {
     });
     await handle.initialTick;
 
-    expect(adapter.todoQueueCalls).toBe(1);
+    expect(adapter.readyQueueCalls).toBe(1);
     expect(adapter.refreshStatusCalls).toEqual([["VA-7"]]);
     const snap = storage
       .listLinearSnapshots()
@@ -244,10 +244,10 @@ describe("startLinearSync — refreshStatus tick (VA-390)", () => {
     ).toBeUndefined();
   });
 
-  it("preserves queue_position when an identifier is in both getTodoQueue and recentIdentifiers", async () => {
+  it("preserves queue_position when an identifier is in both getReadyQueue and recentIdentifiers", async () => {
     // VA-390: an issue in Todo can also be in the recent-touched list
     // (the dashboard just opened it). The refreshStatus save path must
-    // not clobber the queue_position that getTodoQueue set on the same
+    // not clobber the queue_position that getReadyQueue set on the same
     // tick — otherwise the issue vanishes from the Todo queue preview
     // even though Linear still has it in Todo.
     const adapter = makeFakeAdapter();
@@ -335,7 +335,7 @@ describe("startLinearSync — graceful degradation (VA-390)", () => {
 
   it("a tick where both adapter methods reject still resolves without throwing", async () => {
     const adapter = makeFakeAdapter();
-    adapter.failGetTodoQueue = true;
+    adapter.failGetReadyQueue = true;
     adapter.failRefreshStatus = true;
     handle = startLinearSync({
       adapter,
@@ -363,9 +363,9 @@ describe("startLinearSync — graceful degradation (VA-390)", () => {
     await handle.initialTick;
     handle.stop();
     handle = null;
-    const seen = adapter.todoQueueCalls;
+    const seen = adapter.readyQueueCalls;
     expect(seen).toBe(1);
     await new Promise((r) => setTimeout(r, 1100));
-    expect(adapter.todoQueueCalls).toBe(seen);
+    expect(adapter.readyQueueCalls).toBe(seen);
   });
 });

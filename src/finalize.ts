@@ -1,16 +1,15 @@
 import { Effect } from "effect";
-import type { Config } from "./config.js";
 import { rebaseOntoBase } from "./git.js";
 import type { GithubError, GithubGateway } from "./github.js";
 import type { LinearError, LinearGateway, RunwayIssue } from "./linear.js";
 
 /**
  * Narrow per-phase deps: finalize is the only phase that touches
- * GitHub (push + PR) and Linear state transitions. No policy, no
- * sandcastle.
+ * GitHub (push + PR). After VA-423 it no longer mutates Linear
+ * workflow status — Linear's GitHub integration drives the status
+ * from the PR's open/merge events — so `config` is no longer a dep.
  */
 export interface FinalizeDeps {
-  readonly config: Config;
   readonly cwd: string;
   readonly baseBranch: string;
   readonly linear: LinearGateway;
@@ -77,7 +76,7 @@ export const finalize = (
   never
 > =>
   Effect.gen(function* () {
-    const { config, cwd, baseBranch, linear, github } = deps;
+    const { cwd, baseBranch, linear, github } = deps;
 
     const rebase = yield* rebaseOntoBase(cwd, baseBranch, branch).pipe(
       Effect.withSpan("rebaseOntoBase"),
@@ -111,7 +110,10 @@ export const finalize = (
         body: prBody,
       })
       .pipe(Effect.withSpan("openPullRequest"));
-    yield* linear.transition(issue.id, config.inReviewStatus);
+    // VA-423: no `linear.transition` — Linear's GitHub integration
+    // auto-transitions the issue when the PR is cross-referenced
+    // (open → In Progress; merge → Done via the `Closes <issue>`
+    // line in the PR body, see buildPrBody).
     yield* linear.comment(issue.id, `Runway opened a PR for review: ${prUrl}`);
     return { kind: "opened", detail: prUrl };
   });

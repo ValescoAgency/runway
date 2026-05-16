@@ -2,18 +2,19 @@ import { LinearClient } from "@linear/sdk";
 import type { LinearSnapshotRow, Storage } from "./storage.js";
 
 /**
- * VA-390 (dashboard slice 6): Linear sync module.
+ * VA-390 (dashboard slice 6) / VA-423: Linear sync module.
  *
  * The dashboard is otherwise read-only — it ingests OTLP spans from
  * `runway run`. This module is the one place where it reaches back to
- * Linear to surface live workflow state: the Todo queue (so operators
- * see what's about to be picked up next) and the current status of
- * recently-touched issues (so a row's badge can reflect "actually
- * In Review now" rather than the runway-side outcome at emit time).
+ * Linear to surface live workflow state: the ready queue (issues
+ * carrying `ready-for-agent`, so operators see what's about to be
+ * picked up next) and the current status of recently-touched issues
+ * (so a row's badge can reflect Linear's live status rather than the
+ * runway-side outcome at emit time).
  *
  * The module is split in two:
  *
- *   1. `LinearAdapter` — narrow async interface (`getTodoQueue`,
+ *   1. `LinearAdapter` — narrow async interface (`getReadyQueue`,
  *      `refreshStatus`) so the poller can be unit-tested with a
  *      handwritten fake. The concrete `createLinearAdapter` wraps
  *      `@linear/sdk` and is the only spot in the dashboard that talks
@@ -43,16 +44,17 @@ export interface LinearSnapshot {
  * NOT an Effect interface — keeping it `Promise<...>` lets a test
  * stub be a plain object without pulling Effect into every fixture.
  *
- * - `getTodoQueue` returns issues currently in the configured ready
- *   status (defaults to "Todo"), ordered as Linear would pick them up
- *   next. The returned array order IS the queue order.
+ * - `getReadyQueue` returns issues currently carrying the configured
+ *   `readyLabel` (defaults to `ready-for-agent`), ordered as Linear
+ *   would pick them up next. The returned array order IS the queue
+ *   order.
  *
  * - `refreshStatus` returns current snapshots for the requested
  *   identifiers. Identifiers that no longer exist in Linear are
  *   silently dropped (the dashboard renders no badge in that case).
  */
 export interface LinearAdapter {
-  getTodoQueue(): Promise<readonly LinearSnapshot[]>;
+  getReadyQueue(): Promise<readonly LinearSnapshot[]>;
   refreshStatus(
     identifiers: readonly string[],
   ): Promise<readonly LinearSnapshot[]>;
@@ -62,8 +64,13 @@ export interface LinearAdapterOptions {
   readonly apiKey: string;
   /** Linear team key (e.g. "VA"). Defaults to "VA". */
   readonly team?: string;
-  /** Workflow state name treated as "ready to pick up". Defaults to "Todo". */
-  readonly readyStatus?: string;
+  /**
+   * VA-423: label that marks an issue as "ready to pick up." Defaults
+   * to `ready-for-agent` (flightplan v1.1.0 contract). Override to
+   * mirror the value of `RUNWAY_READY_LABEL` on the runway side so
+   * the dashboard preview matches the actual drain queue.
+   */
+  readonly readyLabel?: string;
 }
 
 /**
@@ -80,7 +87,7 @@ export interface LinearAdapterOptions {
 export function createLinearAdapter(opts: LinearAdapterOptions): LinearAdapter {
   const client = new LinearClient({ apiKey: opts.apiKey });
   const teamKey = opts.team ?? "VA";
-  const readyStatus = opts.readyStatus ?? "Todo";
+  const readyLabel = opts.readyLabel ?? "ready-for-agent";
 
   async function snapshotFromIssue(raw: {
     identifier: string;
@@ -98,22 +105,17 @@ export function createLinearAdapter(opts: LinearAdapterOptions): LinearAdapter {
   }
 
   return {
-    async getTodoQueue() {
+    async getReadyQueue() {
       const teams = await client.teams({ filter: { key: { eq: teamKey } } });
       const team = teams.nodes[0];
       if (!team) return [];
-      const states = await client.workflowStates({
-        filter: {
-          team: { id: { eq: team.id } },
-          name: { eq: readyStatus },
-        },
-      });
-      const state = states.nodes[0];
-      if (!state) return [];
+      // VA-423: filter by label, not by workflow state. Mirrors the
+      // gateway's `fetchReady` contract so the dashboard preview and
+      // the actual drain queue can't diverge.
       const issues = await client.issues({
         filter: {
           team: { id: { eq: team.id } },
-          state: { id: { eq: state.id } },
+          labels: { name: { eq: readyLabel } },
         },
       });
       const out: LinearSnapshot[] = [];
@@ -213,15 +215,16 @@ export function startLinearSync(opts: LinearSyncOptions): LinearSyncHandle {
     });
 
   const tick = async (): Promise<void> => {
-    // Identifiers written by `getTodoQueue` on this tick. The
+    // Identifiers written by `getReadyQueue` on this tick. The
     // `refreshStatus` save path skips these so it doesn't clobber the
     // `queue_position` that was just set — an issue present in both
     // calls must keep its queue slot.
     const queuedIds = new Set<string>();
     try {
-      const queue = await opts.adapter.getTodoQueue();
+      const queue = await opts.adapter.getReadyQueue();
       // Wipe queue positions before saving fresh ones so issues that
-      // left Todo since the last poll stop appearing in the preview.
+      // left the ready queue since the last poll stop appearing in
+      // the preview.
       opts.storage.clearLinearQueuePositions();
       const at = new Date().toISOString();
       queue.forEach((q, i) => {
@@ -237,10 +240,10 @@ export function startLinearSync(opts: LinearSyncOptions): LinearSyncHandle {
       });
       log(
         "info",
-        `[runway dashboard] linear sync: refreshed Todo queue (${queue.length} issue${queue.length === 1 ? "" : "s"})`,
+        `[runway dashboard] linear sync: refreshed ready queue (${queue.length} issue${queue.length === 1 ? "" : "s"})`,
       );
     } catch (err) {
-      log("error", "[runway dashboard] linear sync: getTodoQueue failed", err);
+      log("error", "[runway dashboard] linear sync: getReadyQueue failed", err);
     }
 
     try {
@@ -250,10 +253,10 @@ export function startLinearSync(opts: LinearSyncOptions): LinearSyncHandle {
         const refreshed = await opts.adapter.refreshStatus(recent);
         const at = new Date().toISOString();
         for (const r of refreshed) {
-          // Skip identifiers `getTodoQueue` just wrote — saving here
+          // Skip identifiers `getReadyQueue` just wrote — saving here
           // with `queuePosition: null` would erase the freshly-set
-          // queue slot and the issue would vanish from the Todo queue
-          // preview even though it's still in Todo.
+          // queue slot and the issue would vanish from the ready
+          // queue preview even though it's still carrying the label.
           if (queuedIds.has(r.identifier)) continue;
           opts.storage.saveLinearSnapshot({
             issueIdentifier: r.identifier,

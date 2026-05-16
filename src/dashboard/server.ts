@@ -787,7 +787,7 @@ export async function main(): Promise<void> {
     const adapter = createLinearAdapter({
       apiKey: linearApiKey,
       team: process.env.RUNWAY_LINEAR_TEAM,
-      readyStatus: process.env.RUNWAY_READY_STATUS,
+      readyLabel: process.env.RUNWAY_READY_LABEL,
     });
     const intervalSeconds =
       parsePositiveInt(process.env.LINEAR_POLL_INTERVAL_SECONDS) ?? 300;
@@ -797,7 +797,7 @@ export async function main(): Promise<void> {
       intervalSeconds,
     });
     console.log(
-      `[runway dashboard] linear sync: polling every ${intervalSeconds}s (team=${process.env.RUNWAY_LINEAR_TEAM ?? "VA"} ready=${process.env.RUNWAY_READY_STATUS ?? "Todo"})`,
+      `[runway dashboard] linear sync: polling every ${intervalSeconds}s (team=${process.env.RUNWAY_LINEAR_TEAM ?? "VA"} label=${process.env.RUNWAY_READY_LABEL ?? "ready-for-agent"})`,
     );
   } else {
     console.log(

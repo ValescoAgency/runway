@@ -28,6 +28,10 @@ beforeEach(() => {
   process.env.LINEAR_API_KEY = "test-key";
 });
 
+// VA-423: workflow-state checks retired alongside the status-mutation
+// model. The doctor now verifies the team plus the two labels
+// (`ready-for-agent`, `ready-for-human`) that drive pickup and HITL.
+
 describe("linearConfigDiagnostic", () => {
   it("emits a single skip when LINEAR_API_KEY is unset", async () => {
     delete process.env.LINEAR_API_KEY;
@@ -42,10 +46,8 @@ describe("linearConfigDiagnostic", () => {
   it("emits fail + 2 skips when the team is missing", async () => {
     loadConfigMock.mockReturnValue({
       linearTeam: "VA",
-      readyStatus: "Todo",
-      inProgressStatus: "In Progress",
-      inReviewStatus: "In Review",
-      hitlLabel: "needs-human",
+      readyLabel: "ready-for-agent",
+      hitlLabel: "ready-for-human",
     });
     validateLinearConfigMock.mockResolvedValue({
       team: { kind: "missing", key: "VA" },
@@ -55,39 +57,31 @@ describe("linearConfigDiagnostic", () => {
     expect(results[0]?.detail).toContain('"VA" not found');
   });
 
-  it("emits team-ok + 3 state results + hitl-label result when everything is configured", async () => {
+  it("emits team-ok + ready-label-ok + hitl-label-ok when everything is configured", async () => {
     loadConfigMock.mockReturnValue({
       linearTeam: "VA",
-      readyStatus: "Todo",
-      inProgressStatus: "In Progress",
-      inReviewStatus: "In Review",
-      hitlLabel: "needs-human",
+      readyLabel: "ready-for-agent",
+      hitlLabel: "ready-for-human",
     });
     validateLinearConfigMock.mockResolvedValue({
       team: { kind: "ok", id: "team-uuid" },
-      readyStatus: { kind: "ok" },
-      inProgressStatus: { kind: "ok" },
-      inReviewStatus: { kind: "ok" },
+      readyLabel: { kind: "ok" },
       hitlLabel: { kind: "ok" },
     });
     const results = await linearConfigDiagnostic.run(ctx);
-    expect(results).toHaveLength(5);
+    expect(results).toHaveLength(3);
     expect(results.every((r) => r.status === "ok")).toBe(true);
   });
 
   it("emits fail with the available list when the HITL label isn't on the team", async () => {
     loadConfigMock.mockReturnValue({
       linearTeam: "VA",
-      readyStatus: "Todo",
-      inProgressStatus: "In Progress",
-      inReviewStatus: "In Review",
-      hitlLabel: "needs-human",
+      readyLabel: "ready-for-agent",
+      hitlLabel: "missing-label-on-purpose",
     });
     validateLinearConfigMock.mockResolvedValue({
       team: { kind: "ok", id: "team-uuid" },
-      readyStatus: { kind: "ok" },
-      inProgressStatus: { kind: "ok" },
-      inReviewStatus: { kind: "ok" },
+      readyLabel: { kind: "ok" },
       hitlLabel: {
         kind: "missing",
         available: ["bug", "feature", "ready-for-human"],
@@ -99,5 +93,29 @@ describe("linearConfigDiagnostic", () => {
       status: "fail",
       detail: expect.stringContaining("ready-for-human"),
     });
+    expect(hitl?.detail).toContain("RUNWAY_HITL_LABEL");
+  });
+
+  it("emits fail with the available list when the ready label isn't on the team", async () => {
+    loadConfigMock.mockReturnValue({
+      linearTeam: "VA",
+      readyLabel: "ready-for-agent",
+      hitlLabel: "ready-for-human",
+    });
+    validateLinearConfigMock.mockResolvedValue({
+      team: { kind: "ok", id: "team-uuid" },
+      readyLabel: {
+        kind: "missing",
+        available: ["bug", "feature", "ready-for-human"],
+      },
+      hitlLabel: { kind: "ok" },
+    });
+    const results = await linearConfigDiagnostic.run(ctx);
+    const ready = results.find((r) => r.label.includes("ready"));
+    expect(ready).toMatchObject({
+      status: "fail",
+      detail: expect.stringContaining("ready-for-human"),
+    });
+    expect(ready?.detail).toContain("RUNWAY_READY_LABEL");
   });
 });

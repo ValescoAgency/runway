@@ -27,10 +27,6 @@ const IssueNodeSchema = Schema.Struct({
   // comparison.
   priority: Schema.Number,
 });
-const WorkflowStateNodeSchema = Schema.Struct({
-  id: Schema.String,
-  name: Schema.String,
-});
 const TeamNodeSchema = Schema.Struct({
   id: Schema.String,
   key: Schema.String,
@@ -83,7 +79,6 @@ const ViewerSchema = Schema.Struct({
 });
 
 const decodeIssueNode = Schema.decodeUnknownSync(IssueNodeSchema);
-const decodeWorkflowStateNode = Schema.decodeUnknownSync(WorkflowStateNodeSchema);
 const decodeTeamNode = Schema.decodeUnknownSync(TeamNodeSchema);
 const decodeIssueLabelNode = Schema.decodeUnknownSync(IssueLabelNodeSchema);
 const decodeProjectNode = Schema.decodeUnknownSync(ProjectNodeSchema);
@@ -348,14 +343,34 @@ function classifyLinearError(err: unknown, context: string): LinearError {
 
 export interface LinearGateway {
   fetchReady(): Effect.Effect<readonly RunwayIssue[], LinearError>;
-  transition(
-    issueId: string,
-    statusName: string,
-  ): Effect.Effect<void, LinearError>;
   applyLabel(
     issueId: string,
     labelName: string,
   ): Effect.Effect<void, LinearError>;
+  /**
+   * VA-423: remove `labelName` from `issueId`. Used by the
+   * orchestrator to claim an issue at pickup time (remove
+   * `ready-for-agent`) — the claim signal that takes the issue out
+   * of the next drain's queue.
+   *
+   * Returns `{ removed }` so the caller can detect a lost claim
+   * race: when the label was already absent at the time of the read
+   * (another runner picked the issue first, or an operator removed
+   * the label manually), the gateway short-circuits the write and
+   * returns `removed: false`. The orchestrator treats `removed:
+   * false` as "skip this issue" so the loser doesn't proceed to
+   * post a pickup comment or push an agent branch.
+   *
+   * Caveat: this is NOT a true CAS — Linear's `updateIssue` is a
+   * full set assignment with no version field. Two runners that
+   * both read the labels before either has written can both report
+   * `removed: true`; the design assumes the predominant operator
+   * pattern of a single drain instance running sequentially.
+   */
+  removeLabel(
+    issueId: string,
+    labelName: string,
+  ): Effect.Effect<{ readonly removed: boolean }, LinearError>;
   comment(issueId: string, body: string): Effect.Effect<void, LinearError>;
   /**
    * VA-383: fetch every comment on an issue, ordered ascending by
@@ -394,42 +409,11 @@ export interface LinearGateway {
 export function createLinearGateway(
   config: Config,
   limiter: RateLimiter.RateLimiter | null = null,
-  opts: {
-    /**
-     * VA-421: predicate the gateway uses to decide whether an
-     * In-Progress candidate has a real agent branch pushed to origin.
-     * Injected so `linear.ts` stays testable without git; production
-     * wires `(branch) => Effect.runPromise(remoteRefExists(cwd,
-     * branch))` from `commands/run.ts`. When omitted, `fetchReady`
-     * keeps its pre-VA-421 behavior (Todo only) — used by every unit
-     * test and tolerated as a fallback when the caller hasn't been
-     * updated yet.
-     */
-    readonly remoteAgentBranchExists?: (branch: string) => Promise<boolean>;
-  } = {},
 ): LinearGateway {
   const client = new LinearClient({ apiKey: Redacted.value(config.linearApiKey) });
   const gate = <A>(
     eff: Effect.Effect<A, LinearError>,
   ): Effect.Effect<A, LinearError> => (limiter ? limiter(eff) : eff);
-
-  async function findStateId(teamId: string, name: string): Promise<string> {
-    const states = await client.workflowStates({
-      filter: { team: { id: { eq: teamId } }, name: { eq: name } },
-    });
-    const rawState = states.nodes[0];
-    if (!rawState) {
-      throw new LinearNotFound({
-        resource: "state",
-        identifier: name,
-        message: `Linear workflow state "${name}" not found on team ${teamId}`,
-      });
-    }
-    // VA-360: validate the SDK shape. `decodeWorkflowStateNode` throws
-    // `ParseError` on drift, which `classifyLinearError` maps to
-    // `LinearSchemaError` (non-retryable).
-    return decodeWorkflowStateNode(rawState).id;
-  }
 
   async function findTeamId(): Promise<string> {
     const teams = await client.teams({
@@ -478,48 +462,28 @@ export function createLinearGateway(
         Effect.tryPromise({
           try: async () => {
             const teamId = await findTeamId();
-            const readyStateId = await findStateId(teamId, config.readyStatus);
             const projectId = config.linearProject
               ? await findProjectId(config.linearProject)
               : null;
-            // VA-421: optionally accept In-Progress issues whose
-            // `agent/<id>` branch hasn't been pushed to origin yet.
-            // Linear's GitHub integration auto-transitions issues to
-            // In-Progress on unrelated PR-body mentions, which used
-            // to silently drop them from the drain queue. The
-            // git-side check is the authoritative signal that no
-            // successful drain attempt is in flight.
-            const inProgressStateId = opts.remoteAgentBranchExists
-              ? await findStateId(teamId, config.inProgressStatus)
-              : null;
-            const issuesFilter = (stateId: string) => ({
-              team: { id: { eq: teamId } },
-              state: { id: { eq: stateId } },
-              ...(projectId ? { project: { id: { eq: projectId } } } : {}),
-            });
-            const todoBatch = await client.issues({
-              filter: issuesFilter(readyStateId),
+            // VA-423: drain queue is gated by `config.readyLabel`
+            // (default `ready-for-agent`, the flightplan v1.1.0
+            // contract). Status is intentionally NOT filtered — Linear
+            // auto-mutates status on PR cross-references, which used
+            // to silently drop issues from a status-gated queue every
+            // time someone mentioned the issue from a PR. Labels are
+            // immune to that integration.
+            const batch = await client.issues({
+              filter: {
+                team: { id: { eq: teamId } },
+                labels: { name: { eq: config.readyLabel } },
+                ...(projectId ? { project: { id: { eq: projectId } } } : {}),
+              },
               // VA-420: order doesn't matter at the SDK call — Linear's
               // `IssueOrderBy` enum doesn't expose `priority`, and the
               // SDK type for this argument hides the ASC/DESC direction
               // anyway. We re-sort the candidate set in JS below.
               orderBy: "createdAt" as never,
             });
-            const inProgressBatch = inProgressStateId
-              ? await client.issues({
-                  filter: issuesFilter(inProgressStateId),
-                  orderBy: "createdAt" as never,
-                })
-              : { nodes: [] as typeof todoBatch.nodes };
-            const tagged = [
-              ...todoBatch.nodes.map(
-                (raw) => ({ raw, kind: "todo" as const }),
-              ),
-              ...inProgressBatch.nodes.map(
-                (raw) => ({ raw, kind: "inProgress" as const }),
-              ),
-            ];
-            const issues = { nodes: tagged };
             // VA-420: drain by Linear priority first, then by createdAt
             // within a priority bucket. Linear's priority encoding is
             // non-monotonic — `1 = Urgent, 2 = High, 3 = Medium,
@@ -527,53 +491,48 @@ export function createLinearGateway(
             // `Infinity` to sit behind every prioritised bucket
             // (operator intuition: Urgent first, unprioritised last).
             // Within a bucket, oldest-first restores the FIFO intent.
-            const candidates = [...issues.nodes].sort((a, b) => {
-              const pa = a.raw.priority === 0 ? Infinity : a.raw.priority;
-              const pb = b.raw.priority === 0 ? Infinity : b.raw.priority;
+            const candidates = [...batch.nodes].sort((a, b) => {
+              const pa = a.priority === 0 ? Infinity : a.priority;
+              const pb = b.priority === 0 ? Infinity : b.priority;
               if (pa !== pb) return pa - pb;
               return (
-                new Date(a.raw.createdAt).getTime() -
-                new Date(b.raw.createdAt).getTime()
+                new Date(a.createdAt).getTime() -
+                new Date(b.createdAt).getTime()
               );
             });
             // VA-360: validate every issue node through the schema —
             // a single drifted issue surfaces as `LinearSchemaError`
             // instead of a downstream `cannot read property X`.
             //
-            // VA-394: per-candidate eligibility — skip issues carrying
-            // `config.hitlLabel` (triage's "human-only" marker, also
-            // applied by runway itself on prior HITL escapes), and
-            // skip issues with at least one active `blocks` relation
-            // pointing at them. The candidate set is the Todo queue,
-            // typically a handful of issues; the N+1 SDK calls per
-            // candidate go through the rate limiter and the retry
-            // policy alongside everything else.
+            // VA-394 / VA-423 per-candidate eligibility:
+            // - skip issues carrying `config.hitlLabel` (triage's
+            //   `ready-for-human` marker; also covers the AC case
+            //   "issue carries BOTH `ready-for-agent` and
+            //   `ready-for-human` → treat as ready-for-human, skip");
+            // - skip issues whose `ready-for-agent` label was just
+            //   stripped (defensive: the GraphQL filter narrows the
+            //   set, but eventual consistency or a label change
+            //   between query and per-candidate fetch can return an
+            //   issue that no longer qualifies);
+            // - skip issues with at least one active `blocks`
+            //   relation pointing at them;
+            // - skip parent PRDs (issues with sub-issues — agents
+            //   should pick up the children, not the umbrella).
+            // The candidate set is typically a handful of issues;
+            // the N+1 SDK calls go through the rate limiter and
+            // retry policy alongside everything else.
             const eligible: RunwayIssue[] = [];
-            for (const { raw, kind } of candidates) {
+            for (const raw of candidates) {
               const i = decodeIssueNode(raw);
               const labels = await fetchIssueLabelNames(raw);
+              if (!labels.includes(config.readyLabel)) continue;
               if (labels.includes(config.hitlLabel)) continue;
               if (await hasActiveBlocker(raw)) continue;
-              // VA-425: parents (issues with one or more sub-issues)
-              // are PRDs / umbrella tickets — agents should pick up
-              // the children, not the parent. Skipped regardless of
-              // workflow state, since In-Progress parents in particular
-              // are the failure mode that motivated this check.
               if (await hasChildIssues(raw)) {
                 console.debug(
                   `[runway] fetchReady: skipping ${i.identifier} — has child sub-issues (PRD / umbrella ticket)`,
                 );
                 continue;
-              }
-              // VA-421: In-Progress candidates pass only if no
-              // `agent/<id>` ref exists on origin — that's the
-              // authoritative "no drain attempt in flight" signal,
-              // immune to Linear's auto-transitions. Todo candidates
-              // skip this check (no behavior change for the common
-              // path).
-              if (kind === "inProgress" && opts.remoteAgentBranchExists) {
-                const branch = `agent/${i.identifier.toLowerCase()}`;
-                if (await opts.remoteAgentBranchExists(branch)) continue;
               }
               eligible.push({
                 id: i.id,
@@ -588,28 +547,6 @@ export function createLinearGateway(
           catch: (err) => classifyLinearError(err, "fetchReady"),
         }),
         { call: "fetchReady" },
-      ));
-    },
-
-    transition(issueId, statusName) {
-      return gate(applyLinearPolicy(
-        Effect.tryPromise({
-          try: async () => {
-            const issue = await client.issue(issueId);
-            const team = await issue.team;
-            if (!team) {
-              throw new LinearNotFound({
-                resource: "issue",
-                identifier: issueId,
-                message: `Issue ${issueId} has no team`,
-              });
-            }
-            const stateId = await findStateId(team.id, statusName);
-            await client.updateIssue(issueId, { stateId });
-          },
-          catch: (err) => classifyLinearError(err, `transition(${statusName})`),
-        }),
-        { call: `transition(${statusName})` },
       ));
     },
 
@@ -675,6 +612,45 @@ export function createLinearGateway(
       ));
     },
 
+    // VA-423: pickup-time claim signal. The orchestrator calls this
+    // with `config.readyLabel` (`ready-for-agent`) once an issue is
+    // chosen for processing. When the label was present at read
+    // time we issue the write and return `removed: true` (claim
+    // won); when the label was already absent we short-circuit and
+    // return `removed: false` (claim lost — another runner picked
+    // it first, or operator-removed). The orchestrator uses the
+    // returned signal to skip a losing run before it does any of
+    // the work that would be visible to a human (pickup comment,
+    // agent branch push, etc.).
+    //
+    // Not truly atomic — see the interface doc for the residual
+    // race window.
+    removeLabel(issueId, labelName) {
+      return gate(applyLinearPolicy(
+        Effect.tryPromise({
+          try: async () => {
+            const issue = await client.issue(issueId);
+            const existing = await issue.labels();
+            const existingDecoded = existing.nodes.map((l) =>
+              decodeIssueLabelNode(l),
+            );
+            const remaining = existingDecoded.filter(
+              (l) => l.name !== labelName,
+            );
+            if (remaining.length === existingDecoded.length) {
+              return { removed: false } as const;
+            }
+            await client.updateIssue(issueId, {
+              labelIds: remaining.map((l) => l.id),
+            });
+            return { removed: true } as const;
+          },
+          catch: (err) => classifyLinearError(err, `removeLabel(${labelName})`),
+        }),
+        { call: `removeLabel(${labelName})` },
+      ));
+    },
+
     comment(issueId, body) {
       return gate(applyLinearPolicy(
         Effect.tryPromise({
@@ -737,26 +713,27 @@ export function createLinearGateway(
 }
 
 /**
- * VA-354: read-only preflight that surfaces every Linear-side
- * misconfiguration `runway run` would hit. Returns a structured
- * result; the caller (currently `runway doctor`) decides how to
- * render. The returned `availableLabels` are sampled (max 50) so a
- * red ✗ on a missing label can show the operator what IS there.
+ * VA-354 / VA-423: read-only preflight that surfaces every
+ * Linear-side misconfiguration `runway run` would hit. Returns a
+ * structured result; the caller (currently `runway doctor`) decides
+ * how to render. The returned `available` lists are sampled (max 50)
+ * so a red ✗ on a missing label can show the operator what IS there.
+ *
+ * After VA-423, runway's queue contract is label-gated — the doctor
+ * verifies that `readyLabel` and `hitlLabel` both exist; workflow
+ * states are no longer part of the runway contract (Linear's GitHub
+ * integration drives status from PR events, and runway no longer
+ * issues any state mutations).
  */
 export interface LinearValidationResult {
   readonly team:
     | { kind: "ok"; id: string }
     | { kind: "missing"; key: string };
-  readonly readyStatus: StateValidation;
-  readonly inProgressStatus: StateValidation;
-  readonly inReviewStatus: StateValidation;
-  readonly hitlLabel:
-    | { kind: "ok"; name: string }
-    | { kind: "missing"; name: string; available: readonly string[] }
-    | { kind: "skipped"; reason: string };
+  readonly readyLabel: LabelValidation;
+  readonly hitlLabel: LabelValidation;
 }
 
-type StateValidation =
+type LabelValidation =
   | { kind: "ok"; name: string }
   | { kind: "missing"; name: string; available: readonly string[] }
   | { kind: "skipped"; reason: string };
@@ -773,40 +750,24 @@ export async function validateLinearConfig(
   if (!team) {
     return {
       team: { kind: "missing", key: config.linearTeam },
-      readyStatus: { kind: "skipped", reason: "team missing" },
-      inProgressStatus: { kind: "skipped", reason: "team missing" },
-      inReviewStatus: { kind: "skipped", reason: "team missing" },
+      readyLabel: { kind: "skipped", reason: "team missing" },
       hitlLabel: { kind: "skipped", reason: "team missing" },
     };
   }
-
-  const states = await client.workflowStates({
-    filter: { team: { id: { eq: team.id } } },
-  });
-  const stateNames = states.nodes.map((s) => s.name);
-  const checkState = (want: string): StateValidation =>
-    stateNames.includes(want)
-      ? { kind: "ok", name: want }
-      : { kind: "missing", name: want, available: stateNames };
 
   // Accept labels scoped to this team OR workspace-level labels (team: null).
   const labels = await client.issueLabels({
     filter: { or: [{ team: { id: { eq: team.id } } }, { team: { null: true } }] },
   });
   const labelNames = labels.nodes.map((l) => l.name);
-  const hitlLabel = labelNames.includes(config.hitlLabel)
-    ? { kind: "ok" as const, name: config.hitlLabel }
-    : {
-        kind: "missing" as const,
-        name: config.hitlLabel,
-        available: labelNames.slice(0, 50),
-      };
+  const checkLabel = (want: string): LabelValidation =>
+    labelNames.includes(want)
+      ? { kind: "ok", name: want }
+      : { kind: "missing", name: want, available: labelNames.slice(0, 50) };
 
   return {
     team: { kind: "ok", id: team.id },
-    readyStatus: checkState(config.readyStatus),
-    inProgressStatus: checkState(config.inProgressStatus),
-    inReviewStatus: checkState(config.inReviewStatus),
-    hitlLabel,
+    readyLabel: checkLabel(config.readyLabel),
+    hitlLabel: checkLabel(config.hitlLabel),
   };
 }
