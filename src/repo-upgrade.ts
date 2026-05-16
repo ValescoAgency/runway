@@ -8,6 +8,7 @@ import {
 } from "./scaffolder.js";
 import { buildAgentImage } from "./scaffolder-image.js";
 import { preflight } from "./scaffolder-preflight.js";
+import { writeShim } from "./scaffolder-varlock.js";
 import { verify } from "./scaffolder-verify.js";
 
 /**
@@ -229,6 +230,24 @@ function renderDockerfile(
 }
 
 // ---------------------------------------------------------------------------
+// Render: .sandcastle/runway-claude-shim (tier 2, VA-426)
+// ---------------------------------------------------------------------------
+
+// VA-426: the Dockerfile rendered above references
+// `COPY runway-claude-shim …`, so tier-2 upgrades must materialise the
+// shim file alongside the Dockerfile/.env.schema re-render — otherwise
+// the post-render `docker build` verification step fails. `init` writes
+// the shim via `applyVarlockLayer`; `upgrade-repo` historically skipped
+// that step entirely. Reuse the same `writeShim` helper here so the two
+// paths can't drift again.
+function renderShim(cwd: string): FileChange {
+  const shimPath = join(cwd, ".sandcastle", "runway-claude-shim");
+  const before = existsSync(shimPath) ? readFileSync(shimPath, "utf8") : "";
+  const after = readFileSync(join(TEMPLATES_DIR, "claude-shim.sh"), "utf8");
+  return diffStat(shimPath, ".sandcastle/runway-claude-shim", before, after);
+}
+
+// ---------------------------------------------------------------------------
 // Render: .env.schema (tier 2)
 // ---------------------------------------------------------------------------
 
@@ -356,10 +375,12 @@ export async function upgradeRepo(
   const dockerfileChange = renderDockerfile(cwd, tier, opts, !opts.check);
 
   let schemaChange: FileChange | null = null;
+  let shimChange: FileChange | null = null;
   let resolved: ResolvedOpRefs | null = null;
   if (tier === 2) {
     resolved = resolveOpRefs(cwd, opts);
     schemaChange = renderEnvSchema(cwd, resolved);
+    shimChange = renderShim(cwd);
   }
 
   // Sandcastle .env warn-once (tier-1 leftover).
@@ -370,7 +391,7 @@ export async function upgradeRepo(
     );
   }
 
-  const changes = [dockerfileChange, schemaChange].filter(
+  const changes = [dockerfileChange, schemaChange, shimChange].filter(
     (c): c is FileChange => c !== null && c.before !== c.after,
   );
 
@@ -389,10 +410,16 @@ export async function upgradeRepo(
     process.exit(1);
   }
 
-  // Write files.
+  // Write files. The shim needs mode 0755 so the docker COPY preserves
+  // the execute bit — route it through `writeShim` (the same helper
+  // `init` uses) instead of the plain `writeFileSync` path.
   for (const c of changes) {
-    writeFileSync(c.path, c.after);
-    console.log(`  ✓ wrote ${c.relPath}`);
+    if (c.relPath === ".sandcastle/runway-claude-shim") {
+      writeShim(cwd);
+    } else {
+      writeFileSync(c.path, c.after);
+      console.log(`  ✓ wrote ${c.relPath}`);
+    }
   }
 
   if (!opts.skipBuild) {

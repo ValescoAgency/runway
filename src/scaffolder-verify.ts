@@ -68,11 +68,30 @@ export async function verify(
   ok(".env.schema contains no inline secrets");
 
   const dockerfile = readFileSync(join(cwd, ".sandcastle", "Dockerfile"), "utf8");
-  if (!dockerfile.includes("varlock run --env-file"))
-    fail("Dockerfile not patched with varlock shim");
+  // Post-VA-413 the Dockerfile no longer inlines the shim (`varlock
+  // run …` lives inside the vendored `.sandcastle/runway-claude-shim`
+  // file). It does still rename the binary and COPY the vendored shim
+  // over it, so those are the two on-Dockerfile signals.
+  if (!dockerfile.includes("COPY runway-claude-shim"))
+    fail("Dockerfile not patched with claude-shim COPY (run `runway upgrade-repo --force`)");
   if (!dockerfile.includes("/home/agent/.local/bin/claude.real"))
     fail("Dockerfile shim not in expected layout");
-  ok("Dockerfile patched with varlock + claude shim");
+  ok("Dockerfile patched with claude-shim COPY");
+
+  // VA-426 (sibling): the COPY above points at
+  // `.sandcastle/runway-claude-shim`, which `runway init` and
+  // `runway upgrade-repo` both materialise. Confirm it landed on disk
+  // and carries the wrapper's signal lines so a truncated/empty file
+  // doesn't slip past verify and trip on `docker build` instead.
+  const shimPath = join(cwd, ".sandcastle", "runway-claude-shim");
+  if (!existsSync(shimPath))
+    fail(".sandcastle/runway-claude-shim missing (run `runway upgrade-repo --force`)");
+  const shim = readFileSync(shimPath, "utf8");
+  if (!shim.includes("varlock run --env-file"))
+    fail(".sandcastle/runway-claude-shim doesn't invoke varlock — stale file?");
+  if (!shim.includes("claude.real"))
+    fail(".sandcastle/runway-claude-shim doesn't exec claude.real — stale file?");
+  ok(".sandcastle/runway-claude-shim present and wraps claude.real via varlock");
 
   if (existsSync(join(cwd, ".sandcastle", ".env"))) {
     fail(".sandcastle/.env still on disk — tier 2 deletes it");
