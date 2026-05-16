@@ -8,6 +8,10 @@ import type {
   CapturedReviewerReport,
   MetaDashboardRead,
 } from "../dashboard-read.js";
+import {
+  shouldRunIRA,
+  type MetaFilterThresholds,
+} from "../heuristic-filter.js";
 import type { MetaLinearGateway } from "../linear-meta.js";
 import { callRunReview, type AnthropicError } from "../llm.js";
 import {
@@ -43,6 +47,9 @@ export interface RunReviewPassDeps {
   readonly dashboardRead: MetaDashboardRead;
   readonly metaLinear: MetaLinearGateway;
   readonly storage: Storage;
+  // VA-404: optional override of the heuristic-filter thresholds.
+  // Undefined → DEFAULT_META_FILTER_THRESHOLDS.
+  readonly metaFilterThresholds?: MetaFilterThresholds;
 }
 
 export interface RunReviewPassArgs {
@@ -59,6 +66,11 @@ export type RunReviewPassOutcome =
     }
   | {
       readonly kind: "failed";
+      readonly metaReviewId: string;
+      readonly reason: string;
+    }
+  | {
+      readonly kind: "skipped";
       readonly metaReviewId: string;
       readonly reason: string;
     };
@@ -94,6 +106,15 @@ export const runRunReviewPass = (
       );
     }
     const ctx: RunReviewContext = contextResult.right.context;
+
+    // 1.5) VA-404: heuristic pre-filter. Uneventful runs (clean
+    //      one-iteration merges) skip the LLM call entirely — write a
+    //      `meta-skipped` row and exit. No Linear issue. Saves spend
+    //      and noise on the meta-project view.
+    const decision = shouldRunIRA(ctx, deps.metaFilterThresholds);
+    if (!decision.run) {
+      return yield* writeSkippedRow(args, deps, decision.reason);
+    }
 
     // 2) Call the IRA LLM with a structured prompt. The `callRunReview`
     //    helper bakes in the version-handshake parse. Errors that
@@ -177,6 +198,26 @@ export const runRunReviewPass = (
 // ---------------------------------------------------------------------------
 // Helpers — stub-and-continue, prompt assembly, error formatting
 // ---------------------------------------------------------------------------
+
+const writeSkippedRow = (
+  args: RunReviewPassArgs,
+  deps: RunReviewPassDeps,
+  reason: string,
+): Effect.Effect<RunReviewPassOutcome, never, never> =>
+  Effect.sync(() => {
+    const metaReviewId = randomUUID();
+    deps.storage.saveMetaReview({
+      id: metaReviewId,
+      kind: "meta-skipped",
+      scope: args.issueIdentifier,
+      drainId: args.traceId,
+      issueId: args.issueIdentifier,
+      contentJson: JSON.stringify({ reason }),
+      templateVersion: RUN_REVIEW_VERSION,
+      createdAt: nowIso(),
+    });
+    return { kind: "skipped", metaReviewId, reason };
+  });
 
 const writeFailedStub = (
   args: RunReviewPassArgs,

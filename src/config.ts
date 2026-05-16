@@ -120,6 +120,18 @@ export interface RunwayConfig {
    * env → `.runway/config.yml` → `"runway-meta"` default.
    */
   readonly metaProjectName?: string;
+  /**
+   * VA-404: one-off override for the IRA heuristic-filter
+   * thresholds. Operators tuning thresholds for real edit
+   * `.runway/config.yml`; this env var is for one-shot overrides
+   * (e.g. running a single `runway review run` with `minIterationCount=1`
+   * to force a Review on a clean run for debugging). Source:
+   * `RUNWAY_META_FILTER_THRESHOLDS` as a JSON object — partial
+   * overrides supported (set just one field, the other falls
+   * through to the file / hardcoded default). Resolution lives in
+   * `meta/runner.ts` alongside the other meta knobs.
+   */
+  readonly metaFilterThresholds?: { readonly minIterationCount?: number; readonly minReviewerRejections?: number };
 }
 
 // Back-compat alias — existing consumers (orchestrator, gateways)
@@ -185,6 +197,9 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
   ),
   metaReviewModel: EConfig.option(EConfig.string("RUNWAY_META_REVIEW_MODEL")),
   metaProjectName: EConfig.option(EConfig.string("RUNWAY_META_PROJECT_NAME")),
+  metaFilterThresholdsJson: EConfig.option(
+    EConfig.string("RUNWAY_META_FILTER_THRESHOLDS"),
+  ),
 }).pipe(
   Effect.map(
     (raw): RunwayConfig => ({
@@ -208,6 +223,9 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
         .filter(Boolean),
       metaReviewModel: Option.getOrUndefined(raw.metaReviewModel),
       metaProjectName: Option.getOrUndefined(raw.metaProjectName),
+      metaFilterThresholds: parseMetaFilterThresholdsJson(
+        Option.getOrUndefined(raw.metaFilterThresholdsJson),
+      ),
     }),
   ),
 );
@@ -279,4 +297,37 @@ export function loadConfig(
   return Effect.runSync(
     configEffect.pipe(Effect.withConfigProvider(providerFromEnv(env))),
   );
+}
+
+// VA-404: parse the optional `RUNWAY_META_FILTER_THRESHOLDS` env JSON.
+// Malformed JSON or out-of-range numbers are silently ignored —
+// per-threshold env vars are an anti-feature; if the operator wants
+// safety they edit `.runway/config.yml`. We accept partial objects.
+function parseMetaFilterThresholdsJson(
+  raw: string | undefined,
+):
+  | { readonly minIterationCount?: number; readonly minReviewerRejections?: number }
+  | undefined {
+  if (!raw) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return undefined;
+  }
+  const obj = parsed as Record<string, unknown>;
+  const out: { minIterationCount?: number; minReviewerRejections?: number } = {};
+  if (typeof obj.minIterationCount === "number" && obj.minIterationCount >= 1) {
+    out.minIterationCount = Math.floor(obj.minIterationCount);
+  }
+  if (
+    typeof obj.minReviewerRejections === "number" &&
+    obj.minReviewerRejections >= 1
+  ) {
+    out.minReviewerRejections = Math.floor(obj.minReviewerRejections);
+  }
+  return Object.keys(out).length === 0 ? undefined : out;
 }

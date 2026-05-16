@@ -55,6 +55,10 @@ const makeGateway = (
         payload: "{}",
       }),
     ),
+    // VA-404 follow-up: review-attempt count gateway. Default 1 in
+    // the makeGateway helper so existing tests don't have to think
+    // about it; tests that care about retry detection override.
+    countReviewAttempts: vi.fn(() => Effect.succeed(1)),
     ...over,
   }) as unknown as MetaDashboardRead;
 
@@ -147,5 +151,46 @@ describe("loadContextFor — pass: run-review (VA-402)", () => {
     expect(result.context.reviewerReport.ok).toBe(false);
     if (result.context.reviewerReport.ok) return;
     expect(result.context.reviewerReport.kind).toBe("missing");
+  });
+
+  // VA-404 follow-up: the review-attempt count is a first-class
+  // gateway read; widens RunReviewContext so the heuristic filter
+  // can detect retry-then-success runs that the outcomeKind clauses
+  // alone would miss.
+
+  it("propagates the review attempt count from the gateway", async () => {
+    const gateway = makeGateway({
+      countReviewAttempts: vi.fn(() =>
+        Effect.succeed(3),
+      ) as unknown as MetaDashboardRead["countReviewAttempts"],
+    });
+    const result = await Effect.runPromise(
+      loadContextFor(
+        { pass: "run-review", traceId: "trace-abc", issueIdentifier: "VA-401" },
+        gateway,
+      ),
+    );
+    if (result.pass !== "run-review") return;
+    expect(result.context.reviewAttemptCount).toBe(3);
+  });
+
+  it("degrades a countReviewAttempts gateway error to 0 (conservative)", async () => {
+    const gateway = makeGateway({
+      countReviewAttempts: vi.fn(() =>
+        Effect.fail({
+          _tag: "MetaReadDatabaseError" as const,
+          call: "countReviewAttempts",
+          message: "i/o error",
+        }),
+      ) as unknown as MetaDashboardRead["countReviewAttempts"],
+    });
+    const result = await Effect.runPromise(
+      loadContextFor(
+        { pass: "run-review", traceId: "trace-abc", issueIdentifier: "VA-401" },
+        gateway,
+      ),
+    );
+    if (result.pass !== "run-review") return;
+    expect(result.context.reviewAttemptCount).toBe(0);
   });
 });

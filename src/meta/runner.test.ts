@@ -96,4 +96,56 @@ describe("resolveMetaConfig (VA-402)", () => {
     expect(r.metaProjectName).toBe("ira-meta-from-file");
     expect(r.source.project).toBe(".runway/config.yml");
   });
+
+  // VA-404: threshold resolution mirrors the model/project chain.
+  it("falls back to default thresholds when nothing is set", () => {
+    const r = resolveMetaConfig({ config: baseConfig(), cwd });
+    expect(r.metaFilterThresholds.minIterationCount).toBe(3);
+    expect(r.metaFilterThresholds.minReviewerRejections).toBe(2);
+    expect(r.source.thresholds).toBe("default");
+  });
+
+  it("reads metaFilterThresholds from .runway/config.yml", () => {
+    writeFile(
+      [
+        "metaFilterThresholds:",
+        "  minIterationCount: 5",
+        "  minReviewerRejections: 4",
+      ].join("\n"),
+    );
+    const r = resolveMetaConfig({ config: baseConfig(), cwd });
+    expect(r.metaFilterThresholds.minIterationCount).toBe(5);
+    expect(r.metaFilterThresholds.minReviewerRejections).toBe(4);
+    expect(r.source.thresholds).toBe(".runway/config.yml");
+  });
+
+  it("partial file thresholds fall through to defaults per-field", () => {
+    writeFile(
+      ["metaFilterThresholds:", "  minIterationCount: 7"].join("\n"),
+    );
+    const r = resolveMetaConfig({ config: baseConfig(), cwd });
+    expect(r.metaFilterThresholds.minIterationCount).toBe(7);
+    expect(r.metaFilterThresholds.minReviewerRejections).toBe(2);
+  });
+
+  it("env metaFilterThresholds wins over file", () => {
+    writeFile(
+      [
+        "metaFilterThresholds:",
+        "  minIterationCount: 5",
+        "  minReviewerRejections: 4",
+      ].join("\n"),
+    );
+    const r = resolveMetaConfig({
+      config: baseConfig({
+        metaFilterThresholds: { minIterationCount: 9 },
+      }),
+      cwd,
+    });
+    expect(r.metaFilterThresholds.minIterationCount).toBe(9);
+    // Partial env override: minReviewerRejections falls through to
+    // file value, NOT default.
+    expect(r.metaFilterThresholds.minReviewerRejections).toBe(4);
+    expect(r.source.thresholds).toBe("env");
+  });
 });
