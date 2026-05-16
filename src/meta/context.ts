@@ -46,6 +46,11 @@ export interface RunReviewContext {
   readonly issueProcess: CapturedIssueProcess;
   readonly codingAgentReport: CapturedCodingAgentReport;
   readonly reviewerReport: CapturedReviewerReport;
+  // VA-404: number of review attempts the run made. >= 2 means a
+  // mid-run review-retry fired (REJECTED-RETRY → re-impl → re-review)
+  // even if the run ultimately succeeded. The heuristic filter trips
+  // on this so a "looked clean" recovery isn't a clean skip.
+  readonly reviewAttemptCount: number;
   // VA-403: hindsight composed of PR state, human-comment summary,
   // and Linear follow-up issues filed in the past 48h. Null when no
   // hindsight gateways were wired in (back-compat for v1.0.0
@@ -153,6 +158,13 @@ const loadRunReviewContext = (
           }),
         ),
       );
+    // VA-404: review attempt count. Tolerant — gateway error
+    // collapses to 0 (the conservative reading: "we couldn't tell, so
+    // assume no retry"). The other trip clauses still cover the
+    // common signals (HITL, errored, reverted, iteration count).
+    const reviewAttemptCount = yield* gateway
+      .countReviewAttempts(args.traceId, issueProcess.spanId)
+      .pipe(Effect.orElseSucceed(() => 0));
     // VA-403: hindsight is independently optional from the dashboard
     // gateway — the loader runs both fetches concurrently and tolerates
     // a per-source failure inside `fetchHindsightSignals` (it projects
@@ -178,6 +190,7 @@ const loadRunReviewContext = (
       issueProcess,
       codingAgentReport,
       reviewerReport,
+      reviewAttemptCount,
       hindsightSignals,
       norms: null,
     };

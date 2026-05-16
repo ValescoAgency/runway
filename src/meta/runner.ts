@@ -6,6 +6,10 @@ import {
   createGitHubHindsightGateway,
   createLinearHindsightGateway,
 } from "./hindsight.js";
+import {
+  DEFAULT_META_FILTER_THRESHOLDS,
+  type MetaFilterThresholds,
+} from "./heuristic-filter.js";
 import { createMetaLinearGateway } from "./linear-meta.js";
 import { runRunReviewPass, type RunReviewPassOutcome } from "./passes/run-review.js";
 
@@ -80,10 +84,12 @@ export function resolveMetaConfig(env: {
    * 12–24h band; for one-off bypass use `--force` on the CLI.
    */
   readonly metaReviewDelayHours: number;
+  readonly metaFilterThresholds: MetaFilterThresholds;
   readonly source: {
     readonly model: string;
     readonly project: string;
     readonly delayHours: string;
+    readonly thresholds: string;
   };
 } {
   const file = loadRunwayConfigFile(env.cwd);
@@ -103,17 +109,46 @@ export function resolveMetaConfig(env: {
       : file.metaReviewDelayHours !== undefined
         ? { value: file.metaReviewDelayHours, source: ".runway/config.yml" }
         : { value: DEFAULT_META_REVIEW_DELAY_HOURS, source: "default" };
+  // VA-404: env JSON override → file block → hardcoded defaults.
+  // The env knob is one-off only — operators tuning thresholds for
+  // real edit `.runway/config.yml`. Each missing field falls through
+  // to the default individually, so a partial override (just
+  // `minIterationCount`) doesn't reset the other knob.
+  const thresholds = resolveThresholds(env.config.metaFilterThresholds, file.metaFilterThresholds);
   return {
     metaReviewModel: model.value,
     metaProjectName: project.value,
     metaReviewDelayHours: delay.value,
+    metaFilterThresholds: thresholds.value,
     source: {
       model: model.source,
       project: project.source,
       delayHours: delay.source,
+      thresholds: thresholds.source,
     },
   };
 }
+
+const resolveThresholds = (
+  fromEnv: Partial<MetaFilterThresholds> | undefined,
+  fromFile: Partial<MetaFilterThresholds> | undefined,
+): { readonly value: MetaFilterThresholds; readonly source: string } => {
+  if (!fromEnv && !fromFile) {
+    return { value: DEFAULT_META_FILTER_THRESHOLDS, source: "default" };
+  }
+  const merged: MetaFilterThresholds = {
+    minIterationCount:
+      fromEnv?.minIterationCount ??
+      fromFile?.minIterationCount ??
+      DEFAULT_META_FILTER_THRESHOLDS.minIterationCount,
+    minReviewerRejections:
+      fromEnv?.minReviewerRejections ??
+      fromFile?.minReviewerRejections ??
+      DEFAULT_META_FILTER_THRESHOLDS.minReviewerRejections,
+  };
+  const source = fromEnv ? "env" : ".runway/config.yml";
+  return { value: merged, source };
+};
 
 /**
  * VA-402: invoke the Run Review pass end-to-end. Manages storage +
@@ -162,6 +197,7 @@ export const dispatchRunReview = (
           },
           delayHours: resolved.metaReviewDelayHours,
           force: args.force ?? false,
+          metaFilterThresholds: resolved.metaFilterThresholds,
         },
       );
     } finally {

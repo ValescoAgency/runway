@@ -107,6 +107,12 @@ export async function reviewCommand(argv: readonly string[]): Promise<void> {
     console.log(
       `[runway review run] drain too fresh — age=${outcome.drainAgeHours}h, threshold=${outcome.thresholdHours}h. Retry after ${outcome.retryAfterIso} (or pass --force to override).`,
     );
+  } else if (outcome.kind === "skipped") {
+    // VA-404: heuristic pre-filter trip. No LLM, no Linear — just the
+    // skipped row. Operator audit reads the reason off `meta_reviews`.
+    console.log(
+      `[runway review run] skipped — meta_review=${outcome.metaReviewId} reason: ${outcome.reason}`,
+    );
   } else {
     console.log(
       `[runway review run] stub-and-continue — meta_review=${outcome.metaReviewId} reason: ${outcome.reason}`,
