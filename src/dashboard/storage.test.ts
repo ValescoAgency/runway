@@ -1233,4 +1233,71 @@ describe("createStorage — meta_reviews (VA-402)", () => {
     const out = storage.listMetaReviews({ issueId: "VA-401" });
     expect(out).toHaveLength(2);
   });
+
+  // VA-407: list + detail surfaces for the new `/meta-reviews`
+  // dashboard route. Pagination, count, getById, and the cross-link
+  // helper that resolves (trace_id, issue_identifier) → span_id.
+
+  it("countMetaReviews returns the row count matching a filter", () => {
+    storage.saveMetaReview(row({ id: "a", kind: "meta-run-review" }));
+    storage.saveMetaReview(row({ id: "b", kind: "meta-run-review" }));
+    storage.saveMetaReview(row({ id: "c", kind: "meta-drain-review" }));
+    expect(storage.countMetaReviews()).toBe(3);
+    expect(storage.countMetaReviews({ kind: "meta-run-review" })).toBe(2);
+    expect(storage.countMetaReviews({ kind: "meta-failed" })).toBe(0);
+  });
+
+  it("listMetaReviews supports offset for pagination (page 2 skips page 1)", () => {
+    // 5 rows, page_size 2 → page 1 = [e, d], page 2 = [c, b], page 3 = [a].
+    for (const id of ["a", "b", "c", "d", "e"]) {
+      storage.saveMetaReview(
+        row({ id, createdAt: `2026-05-15 12:0${id.charCodeAt(0) - 96}:00` }),
+      );
+    }
+    const page1 = storage.listMetaReviews({ limit: 2, offset: 0 });
+    expect(page1.map((r) => r.id)).toEqual(["e", "d"]);
+    const page2 = storage.listMetaReviews({ limit: 2, offset: 2 });
+    expect(page2.map((r) => r.id)).toEqual(["c", "b"]);
+    const page3 = storage.listMetaReviews({ limit: 2, offset: 4 });
+    expect(page3.map((r) => r.id)).toEqual(["a"]);
+  });
+
+  it("getMetaReview fetches one row by id", () => {
+    storage.saveMetaReview(row({ id: "abc" }));
+    const r = storage.getMetaReview("abc");
+    expect(r?.id).toBe("abc");
+    expect(storage.getMetaReview("nonexistent")).toBeUndefined();
+  });
+
+  it("findIssueProcessByIdentifier returns the matching span_id for cross-linking", () => {
+    // Seed an issue_processes row that the meta-review can cross-link to.
+    storage.saveIssueProcess({
+      traceId: "trace-x",
+      spanId: "span-source-1",
+      parentSpanId: null,
+      issueIdentifier: "VA-501",
+      issueId: null,
+      issueTitle: null,
+      issueLabels: [],
+      branch: null,
+      outcomeKind: "opened",
+      outcomeDetail: null,
+      prUrl: null,
+      hitlReason: null,
+      startTimeUnixNano: "1000000000000000000",
+      endTimeUnixNano: "1000000001000000000",
+      statusCode: 1,
+      statusMessage: null,
+    });
+    const ip = storage.findIssueProcessByIdentifier("trace-x", "VA-501");
+    expect(ip?.spanId).toBe("span-source-1");
+    // Wrong trace → undefined.
+    expect(
+      storage.findIssueProcessByIdentifier("trace-y", "VA-501"),
+    ).toBeUndefined();
+    // Wrong identifier → undefined.
+    expect(
+      storage.findIssueProcessByIdentifier("trace-x", "VA-999"),
+    ).toBeUndefined();
+  });
 });

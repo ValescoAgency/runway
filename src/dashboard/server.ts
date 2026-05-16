@@ -10,17 +10,22 @@ import {
   createStorage,
   type IssueProcessFilter,
   type LinearSnapshotRow,
+  type MetaReviewKind,
   type OutcomeFilterKind,
   type RecentDrain,
   type Storage,
   type StoredIssueProcess,
 } from "./storage.js";
 import {
+  META_REVIEW_PAGE_SIZE,
   renderDetailView,
   renderIssueProcessRows,
   renderListView,
   renderLogsSection,
+  renderMetaReviewDetailView,
+  renderMetaReviewListView,
   type ListFilterState,
+  type MetaReviewListFilterState,
 } from "./views.js";
 import type { OtlpLogsPayload, OtlpTracesPayload } from "./otlp.js";
 
@@ -36,6 +41,17 @@ const ISSUE_PROCESS_DETAIL_RE = /^\/issue-processes\/([^/?#]+)\/?$/;
 // (same as the detail route); the handler resolves it to a trace_id
 // and forwards every dashboard event for that trace to the client.
 const ISSUE_PROCESS_STREAM_RE = /^\/issue-processes\/([^/?#]+)\/stream\/?$/;
+// VA-407: meta-review detail route. `:id` is the meta_reviews row's
+// synthetic UUID; resolved via `getMetaReview`.
+const META_REVIEW_DETAIL_RE = /^\/meta-reviews\/([^/?#]+)\/?$/;
+
+const META_REVIEW_KIND_VALUES: ReadonlySet<MetaReviewKind> = new Set<MetaReviewKind>([
+  "meta-run-review",
+  "meta-drain-review",
+  "meta-weekly-review",
+  "meta-skipped",
+  "meta-failed",
+]);
 
 /**
  * VA-386 (dashboard slice 1): the dashboard runs as a single Node HTTP
@@ -203,6 +219,21 @@ async function handle(
     if (issueProcessMatch) {
       const spanId = decodeURIComponent(issueProcessMatch[1] ?? "");
       handleIssueProcessDetailView(res, storage, spanId);
+      return;
+    }
+    // VA-407: meta-review list + detail. List matches the bare path or
+    // `?...` form; detail matches the `:id` segment. Both come before
+    // the legacy `/issue/...` regex below since they share no
+    // ambiguity but listing them by specificity keeps the routing
+    // table readable.
+    if (pathOnly === "/meta-reviews") {
+      handleMetaReviewListView(res, storage, url);
+      return;
+    }
+    const metaReviewMatch = META_REVIEW_DETAIL_RE.exec(pathOnly);
+    if (metaReviewMatch) {
+      const id = decodeURIComponent(metaReviewMatch[1] ?? "");
+      handleMetaReviewDetailView(res, storage, id);
       return;
     }
     const detailMatch = ISSUE_DETAIL_RE.exec(pathOnly);
@@ -708,6 +739,92 @@ function handleAggregates(res: ServerResponse, storage: Storage): void {
   const rows = storage.listAggregates();
   res.writeHead(200, { "content-type": "application/json" });
   res.end(JSON.stringify({ view: "evaluator_aggregates_v1", rows }));
+}
+
+/**
+ * VA-407: GET `/meta-reviews` — paginated list view of meta_reviews
+ * rows. `?kind=<kind>` narrows to one kind; `?page=N` is 1-based and
+ * combined with `META_REVIEW_PAGE_SIZE` to produce the OFFSET. The
+ * handler parses the URL, runs both a list + count read against
+ * Storage, and hands the projection to `renderMetaReviewListView`.
+ */
+function handleMetaReviewListView(
+  res: ServerResponse,
+  storage: Storage,
+  url: string,
+): void {
+  const filterState = parseMetaReviewQuery(url);
+  const offset = (filterState.page - 1) * META_REVIEW_PAGE_SIZE;
+  const filter = {
+    ...(filterState.kind !== null ? { kind: filterState.kind } : {}),
+    limit: META_REVIEW_PAGE_SIZE,
+    offset,
+  };
+  const rows = storage.listMetaReviews(filter);
+  const totalCount = storage.countMetaReviews(
+    filterState.kind !== null ? { kind: filterState.kind } : undefined,
+  );
+  const html = renderMetaReviewListView({ rows, totalCount, filterState });
+  res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+  res.end(html);
+}
+
+/**
+ * VA-407: GET `/meta-reviews/:id` — render the structured review for
+ * one row. Looks up the source `issue_processes` row when applicable
+ * (Run Review only) so the detail view can cross-link back to the
+ * canonical `/issue-processes/:spanId` route per the AC.
+ */
+function handleMetaReviewDetailView(
+  res: ServerResponse,
+  storage: Storage,
+  id: string,
+): void {
+  const metaReview = storage.getMetaReview(id);
+  if (!metaReview) {
+    writeError(res, 404, "not_found", `no meta-review for id=${id}`);
+    return;
+  }
+  let sourceIssueProcessSpanId: string | null = null;
+  if (
+    metaReview.kind === "meta-run-review" &&
+    metaReview.drainId &&
+    metaReview.issueId
+  ) {
+    const sourceIp = storage.findIssueProcessByIdentifier(
+      metaReview.drainId,
+      metaReview.issueId,
+    );
+    sourceIssueProcessSpanId = sourceIp?.spanId ?? null;
+  }
+  const html = renderMetaReviewDetailView({
+    metaReview,
+    sourceIssueProcessSpanId,
+  });
+  res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+  res.end(html);
+}
+
+/**
+ * VA-407: parse the `/meta-reviews` URL query string into the typed
+ * filter state. Unknown `kind` values fall through to `null` (the
+ * "all" chip), and a missing / non-positive `page` parameter clamps
+ * to 1 — defensive against operator-typed URLs.
+ */
+function parseMetaReviewQuery(url: string): MetaReviewListFilterState {
+  const queryStart = url.indexOf("?");
+  if (queryStart === -1) return { kind: null, page: 1 };
+  const search = new URLSearchParams(url.slice(queryStart + 1));
+  const kindRaw = search.get("kind");
+  const kind =
+    kindRaw !== null && META_REVIEW_KIND_VALUES.has(kindRaw as MetaReviewKind)
+      ? (kindRaw as MetaReviewKind)
+      : null;
+  const pageRaw = search.get("page");
+  const pageNum = pageRaw !== null ? Number(pageRaw) : 1;
+  const page =
+    Number.isFinite(pageNum) && pageNum >= 1 ? Math.floor(pageNum) : 1;
+  return { kind, page };
 }
 
 async function readBody(req: IncomingMessage): Promise<string | undefined> {

@@ -4,12 +4,18 @@ import type {
   PhaseSpan,
   StoredAgentIteration,
   StoredIssueProcess,
+  StoredMetaReview,
 } from "./storage.js";
 import {
   escapeHtml,
   filterStateToQueryString,
+  META_REVIEW_PAGE_SIZE,
+  metaReviewFilterToQuery,
   renderDetailView,
   renderListView,
+  renderMetaReviewDetailView,
+  renderMetaReviewListView,
+  safeExternalHref,
   type DetailViewModel,
   type ListFilterState,
 } from "./views.js";
@@ -567,5 +573,478 @@ describe("filterStateToQueryString (VA-392)", () => {
         drain: "trace with spaces",
       }),
     ).toBe("?drain=trace%20with%20spaces");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// VA-407: meta-reviews list + detail views
+// ---------------------------------------------------------------------------
+
+function metaRow(over: Partial<StoredMetaReview> = {}): StoredMetaReview {
+  return {
+    id: "row-1",
+    kind: "meta-run-review",
+    scope: "VA-401",
+    drainId: "trace-1",
+    issueId: "VA-401",
+    contentJson: JSON.stringify({
+      review: {
+        issue_identifier: "VA-401",
+        final_outcome: "opened",
+        agent_quality: { absolute: "STRONG", justification: "Surgical commits." },
+        recommendations: [
+          { target: "prompt", change: "Tighten X.", confidence: "MEDIUM" },
+        ],
+        hindsight_signals: null,
+      },
+      linear_issue_identifier: "META-100",
+      linear_url: "https://linear.app/x/issue/META-100",
+    }),
+    templateVersion: "1.2.0",
+    createdAt: "2026-05-15 12:00:00",
+    ...over,
+  };
+}
+
+describe("renderMetaReviewListView (VA-407)", () => {
+  it("renders a row per meta-review with kind, scope, created_at, and summary link", () => {
+    const html = renderMetaReviewListView({
+      rows: [metaRow()],
+      totalCount: 1,
+      filterState: { kind: null, page: 1 },
+    });
+    expect(html).toContain("meta-reviews");
+    expect(html).toContain("VA-401");
+    expect(html).toContain("run");
+    // Detail link uses the meta-review id.
+    expect(html).toContain('href="/meta-reviews/row-1"');
+    // Summary projection — agent grade + recommendation count.
+    expect(html).toContain("agent=STRONG");
+    expect(html).toContain("1 recommendations");
+  });
+
+  it("renders kind chips reflecting the current filter state", () => {
+    const html = renderMetaReviewListView({
+      rows: [],
+      totalCount: 0,
+      filterState: { kind: "meta-drain-review", page: 1 },
+    });
+    expect(html).toContain('href="/meta-reviews?kind=meta-run-review"');
+    // The active drain chip clears (`href="/meta-reviews"`) when clicked.
+    expect(html).toMatch(/class="filter-chip active"[^>]*href="\/meta-reviews"/);
+  });
+
+  it("renders the 'all' kind chip with the bare /meta-reviews href (not a doubled path)", () => {
+    // Regression test for the "/meta-reviews/meta-reviews" bug —
+    // metaReviewFilterToQuery returns "" for the all-defaults state, and
+    // the chip must not double the prefix via a fallback. When kind is
+    // already null, the active chip renders /meta-reviews; when kind is
+    // a specific value, the all chip resets to /meta-reviews.
+    const allActive = renderMetaReviewListView({
+      rows: [],
+      totalCount: 0,
+      filterState: { kind: null, page: 1 },
+    });
+    expect(allActive).toContain('href="/meta-reviews">all</a>');
+    expect(allActive).not.toContain("/meta-reviews/meta-reviews");
+
+    const kindActive = renderMetaReviewListView({
+      rows: [],
+      totalCount: 0,
+      filterState: { kind: "meta-failed", page: 1 },
+    });
+    expect(kindActive).toContain('href="/meta-reviews">all</a>');
+    expect(kindActive).not.toContain("/meta-reviews/meta-reviews");
+  });
+
+  it("renders pager footer with prev/next links and total count", () => {
+    // 25 rows total, page 1 of 2 (page_size = 20).
+    const rows = Array.from({ length: META_REVIEW_PAGE_SIZE }, (_, i) =>
+      metaRow({ id: `row-${i + 1}`, scope: `VA-${100 + i}` }),
+    );
+    const html = renderMetaReviewListView({
+      rows,
+      totalCount: 25,
+      filterState: { kind: null, page: 1 },
+    });
+    expect(html).toContain("1–20 of 25");
+    expect(html).toContain('href="/meta-reviews?page=2"');
+    // Prev is disabled on page 1 — rendered as muted text, not a link.
+    expect(html).toContain('<span class="muted">← prev</span>');
+  });
+
+  it("pager preserves kind filter across page links", () => {
+    const html = renderMetaReviewListView({
+      rows: [],
+      totalCount: 50,
+      filterState: { kind: "meta-run-review", page: 2 },
+    });
+    expect(html).toContain(
+      'href="/meta-reviews?kind=meta-run-review&amp;page=3"',
+    );
+    expect(html).toContain(
+      'href="/meta-reviews?kind=meta-run-review"',
+    );
+  });
+
+  it("applies the skipped / failed CSS treatment classes for visual differentiation", () => {
+    const html = renderMetaReviewListView({
+      rows: [
+        metaRow({
+          id: "skip-1",
+          kind: "meta-skipped",
+          contentJson: JSON.stringify({ reason: "Heuristic pre-filter trip" }),
+        }),
+        metaRow({
+          id: "fail-1",
+          kind: "meta-failed",
+          contentJson: JSON.stringify({ reason: "Anthropic 5xx after 3 retries" }),
+        }),
+      ],
+      totalCount: 2,
+      filterState: { kind: null, page: 1 },
+    });
+    expect(html).toContain('class="meta-row-meta-skipped"');
+    expect(html).toContain('class="meta-row-meta-failed"');
+    expect(html).toContain("Skipped — Heuristic pre-filter trip");
+    expect(html).toContain("FAILED — Anthropic 5xx after 3 retries");
+  });
+
+  it("renders an empty-state row when no meta-reviews match", () => {
+    const html = renderMetaReviewListView({
+      rows: [],
+      totalCount: 0,
+      filterState: { kind: null, page: 1 },
+    });
+    expect(html).toContain("No meta-reviews match");
+  });
+});
+
+describe("metaReviewFilterToQuery (VA-407)", () => {
+  it("returns an empty string when on the default (no filter, page 1)", () => {
+    expect(metaReviewFilterToQuery({ kind: null, page: 1 })).toBe("");
+  });
+
+  it("serializes kind only", () => {
+    expect(
+      metaReviewFilterToQuery({ kind: "meta-weekly-review", page: 1 }),
+    ).toBe("?kind=meta-weekly-review");
+  });
+
+  it("serializes page only", () => {
+    expect(metaReviewFilterToQuery({ kind: null, page: 3 })).toBe("?page=3");
+  });
+
+  it("serializes both kind and page", () => {
+    expect(
+      metaReviewFilterToQuery({ kind: "meta-failed", page: 2 }),
+    ).toBe("?kind=meta-failed&page=2");
+  });
+});
+
+describe("renderMetaReviewDetailView (VA-407)", () => {
+  it("renders a Run Review with quality grades + recommendations + source-run link", () => {
+    const html = renderMetaReviewDetailView({
+      metaReview: metaRow(),
+      sourceIssueProcessSpanId: "span-source-1",
+    });
+    expect(html).toContain("Quality grades");
+    expect(html).toContain("STRONG");
+    expect(html).toContain("Tighten X.");
+    expect(html).toContain('href="/issue-processes/span-source-1"');
+    expect(html).toContain('href="https://linear.app/x/issue/META-100"');
+  });
+
+  it("renders a Run Review with v1.0.0 nested `relative: null` without crashing", () => {
+    // VA-405: the legacy v1.0.0 shape carries `relative: null` inside
+    // each quality section. The detail view ignores the nested slot
+    // and reads from top-level `*_quality_relative` fields, falling
+    // through to "no relative" when absent.
+    const html = renderMetaReviewDetailView({
+      metaReview: metaRow({
+        templateVersion: "1.0.0",
+        contentJson: JSON.stringify({
+          review: {
+            issue_identifier: "VA-1",
+            agent_quality: {
+              absolute: "WEAK",
+              relative: null,
+              justification: "Two retries before HITL.",
+            },
+            issue_quality: {
+              absolute: "ADEQUATE",
+              relative: null,
+              justification: "Spec was OK.",
+            },
+            recommendations: [],
+            hindsight_signals: null,
+          },
+        }),
+      }),
+    });
+    expect(html).toContain("Two retries before HITL.");
+    expect(html).toContain("WEAK");
+    expect(html).toContain("ADEQUATE");
+  });
+
+  it("renders a Drain Review with cross-link to drain's issue_processes", () => {
+    const html = renderMetaReviewDetailView({
+      metaReview: metaRow({
+        id: "drain-1",
+        kind: "meta-drain-review",
+        scope: "trace-abc",
+        drainId: "trace-abc",
+        issueId: null,
+        contentJson: JSON.stringify({
+          review: {
+            severity: "routine",
+            severity_justification: "no blocking signals",
+            issue_count: 3,
+            outcomes_summary: { opened: 2, hitl: 1 },
+            sequencing_assessment: "schema migration first, UI after.",
+            cross_issue_patterns: ["all touched src/dashboard"],
+            notable_events: [
+              {
+                issue_identifier: "VA-401",
+                event: "HITL after 2 rejections",
+                run_review_url: "https://linear.app/x/issue/META-200",
+              },
+            ],
+            recommendations: [],
+          },
+        }),
+      }),
+    });
+    expect(html).toContain("severity:");
+    expect(html).toContain("routine");
+    expect(html).toContain("schema migration first");
+    expect(html).toContain("all touched src/dashboard");
+    expect(html).toContain('href="/?drain=trace-abc"');
+    expect(html).toContain(
+      'href="https://linear.app/x/issue/META-200"',
+    );
+  });
+
+  it("renders a Weekly Review with promotions cross-linking to runway-meta Linear URLs", () => {
+    const html = renderMetaReviewDetailView({
+      metaReview: metaRow({
+        id: "weekly-1",
+        kind: "meta-weekly-review",
+        scope: "2026-W19",
+        drainId: null,
+        issueId: null,
+        templateVersion: "1.1.0",
+        contentJson: JSON.stringify({
+          review: {
+            narrative: "Steady week.",
+            rates: { throughput: 12, success_pct: 75 },
+            promotions: [
+              {
+                title: "Tighten reviewer rejection guidance",
+                theme_key: "prompt:tighten:abcd1234",
+                target: "prompt",
+              },
+            ],
+            shipped_promotions: [
+              {
+                linear_identifier: "VA-3001",
+                linear_url: "https://linear.app/x/issue/VA-3001",
+                linear_title: "Tighten reviewer rejection guidance",
+                verdict: "HELD",
+                comment: "Observed 6% across n=15 runs.",
+              },
+            ],
+          },
+          linear_identifier: "META-300",
+          linear_url: "https://linear.app/x/issue/META-300",
+          promotion_filings: [
+            {
+              theme_key: "prompt:tighten:abcd1234",
+              identifier: "VA-4001",
+              url: "https://linear.app/x/issue/VA-4001",
+            },
+          ],
+        }),
+      }),
+    });
+    expect(html).toContain("Narrative");
+    expect(html).toContain("Steady week.");
+    expect(html).toContain("Promotions");
+    // VA-407 AC: promotions cross-link to runway-meta Linear issue
+    // URLs (resolved from `promotion_filings` by theme_key).
+    expect(html).toContain('href="https://linear.app/x/issue/VA-4001"');
+    expect(html).toContain("VA-4001");
+    // What we shipped section + verdict pill.
+    expect(html).toContain("What we shipped");
+    expect(html).toContain('class="meta-grade meta-verdict-HELD"');
+    expect(html).toContain('href="https://linear.app/x/issue/VA-3001"');
+  });
+
+  it("renders a meta-skipped row with the skip banner", () => {
+    const html = renderMetaReviewDetailView({
+      metaReview: metaRow({
+        id: "skip-1",
+        kind: "meta-skipped",
+        contentJson: JSON.stringify({ reason: "Heuristic pre-filter trip" }),
+      }),
+    });
+    expect(html).toContain("meta-skipped-banner");
+    expect(html).toContain("Heuristic pre-filter trip");
+  });
+
+  it("renders a meta-failed row with the failure banner + linear stub link", () => {
+    const html = renderMetaReviewDetailView({
+      metaReview: metaRow({
+        id: "fail-1",
+        kind: "meta-failed",
+        contentJson: JSON.stringify({
+          reason: "Anthropic 5xx after 3 retries",
+          linear_identifier: "META-FAIL-1",
+          linear_url: "https://linear.app/x/issue/META-FAIL-1",
+        }),
+      }),
+    });
+    expect(html).toContain("meta-failed-banner");
+    expect(html).toContain("Anthropic 5xx after 3 retries");
+    expect(html).toContain('href="https://linear.app/x/issue/META-FAIL-1"');
+  });
+
+  it("renders an unparseable content_json with a fallback banner instead of crashing", () => {
+    const html = renderMetaReviewDetailView({
+      metaReview: metaRow({
+        id: "junk-1",
+        contentJson: "{not valid json",
+      }),
+    });
+    expect(html).toContain("content_json could not be parsed");
+    expect(html).toContain("json-fallback");
+  });
+
+  it("rejects javascript:/data: URLs in content_json, falling back to plain text", () => {
+    // Prompt-injection defense — a malicious content_json shouldn't
+    // be able to smuggle an executable link into the dashboard. The
+    // URL-bearing fields go through `safeExternalHref` and degrade to
+    // plain (escaped) text when the scheme isn't http(s).
+    const html = renderMetaReviewDetailView({
+      metaReview: metaRow({
+        id: "evil-1",
+        kind: "meta-failed",
+        contentJson: JSON.stringify({
+          reason: "anthropic 5xx",
+          linear_identifier: "META-EVIL",
+          linear_url: "javascript:alert(1)",
+        }),
+      }),
+    });
+    expect(html).not.toContain("javascript:");
+    expect(html).not.toContain("href=\"javascript");
+    // The identifier still renders, just as plain text.
+    expect(html).toContain("META-EVIL");
+  });
+
+  it("rejects a data: scheme in notable_events run_review_url", () => {
+    const html = renderMetaReviewDetailView({
+      metaReview: metaRow({
+        id: "evil-drain",
+        kind: "meta-drain-review",
+        scope: "trace-z",
+        drainId: "trace-z",
+        issueId: null,
+        contentJson: JSON.stringify({
+          review: {
+            severity: "routine",
+            severity_justification: "ok",
+            issue_count: 1,
+            outcomes_summary: { opened: 1 },
+            sequencing_assessment: "x",
+            cross_issue_patterns: [],
+            notable_events: [
+              {
+                issue_identifier: "VA-1",
+                event: "x",
+                run_review_url: "data:text/html,<script>alert(1)</script>",
+              },
+            ],
+            recommendations: [],
+          },
+        }),
+      }),
+    });
+    expect(html).not.toContain("data:text/html");
+    expect(html).not.toContain("<script>alert");
+    // Identifier still appears as plain text.
+    expect(html).toContain("VA-1");
+  });
+
+  it("rejects javascript: in Weekly Review shipped_promotions linear_url and promotion_filings url", () => {
+    const html = renderMetaReviewDetailView({
+      metaReview: metaRow({
+        id: "evil-weekly",
+        kind: "meta-weekly-review",
+        scope: "2026-W19",
+        drainId: null,
+        issueId: null,
+        contentJson: JSON.stringify({
+          review: {
+            narrative: "x",
+            rates: {},
+            promotions: [
+              { title: "T", theme_key: "k:a:b", target: "prompt" },
+            ],
+            shipped_promotions: [
+              {
+                linear_identifier: "VA-X",
+                linear_url: "javascript:alert('shipped')",
+                linear_title: "T",
+                verdict: "HELD",
+                comment: "c",
+              },
+            ],
+          },
+          promotion_filings: [
+            { theme_key: "k:a:b", identifier: "VA-Y", url: "vbscript:msgbox(1)" },
+          ],
+        }),
+      }),
+    });
+    expect(html).not.toContain("javascript:");
+    expect(html).not.toContain("vbscript:");
+    expect(html).toContain("VA-X");
+    expect(html).toContain("VA-Y");
+  });
+});
+
+describe("safeExternalHref (VA-407)", () => {
+  it("accepts http and https URLs", () => {
+    expect(safeExternalHref("https://linear.app/x/issue/VA-1")).toBe(
+      "https://linear.app/x/issue/VA-1",
+    );
+    expect(safeExternalHref("http://example.com")).toBe("http://example.com");
+    // Case-insensitive on the scheme.
+    expect(safeExternalHref("HTTPS://example.com")).toBe("HTTPS://example.com");
+  });
+
+  it("trims leading whitespace before checking the scheme", () => {
+    expect(safeExternalHref("  https://example.com  ")).toBe(
+      "https://example.com",
+    );
+  });
+
+  it("rejects unsafe schemes (javascript:, data:, vbscript:, file:)", () => {
+    expect(safeExternalHref("javascript:alert(1)")).toBeNull();
+    expect(safeExternalHref("data:text/html,<script>alert(1)</script>")).toBeNull();
+    expect(safeExternalHref("vbscript:msgbox(1)")).toBeNull();
+    expect(safeExternalHref("file:///etc/passwd")).toBeNull();
+    // Schemes that masquerade — leading whitespace before "javascript:"
+    // is trimmed first, then rejected by the regex.
+    expect(safeExternalHref("\tjavascript:alert(1)")).toBeNull();
+  });
+
+  it("rejects non-string and empty inputs", () => {
+    expect(safeExternalHref(null)).toBeNull();
+    expect(safeExternalHref(undefined)).toBeNull();
+    expect(safeExternalHref("")).toBeNull();
+    expect(safeExternalHref(123)).toBeNull();
+    expect(safeExternalHref({})).toBeNull();
   });
 });

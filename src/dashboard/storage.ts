@@ -295,6 +295,32 @@ export interface Storage {
   listMetaReviews(
     filter?: MetaReviewFilter,
   ): readonly StoredMetaReview[];
+  /**
+   * VA-407: count matching `meta_reviews` rows for a filter. Powers the
+   * pagination footer on the `/meta-reviews` list view ("Showing 1–20
+   * of 47"). Mirrors `listMetaReviews`' filter shape — same `kind` /
+   * `drainId` / `issueId` semantics, ignores `limit` / `offset`.
+   */
+  countMetaReviews(filter?: MetaReviewFilter): number;
+  /**
+   * VA-407: fetch one meta_reviews row by synthetic id. The
+   * `/meta-reviews/:id` detail route uses this to render the
+   * structured review. Returns undefined when the id doesn't match
+   * (typo in URL, row deleted, fresh dashboard).
+   */
+  getMetaReview(id: string): StoredMetaReview | undefined;
+  /**
+   * VA-407: cross-link helper — given a (trace_id, issue_identifier)
+   * pair, return the matching `issue_processes` row so the meta-review
+   * detail view can link back to the underlying run via the canonical
+   * `/issue-processes/:spanId` route. Returns undefined when no row
+   * matches (older runs whose `issue_processes` was never populated,
+   * or a Run Review that pointed at the wrong drain).
+   */
+  findIssueProcessByIdentifier(
+    traceId: string,
+    issueIdentifier: string,
+  ): StoredIssueProcess | undefined;
   close(): void;
 }
 
@@ -366,6 +392,15 @@ export interface MetaReviewFilter {
   readonly drainId?: string;
   readonly issueId?: string;
   readonly limit?: number;
+  /**
+   * VA-407: offset-based pagination for the `/meta-reviews` list view.
+   * Defaults to 0 (first page). Combined with `limit` to produce the
+   * familiar OFFSET/LIMIT pair. Cursor pagination would scale better
+   * past ~10k rows, but the meta_reviews table is bounded by the IRA's
+   * write cadence (~tens per drain × handful of drains per day) so
+   * offset is fine for the dashboard UI's lifetime.
+   */
+  readonly offset?: number;
 }
 
 export interface StorageOptions {
@@ -1131,9 +1166,9 @@ export function createStorage(
     );
   };
 
-  const listMetaReviews = (
+  const buildMetaReviewWhere = (
     filter?: MetaReviewFilter,
-  ): readonly StoredMetaReview[] => {
+  ): { sql: string; params: (string | number)[] } => {
     const where: string[] = [];
     const params: (string | number)[] = [];
     if (filter?.kind) {
@@ -1148,16 +1183,27 @@ export function createStorage(
       where.push(`issue_id = ?`);
       params.push(filter.issueId);
     }
+    return {
+      sql: where.length > 0 ? `WHERE ${where.join(" AND ")}` : "",
+      params,
+    };
+  };
+
+  const listMetaReviews = (
+    filter?: MetaReviewFilter,
+  ): readonly StoredMetaReview[] => {
+    const { sql: whereSql, params } = buildMetaReviewWhere(filter);
     const limit = filter?.limit ?? 100;
+    const offset = Math.max(0, Math.floor(filter?.offset ?? 0));
     const sql = `
       SELECT id, kind, scope, drain_id, issue_id, content_json,
              template_version, created_at
       FROM meta_reviews
-      ${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
+      ${whereSql}
       ORDER BY created_at DESC, id DESC
-      LIMIT ?
+      LIMIT ? OFFSET ?
     `;
-    const rows = db.prepare(sql).all(...params, limit) as Array<
+    const rows = db.prepare(sql).all(...params, limit, offset) as Array<
       Record<string, unknown>
     >;
     return rows.map((row) => ({
@@ -1170,6 +1216,59 @@ export function createStorage(
       templateVersion: String(row.template_version ?? ""),
       createdAt: String(row.created_at ?? ""),
     }));
+  };
+
+  const countMetaReviews = (filter?: MetaReviewFilter): number => {
+    const { sql: whereSql, params } = buildMetaReviewWhere(filter);
+    const row = db
+      .prepare(`SELECT COUNT(*) AS n FROM meta_reviews ${whereSql}`)
+      .get(...params) as { n?: unknown } | undefined;
+    return Number(row?.n ?? 0);
+  };
+
+  const getMetaReviewStmt = db.prepare(`
+    SELECT id, kind, scope, drain_id, issue_id, content_json,
+           template_version, created_at
+    FROM meta_reviews
+    WHERE id = ?
+    LIMIT 1
+  `);
+
+  const getMetaReview = (id: string): StoredMetaReview | undefined => {
+    const row = getMetaReviewStmt.get(id) as
+      | Record<string, unknown>
+      | undefined;
+    if (!row) return undefined;
+    return {
+      id: String(row.id ?? ""),
+      kind: String(row.kind ?? "") as MetaReviewKind,
+      scope: String(row.scope ?? ""),
+      drainId: nullableStr(row.drain_id),
+      issueId: nullableStr(row.issue_id),
+      contentJson: String(row.content_json ?? ""),
+      templateVersion: String(row.template_version ?? ""),
+      createdAt: String(row.created_at ?? ""),
+    };
+  };
+
+  // VA-407: lookup the issue_processes row for a (trace, identifier)
+  // pair so the meta-review detail page can cross-link to the canonical
+  // `/issue-processes/:spanId` route. Ordered DESC by inserted_at so a
+  // retried run picks up the freshest projection.
+  const findProcessByIdentifierStmt = db.prepare(`
+    SELECT ${ISSUE_PROCESS_COLUMNS}
+    FROM issue_processes
+    WHERE trace_id = ? AND issue_identifier = ?
+    ORDER BY inserted_at DESC
+    LIMIT 1
+  `);
+
+  const findIssueProcessByIdentifier = (
+    traceId: string,
+    issueIdentifier: string,
+  ): StoredIssueProcess | undefined => {
+    const row = findProcessByIdentifierStmt.get(traceId, issueIdentifier);
+    return row ? rowToIssueProcess(row) : undefined;
   };
 
   return {
@@ -1193,6 +1292,9 @@ export function createStorage(
     getActiveDrain,
     saveMetaReview,
     listMetaReviews,
+    countMetaReviews,
+    getMetaReview,
+    findIssueProcessByIdentifier,
     close,
   };
 }
