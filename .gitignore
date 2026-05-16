@@ -9,5 +9,11 @@ dist/
 .env.schema.bak
 .envrc
 
-# Sub-agent worktrees spawned by Claude Code (isolation: "worktree")
-.claude/
+# Claude Code's local-only state: sub-agent worktrees (isolation:
+# "worktree") and per-machine settings. Per-skill markdown files
+# committed under `.claude/skills/` are tracked — see VA-410's
+# /triage skill. We use targeted ignores rather than a blanket
+# `.claude/` ignore because gitignore re-includes (`!path`) don't
+# apply when a parent directory is already excluded.
+.claude/worktrees/
+.claude/settings.local.json
