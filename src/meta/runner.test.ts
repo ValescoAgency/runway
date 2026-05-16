@@ -96,4 +96,39 @@ describe("resolveMetaConfig (VA-402)", () => {
     expect(r.metaProjectName).toBe("ira-meta-from-file");
     expect(r.source.project).toBe(".runway/config.yml");
   });
+
+  // VA-403: metaReviewDelayHours follows the same env → file →
+  // default chain; default is 18h per PRD.
+
+  it("defaults metaReviewDelayHours to 18 when nothing is set", () => {
+    const r = resolveMetaConfig({ config: baseConfig(), cwd });
+    expect(r.metaReviewDelayHours).toBe(18);
+    expect(r.source.delayHours).toBe("default");
+  });
+
+  it("reads metaReviewDelayHours from .runway/config.yml when env is unset", () => {
+    writeFile("metaReviewDelayHours: 24");
+    const r = resolveMetaConfig({ config: baseConfig(), cwd });
+    expect(r.metaReviewDelayHours).toBe(24);
+    expect(r.source.delayHours).toBe(".runway/config.yml");
+  });
+
+  it("env wins for metaReviewDelayHours", () => {
+    writeFile("metaReviewDelayHours: 24");
+    const r = resolveMetaConfig({
+      config: baseConfig({ metaReviewDelayHours: 6 }),
+      cwd,
+    });
+    expect(r.metaReviewDelayHours).toBe(6);
+    expect(r.source.delayHours).toBe("env");
+  });
+
+  it("accepts 0 as a valid metaReviewDelayHours (alias for --force always)", () => {
+    const r = resolveMetaConfig({
+      config: baseConfig({ metaReviewDelayHours: 0 }),
+      cwd,
+    });
+    expect(r.metaReviewDelayHours).toBe(0);
+    expect(r.source.delayHours).toBe("env");
+  });
 });

@@ -120,6 +120,16 @@ export interface RunwayConfig {
    * env → `.runway/config.yml` → `"runway-meta"` default.
    */
   readonly metaProjectName?: string;
+  /**
+   * VA-403: minimum drain age (in hours) before `runway review run`
+   * grades it. The IRA's hindsight signals (PR merge / human
+   * comments / follow-up issues) need real time to land — judging
+   * too early scores against absent signals. Default 18h. `0`
+   * disables the gate (alias for `--force` on every invocation).
+   * Source: `RUNWAY_REVIEW_DELAY_HOURS`. Resolution: env →
+   * `.runway/config.yml` → 18-hour hardcoded default.
+   */
+  readonly metaReviewDelayHours?: number;
 }
 
 // Back-compat alias — existing consumers (orchestrator, gateways)
@@ -185,6 +195,14 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
   ),
   metaReviewModel: EConfig.option(EConfig.string("RUNWAY_META_REVIEW_MODEL")),
   metaProjectName: EConfig.option(EConfig.string("RUNWAY_META_PROJECT_NAME")),
+  metaReviewDelayHours: EConfig.option(
+    EConfig.number("RUNWAY_REVIEW_DELAY_HOURS").pipe(
+      EConfig.validate({
+        message: "RUNWAY_REVIEW_DELAY_HOURS must be >= 0",
+        validation: (n): n is number => n >= 0,
+      }),
+    ),
+  ),
 }).pipe(
   Effect.map(
     (raw): RunwayConfig => ({
@@ -208,6 +226,7 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
         .filter(Boolean),
       metaReviewModel: Option.getOrUndefined(raw.metaReviewModel),
       metaProjectName: Option.getOrUndefined(raw.metaProjectName),
+      metaReviewDelayHours: Option.getOrUndefined(raw.metaReviewDelayHours),
     }),
   ),
 );

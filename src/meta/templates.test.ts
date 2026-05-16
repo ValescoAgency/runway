@@ -464,4 +464,92 @@ describe("parseRunReview (VA-402)", () => {
     if (result.ok) return;
     expect(result.error.kind).toBe("version-mismatch");
   });
+
+  // VA-403: Run Review v1.1.0 widens hindsight_signals from `null`
+  // to `null | { pr, human_verdict, follow_up_issues }`. The schema
+  // must continue to accept the v1.0.0 null payload (forward-compat
+  // on the minor bump) while also accepting the new populated shape.
+
+  it("v1.0.0 payloads with hindsight_signals: null still parse under the v1.1.0 schema", () => {
+    // Locked v1.0.0 fixture (template_version stamped explicitly to
+    // the prior minor) with hindsight_signals as the legacy null.
+    const v100 = {
+      ...VALID_RUN_REVIEW,
+      template_version: "1.0.0",
+      hindsight_signals: null,
+    };
+    const result = parseRunReview(wrapRunReview(JSON.stringify(v100)));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.hindsight_signals).toBeNull();
+  });
+
+  it("accepts a populated hindsight_signals object at v1.1.0", () => {
+    const v110 = {
+      ...VALID_RUN_REVIEW,
+      template_version: "1.1.0",
+      hindsight_signals: {
+        pr: {
+          url: "https://github.com/x/y/pull/103",
+          state: "merged",
+          merged_at: "2026-05-15T01:23:45Z",
+        },
+        human_verdict: {
+          sentiment: "approving",
+          comment_count: 1,
+          summary: "Reviewer @alice left a thumbs-up; no blocking notes.",
+        },
+        follow_up_issues: [
+          { identifier: "VA-501", title: "Fix flaky test introduced by VA-401" },
+        ],
+      },
+    };
+    const result = parseRunReview(wrapRunReview(JSON.stringify(v110)));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const hs = result.report.hindsight_signals;
+    expect(hs).not.toBeNull();
+    if (hs === null) return;
+    expect(hs.pr?.state).toBe("merged");
+    expect(hs.human_verdict?.sentiment).toBe("approving");
+    expect(hs.follow_up_issues).toHaveLength(1);
+    expect(hs.follow_up_issues[0]?.identifier).toBe("VA-501");
+  });
+
+  it("accepts independently-null sub-sections (partial hindsight)", () => {
+    // Gateway may have GitHub token but no Linear search; or PR URL
+    // missing but follow-ups present. Each sub-section nulls out
+    // independently — the IRA grades on what it has.
+    const partial = {
+      ...VALID_RUN_REVIEW,
+      template_version: "1.1.0",
+      hindsight_signals: {
+        pr: null,
+        human_verdict: null,
+        follow_up_issues: [],
+      },
+    };
+    const result = parseRunReview(wrapRunReview(JSON.stringify(partial)));
+    expect(result.ok).toBe(true);
+  });
+
+  it("rejects an unknown PR state outside the open|merged|closed alphabet", () => {
+    const bad = {
+      ...VALID_RUN_REVIEW,
+      template_version: "1.1.0",
+      hindsight_signals: {
+        pr: {
+          url: "https://github.com/x/y/pull/103",
+          state: "draft",
+          merged_at: null,
+        },
+        human_verdict: null,
+        follow_up_issues: [],
+      },
+    };
+    const result = parseRunReview(wrapRunReview(JSON.stringify(bad)));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.kind).toBe("schema-mismatch");
+  });
 });

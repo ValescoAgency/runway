@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { Effect } from "effect";
 import type { Storage } from "../../dashboard/storage.js";
-import { loadContextFor, type RunReviewContext } from "../context.js";
+import { loadContextFor, type HindsightWiring, type RunReviewContext } from "../context.js";
 import type {
   CapturedCodingAgentReport,
   CapturedIssueProcess,
@@ -12,6 +12,7 @@ import type { MetaLinearGateway } from "../linear-meta.js";
 import { callRunReview, type AnthropicError } from "../llm.js";
 import {
   RUN_REVIEW_VERSION,
+  type HindsightSignals,
   type ReportParseError,
   type RunReview,
 } from "../templates.js";
@@ -43,6 +44,34 @@ export interface RunReviewPassDeps {
   readonly dashboardRead: MetaDashboardRead;
   readonly metaLinear: MetaLinearGateway;
   readonly storage: Storage;
+  /**
+   * VA-403: optional hindsight wiring. When present, the loaded
+   * `RunReviewContext.hindsightSignals` is populated and the user
+   * prompt includes the captured PR state + Linear follow-ups.
+   * When absent, the pass behaves like the v1.0.0 tracer (no
+   * hindsight in the prompt; v1.1.0 schema still accepts the null
+   * sentinel emitted in that case).
+   */
+  readonly hindsight?: HindsightWiring;
+  /**
+   * VA-403: how stale the drain must be before the IRA grades it.
+   * Compared against `loadDrainEndTime` — the latest end_time
+   * across the trace's issue_processes. Default 18h per PRD.
+   * `0` disables the gate (alias for the `--force` CLI flag).
+   */
+  readonly delayHours?: number;
+  /**
+   * VA-403: bypass the delay gate. Set when the operator passed
+   * `--force` on the CLI. The gate still computes drain age and
+   * logs it via the outcome's `delayed` reason for audit trail —
+   * we just don't act on it.
+   */
+  readonly force?: boolean;
+  /**
+   * Override "now" for tests. Defaults to `Date.now()`. Production
+   * callers leave this unset.
+   */
+  readonly now?: () => number;
 }
 
 export interface RunReviewPassArgs {
@@ -61,7 +90,21 @@ export type RunReviewPassOutcome =
       readonly kind: "failed";
       readonly metaReviewId: string;
       readonly reason: string;
+    }
+  | {
+      // VA-403: drain too fresh (younger than `delayHours`). The
+      // pass exits without calling Anthropic / Linear / SQLite —
+      // operator re-runs after the delay window elapses. Distinct
+      // from `failed` so the CLI can render a friendly retry hint
+      // instead of a stub-and-continue notice.
+      readonly kind: "delayed";
+      readonly drainAgeHours: number;
+      readonly thresholdHours: number;
+      readonly retryAfterIso: string;
     };
+
+const DEFAULT_DELAY_HOURS = 18;
+const NS_PER_MS = 1_000_000;
 
 // ---------------------------------------------------------------------------
 // Pass body
@@ -72,6 +115,35 @@ export const runRunReviewPass = (
   deps: RunReviewPassDeps,
 ): Effect.Effect<RunReviewPassOutcome, never, never> =>
   Effect.gen(function* () {
+    // 0) VA-403 delay gate. Hindsight has to land before we judge —
+    //    PR merge / human comments / follow-up issues all need real
+    //    time to accumulate. Default 18h. `--force` bypasses but we
+    //    still compute the age so the CLI can log what was skipped.
+    const delayHours = deps.delayHours ?? DEFAULT_DELAY_HOURS;
+    if (delayHours > 0 && !deps.force) {
+      const endNanoResult = yield* deps.dashboardRead
+        .loadDrainEndTime(args.traceId)
+        .pipe(Effect.either);
+      const endNano =
+        endNanoResult._tag === "Right" ? endNanoResult.right : null;
+      const nowMs = (deps.now ?? Date.now)();
+      // Unknown drain age is treated as "fresh" — the conservative
+      // default. An unfound drain may also be a typo / wrong db, but
+      // the operator's explicit recovery is `--force`.
+      const ageHours =
+        endNano !== null ? hoursBetween(endNano, nowMs) : 0;
+      if (ageHours < delayHours) {
+        const retryAfterMs =
+          nowMs + Math.ceil((delayHours - ageHours) * 60 * 60 * 1000);
+        return {
+          kind: "delayed",
+          drainAgeHours: round1(ageHours),
+          thresholdHours: delayHours,
+          retryAfterIso: new Date(retryAfterMs).toISOString(),
+        } satisfies RunReviewPassOutcome;
+      }
+    }
+
     // 1) Load the captured context via the `meta/context` seam.
     //    Discriminated by pass — VA-403 / VA-405 widen the shape
     //    without editing this pass.
@@ -80,6 +152,7 @@ export const runRunReviewPass = (
         pass: "run-review",
         traceId: args.traceId,
         issueIdentifier: args.issueIdentifier,
+        hindsight: deps.hindsight,
       },
       deps.dashboardRead,
     ).pipe(Effect.either);
@@ -107,6 +180,7 @@ export const runRunReviewPass = (
         ctx.issueProcess,
         ctx.codingAgentReport,
         ctx.reviewerReport,
+        ctx.hindsightSignals,
       ),
     }).pipe(Effect.either);
 
@@ -291,9 +365,9 @@ const SYSTEM_PROMPT = [
   "line; the body must be valid JSON. You may emit a short preamble before",
   "the fence, but nothing after the closing fence.",
   "",
-  "Schema (template_version 1.0.0):",
+  "Schema (template_version 1.1.0):",
   "  {",
-  "    \"template_version\": \"1.0.0\",",
+  "    \"template_version\": \"1.1.0\",",
   "    \"issue_identifier\": \"<echo of input>\",",
   "    \"drain_trace_id\": \"<echo of input>\",",
   "    \"final_outcome\": \"<one of: opened | hitl | reverted | errored | unknown>\",",
@@ -305,7 +379,11 @@ const SYSTEM_PROMPT = [
   "    \"recommendations\": [",
   "      {\"target\": <prompt|workflow|sandcastle|issue-body|tooling>, \"change\": \"<concrete change>\", \"confidence\": <LOW|MEDIUM|HIGH>}",
   "    ],",
-  "    \"hindsight_signals\": null",
+  "    \"hindsight_signals\": null | {",
+  "      \"pr\": null | {\"url\": \"<echo>\", \"state\": <open|merged|closed>, \"merged_at\": null | \"<iso>\"},",
+  "      \"human_verdict\": null | {\"sentiment\": <approving|neutral|rejecting>, \"comment_count\": <number>, \"summary\": \"<1-2 sentences>\"},",
+  "      \"follow_up_issues\": [{\"identifier\": \"<id>\", \"title\": \"<title>\"}]",
+  "    }",
   "  }",
   "",
   "Grading guidance:",
@@ -315,9 +393,23 @@ const SYSTEM_PROMPT = [
   "  - FAILED: dimension caused the run to fail or required HITL escape",
   "",
   "All `relative` slots stay `null` at this slice — rolling norms are not",
-  "yet available. `hindsight_signals` stays `null` — hindsight is also a",
-  "later slice. Be honest. The IRA's value is in calling out real",
-  "weaknesses, not in pretending every run was fine.",
+  "yet available.",
+  "",
+  "Hindsight reading (VA-403):",
+  "  - When the user prompt provides a `## Hindsight signals` section,",
+  "    your `hindsight_signals` MUST be a populated object echoing what",
+  "    you observed. Otherwise emit `null`.",
+  "  - Reflect hindsight in your grades. A run that LOOKED clean in-band",
+  "    but produced a closed-without-merge PR or attracted rejecting",
+  "    human comments is NOT a STRONG agent_quality run — downgrade.",
+  "  - A clean merge with no follow-up issues should bias toward STRONG",
+  "    even if the in-band reports were noisy.",
+  "  - Follow-up issues filed within the 48h window are evidence the run",
+  "    didn't fully address the problem; weight them in agent_quality",
+  "    and prompt_quality.",
+  "",
+  "Be honest. The IRA's value is in calling out real weaknesses, not in",
+  "pretending every run was fine.",
 ].join("\n");
 
 const composeUserPrompt = (
@@ -325,6 +417,7 @@ const composeUserPrompt = (
   ip: CapturedIssueProcess,
   agentReport: CapturedCodingAgentReport,
   reviewerReport: CapturedReviewerReport,
+  hindsight: HindsightSignals | null,
 ): string => {
   const lines: string[] = [];
   lines.push(`Drain trace id: ${args.traceId}`);
@@ -369,8 +462,24 @@ const composeUserPrompt = (
     );
     lines.push(reviewerReport.message);
   }
+  if (hindsight !== null) {
+    lines.push("");
+    lines.push("# Hindsight signals");
+    lines.push(
+      "(captured ~18h after the drain — these are real-world reactions",
+      " to the run, not in-band agent claims; weight them appropriately)",
+    );
+    lines.push("");
+    lines.push("```json");
+    lines.push(JSON.stringify(hindsight, null, 2));
+    lines.push("```");
+  }
   lines.push("");
-  lines.push("Emit a `runway-run-review` JSON block grading this run.");
+  lines.push(
+    hindsight !== null
+      ? "Emit a `runway-run-review` JSON block grading this run. Echo the hindsight signals back in your `hindsight_signals` field."
+      : "Emit a `runway-run-review` JSON block grading this run. No hindsight available — set `hindsight_signals` to null.",
+  );
   return lines.join("\n");
 };
 
@@ -425,5 +534,17 @@ const formatParseError = (err: ReportParseError): string => {
 
 const shortenTrace = (traceId: string): string =>
   traceId.length > 8 ? traceId.slice(0, 8) : traceId;
+
+const hoursBetween = (endNanoStr: string, nowMs: number): number => {
+  // end_time_unix_nano arrives as a string-encoded int64 (the OTel
+  // SDK keeps it that way to avoid JS number precision drift).
+  // Comparison is cheap if we drop to ms resolution — the delay
+  // window is in hours, sub-millisecond precision is irrelevant.
+  const endMs = Number(BigInt(endNanoStr) / BigInt(NS_PER_MS));
+  const ageMs = nowMs - endMs;
+  return ageMs / 3_600_000;
+};
+
+const round1 = (n: number): number => Math.round(n * 10) / 10;
 
 const nowIso = (): string => new Date().toISOString().replace("T", " ").slice(0, 19);

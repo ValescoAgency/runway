@@ -32,6 +32,13 @@ const RunwayConfigFileSchema = z.object({
    * Overridden by `RUNWAY_META_PROJECT_NAME` if set in env.
    */
   metaProjectName: z.string().optional(),
+  /**
+   * VA-403: minimum drain age before the IRA grades it. Default 18h
+   * gives hindsight (PR merge state, human review comments, follow-up
+   * issues) time to accumulate. `0` disables the gate. Overridden by
+   * `RUNWAY_REVIEW_DELAY_HOURS` if set in env.
+   */
+  metaReviewDelayHours: z.number().nonnegative().optional(),
 });
 
 export type RunwayConfigFile = z.infer<typeof RunwayConfigFileSchema>;

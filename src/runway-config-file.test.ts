@@ -73,4 +73,21 @@ describe("loadRunwayConfigFile (VA-402)", () => {
     writeConfig("metaReviewModel: 12345");
     expect(() => loadRunwayConfigFile(cwd)).toThrow();
   });
+
+  // VA-403: metaReviewDelayHours field — numeric, non-negative.
+
+  it("parses metaReviewDelayHours as a number", () => {
+    writeConfig("metaReviewDelayHours: 24");
+    expect(loadRunwayConfigFile(cwd).metaReviewDelayHours).toBe(24);
+  });
+
+  it("accepts metaReviewDelayHours: 0 (operator wants no delay)", () => {
+    writeConfig("metaReviewDelayHours: 0");
+    expect(loadRunwayConfigFile(cwd).metaReviewDelayHours).toBe(0);
+  });
+
+  it("rejects a negative metaReviewDelayHours (loud failure)", () => {
+    writeConfig("metaReviewDelayHours: -1");
+    expect(() => loadRunwayConfigFile(cwd)).toThrow();
+  });
 });

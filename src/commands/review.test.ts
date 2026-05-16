@@ -68,4 +68,47 @@ describe("parseRunArgs (VA-402)", () => {
     if (r.kind !== "error") return;
     expect(r.message).toContain("--what");
   });
+
+  // VA-403: --force boolean flag for delay-gate bypass.
+
+  it("defaults force to false when omitted", () => {
+    const r = parseRunArgs(["--drain=deadbeef", "--issue=VA-401"]);
+    expect(r.kind).toBe("ok");
+    if (r.kind !== "ok") return;
+    expect(r.force).toBe(false);
+  });
+
+  it("parses bare --force as true", () => {
+    const r = parseRunArgs([
+      "--drain=deadbeef",
+      "--issue=VA-401",
+      "--force",
+    ]);
+    expect(r.kind).toBe("ok");
+    if (r.kind !== "ok") return;
+    expect(r.force).toBe(true);
+  });
+
+  it("parses --force=true as true", () => {
+    const r = parseRunArgs([
+      "--drain=deadbeef",
+      "--issue=VA-401",
+      "--force=true",
+    ]);
+    expect(r.kind).toBe("ok");
+    if (r.kind !== "ok") return;
+    expect(r.force).toBe(true);
+  });
+
+  it("accepts --force in any position relative to other flags", () => {
+    const r = parseRunArgs([
+      "--force",
+      "--issue=VA-401",
+      "--drain=deadbeef",
+    ]);
+    expect(r.kind).toBe("ok");
+    if (r.kind !== "ok") return;
+    expect(r.force).toBe(true);
+    expect(r.traceId).toBe("deadbeef");
+  });
 });

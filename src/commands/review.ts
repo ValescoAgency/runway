@@ -22,23 +22,28 @@ export interface ReviewArgs {
   readonly verb: "run";
   readonly traceId: string;
   readonly issueIdentifier: string;
+  /** VA-403: bypass the delay gate. */
+  readonly force?: boolean;
 }
 
 export function printReviewUsage(): void {
   console.log(`runway review — IRA retrospective passes
 
 USAGE
-  runway review run --drain <trace-id> --issue <identifier>
+  runway review run --drain <trace-id> --issue <identifier> [--force]
 
 OPTIONS
   --drain <trace-id>     the drain's OTLP trace id (32 hex chars)
   --issue <identifier>   the Linear issue identifier (e.g. VA-401)
+  --force                bypass the drain-age delay gate (VA-403)
 
 ENV
-  ANTHROPIC_API_KEY      required — Claude API key for the IRA call
-  RUNWAY_DASHBOARD_DB    dashboard SQLite path (default: ./runway-dashboard.db)
-  RUNWAY_META_REVIEW_MODEL  override the Anthropic model (default: claude-sonnet-4-6)
-  RUNWAY_META_PROJECT_NAME  override the Linear meta-project name (default: runway-meta)
+  ANTHROPIC_API_KEY            required — Claude API key for the IRA call
+  RUNWAY_DASHBOARD_DB          dashboard SQLite path (default: ./runway-dashboard.db)
+  RUNWAY_META_REVIEW_MODEL     override the Anthropic model (default: claude-sonnet-4-6)
+  RUNWAY_META_PROJECT_NAME     override the Linear meta-project name (default: runway-meta)
+  RUNWAY_REVIEW_DELAY_HOURS    minimum drain age before grading (default: 18; 0 disables)
+  GITHUB_TOKEN                 optional — authenticates GitHub API for hindsight PR fetch
 `);
 }
 
@@ -75,12 +80,21 @@ export async function reviewCommand(argv: readonly string[]): Promise<void> {
 
   const outcome = await Effect.runPromise(
     dispatchRunReview(
-      { traceId: parsed.traceId, issueIdentifier: parsed.issueIdentifier },
+      {
+        traceId: parsed.traceId,
+        issueIdentifier: parsed.issueIdentifier,
+        force: parsed.force,
+      },
       {
         config,
         cwd: process.cwd(),
         dashboardDbPath,
         anthropicApiKey,
+        // VA-403: optional GitHub token. The hindsight gateway runs
+        // unauthenticated when absent (60 reqs/hr, public repos
+        // only) — sufficient for OSS workflows. Set the env var
+        // before invoking for private-repo or rate-limit headroom.
+        githubToken: process.env.GITHUB_TOKEN,
       },
     ),
   );
@@ -88,6 +102,10 @@ export async function reviewCommand(argv: readonly string[]): Promise<void> {
   if (outcome.kind === "review") {
     console.log(
       `[runway review run] ok — meta_review=${outcome.metaReviewId} linear=${outcome.linearIdentifier} (${outcome.linearUrl})`,
+    );
+  } else if (outcome.kind === "delayed") {
+    console.log(
+      `[runway review run] drain too fresh — age=${outcome.drainAgeHours}h, threshold=${outcome.thresholdHours}h. Retry after ${outcome.retryAfterIso} (or pass --force to override).`,
     );
   } else {
     console.log(
@@ -99,19 +117,33 @@ export async function reviewCommand(argv: readonly string[]): Promise<void> {
 }
 
 type ParseResult =
-  | { kind: "ok"; traceId: string; issueIdentifier: string }
+  | {
+      kind: "ok";
+      traceId: string;
+      issueIdentifier: string;
+      force: boolean;
+    }
   | { kind: "error"; message: string };
 
 /**
  * Minimal argv parser — supports `--drain <id> --issue <id>` (with
- * `=` allowed in either form). Order independent.
+ * `=` allowed in either form) plus the boolean `--force` flag.
+ * Order independent.
  */
 export function parseRunArgs(argv: readonly string[]): ParseResult {
   let traceId: string | undefined;
   let issueIdentifier: string | undefined;
+  let force = false;
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === undefined) continue;
+    // VA-403: --force is a boolean flag — handled before consumeFlag
+    // so a stray positional after it doesn't get swallowed as the
+    // flag's value.
+    if (arg === "--force") {
+      force = true;
+      continue;
+    }
     const split = consumeFlag(arg, argv, i);
     if (!split) continue;
     if (split.name === "--drain") {
@@ -119,6 +151,10 @@ export function parseRunArgs(argv: readonly string[]): ParseResult {
       i = split.advance;
     } else if (split.name === "--issue") {
       issueIdentifier = split.value;
+      i = split.advance;
+    } else if (split.name === "--force") {
+      // The `--force=true` form also accepted (operator scripted CI).
+      force = split.value !== "false";
       i = split.advance;
     } else {
       return { kind: "error", message: `unknown flag: ${split.name}` };
@@ -130,7 +166,7 @@ export function parseRunArgs(argv: readonly string[]): ParseResult {
   if (!issueIdentifier) {
     return { kind: "error", message: "missing required --issue <identifier>" };
   }
-  return { kind: "ok", traceId, issueIdentifier };
+  return { kind: "ok", traceId, issueIdentifier, force };
 }
 
 interface ConsumedFlag {

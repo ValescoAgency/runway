@@ -64,6 +64,10 @@ const buildFixtures = () => {
 
   const dashboardRead = {
     loadIssueProcess: vi.fn(() => Effect.succeed(captured)),
+    // VA-403: loadDrainEndTime is the delay-gate input. The default
+    // mock returns null ("unknown") so existing happy/failure-path
+    // tests pass `delayHours: 0` to bypass the gate entirely.
+    loadDrainEndTime: vi.fn(() => Effect.succeed(null)),
     loadCodingAgentReport: vi.fn(() =>
       Effect.succeed({
         ok: true as const,
@@ -132,6 +136,9 @@ describe("runRunReviewPass (VA-402)", () => {
           dashboardRead: f.dashboardRead,
           metaLinear: f.metaLinear,
           storage: f.storage,
+          // VA-403: bypass the delay gate — these tests focus on
+          // the LLM / persistence paths, not on age checking.
+          delayHours: 0,
         },
       ),
     );
@@ -168,6 +175,9 @@ describe("runRunReviewPass (VA-402)", () => {
           dashboardRead: f.dashboardRead,
           metaLinear: f.metaLinear,
           storage: f.storage,
+          // VA-403: bypass the delay gate — these tests focus on
+          // the LLM / persistence paths, not on age checking.
+          delayHours: 0,
         },
       ),
     );
@@ -211,6 +221,9 @@ describe("runRunReviewPass (VA-402)", () => {
           dashboardRead: f.dashboardRead,
           metaLinear: f.metaLinear,
           storage: f.storage,
+          // VA-403: bypass the delay gate — these tests focus on
+          // the LLM / persistence paths, not on age checking.
+          delayHours: 0,
         },
       ),
     );
@@ -244,6 +257,9 @@ describe("runRunReviewPass (VA-402)", () => {
           dashboardRead: f.dashboardRead,
           metaLinear: f.metaLinear,
           storage: f.storage,
+          // VA-403: bypass the delay gate — these tests focus on
+          // the LLM / persistence paths, not on age checking.
+          delayHours: 0,
         },
       ),
     );
@@ -283,6 +299,9 @@ describe("runRunReviewPass (VA-402)", () => {
           dashboardRead: f.dashboardRead,
           metaLinear: f.metaLinear,
           storage: f.storage,
+          // VA-403: bypass the delay gate — these tests focus on
+          // the LLM / persistence paths, not on age checking.
+          delayHours: 0,
         },
       ),
     );
@@ -295,5 +314,172 @@ describe("runRunReviewPass (VA-402)", () => {
     expect(callRunReviewMock).not.toHaveBeenCalled();
     // Linear stub still lands so the gap appears in the meta-project.
     expect(f.metaLinear.createRunReviewIssue).toHaveBeenCalledTimes(1);
+  });
+
+  // VA-403: delay gate. Drain end-time loaded from dashboard-read;
+  // compared against now - delayHours. Younger drains short-circuit
+  // with a `delayed` outcome, no LLM / Linear / SQLite write.
+
+  it("returns kind=delayed without calling Anthropic when drain is younger than delayHours", async () => {
+    const f = buildFixtures();
+    // Drain ended 2 hours ago — younger than the 18h default.
+    const twoHoursAgoNs = String(
+      BigInt(Date.now() - 2 * 3_600 * 1000) * BigInt(1_000_000),
+    );
+    f.dashboardRead.loadDrainEndTime = vi.fn(() =>
+      Effect.succeed(twoHoursAgoNs),
+    ) as unknown as typeof f.dashboardRead.loadDrainEndTime;
+
+    const outcome = await Effect.runPromise(
+      runRunReviewPass(
+        { traceId: "trace-fresh", issueIdentifier: "VA-401" },
+        {
+          anthropicApiKey: "test-key",
+          metaReviewModel: "claude-sonnet-4-6",
+          dashboardRead: f.dashboardRead,
+          metaLinear: f.metaLinear,
+          storage: f.storage,
+          // omit delayHours → defaults to 18
+        },
+      ),
+    );
+
+    expect(outcome.kind).toBe("delayed");
+    if (outcome.kind !== "delayed") return;
+    expect(outcome.thresholdHours).toBe(18);
+    expect(outcome.drainAgeHours).toBeGreaterThanOrEqual(1.5);
+    expect(outcome.drainAgeHours).toBeLessThan(3);
+    // No Anthropic call, no Linear write, no SQLite row.
+    expect(callRunReviewMock).not.toHaveBeenCalled();
+    expect(f.metaLinear.createRunReviewIssue).not.toHaveBeenCalled();
+    expect(f.saved).toHaveLength(0);
+  });
+
+  it("proceeds normally when drain is older than delayHours", async () => {
+    const f = buildFixtures();
+    // Drain ended 24 hours ago — older than 18h default.
+    const dayAgoNs = String(
+      BigInt(Date.now() - 24 * 3_600 * 1000) * BigInt(1_000_000),
+    );
+    f.dashboardRead.loadDrainEndTime = vi.fn(() =>
+      Effect.succeed(dayAgoNs),
+    ) as unknown as typeof f.dashboardRead.loadDrainEndTime;
+    callRunReviewMock.mockReturnValueOnce(
+      Effect.succeed({ ok: true, report: validReview }),
+    );
+
+    const outcome = await Effect.runPromise(
+      runRunReviewPass(
+        { traceId: "trace-mature", issueIdentifier: "VA-401" },
+        {
+          anthropicApiKey: "test-key",
+          metaReviewModel: "claude-sonnet-4-6",
+          dashboardRead: f.dashboardRead,
+          metaLinear: f.metaLinear,
+          storage: f.storage,
+        },
+      ),
+    );
+
+    expect(outcome.kind).toBe("review");
+    expect(callRunReviewMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("bypasses the delay gate when force=true (operator --force)", async () => {
+    const f = buildFixtures();
+    // Drain literally just ended.
+    const justNowNs = String(BigInt(Date.now()) * BigInt(1_000_000));
+    f.dashboardRead.loadDrainEndTime = vi.fn(() =>
+      Effect.succeed(justNowNs),
+    ) as unknown as typeof f.dashboardRead.loadDrainEndTime;
+    callRunReviewMock.mockReturnValueOnce(
+      Effect.succeed({ ok: true, report: validReview }),
+    );
+
+    const outcome = await Effect.runPromise(
+      runRunReviewPass(
+        { traceId: "trace-fresh", issueIdentifier: "VA-401" },
+        {
+          anthropicApiKey: "test-key",
+          metaReviewModel: "claude-sonnet-4-6",
+          dashboardRead: f.dashboardRead,
+          metaLinear: f.metaLinear,
+          storage: f.storage,
+          force: true,
+        },
+      ),
+    );
+
+    expect(outcome.kind).toBe("review");
+  });
+
+  it("treats unknown drain age as fresh (loadDrainEndTime returns null → delayed)", async () => {
+    const f = buildFixtures();
+    f.dashboardRead.loadDrainEndTime = vi.fn(() =>
+      Effect.succeed(null),
+    ) as unknown as typeof f.dashboardRead.loadDrainEndTime;
+
+    const outcome = await Effect.runPromise(
+      runRunReviewPass(
+        { traceId: "trace-unknown", issueIdentifier: "VA-401" },
+        {
+          anthropicApiKey: "test-key",
+          metaReviewModel: "claude-sonnet-4-6",
+          dashboardRead: f.dashboardRead,
+          metaLinear: f.metaLinear,
+          storage: f.storage,
+          // default delayHours = 18, default force = false
+        },
+      ),
+    );
+
+    expect(outcome.kind).toBe("delayed");
+    expect(callRunReviewMock).not.toHaveBeenCalled();
+  });
+
+  // VA-403: hindsight wiring. The pass passes ctx.hindsightSignals
+  // into composeUserPrompt; we verify the LLM was called with a
+  // prompt that mentions the hindsight section.
+
+  it("includes hindsight signals in the LLM user prompt when wired", async () => {
+    const f = buildFixtures();
+    callRunReviewMock.mockReturnValueOnce(
+      Effect.succeed({ ok: true, report: validReview }),
+    );
+    const github = {
+      fetchPrState: vi.fn(() =>
+        Effect.succeed({
+          url: "https://github.com/x/y/pull/103",
+          state: "merged" as const,
+          mergedAt: "2026-05-15T01:23Z",
+          humanComments: [],
+        }),
+      ),
+    };
+    const linear = {
+      findFollowUpIssues: vi.fn(() => Effect.succeed([])),
+    };
+
+    await Effect.runPromise(
+      runRunReviewPass(
+        { traceId: "trace-abc", issueIdentifier: "VA-401" },
+        {
+          anthropicApiKey: "test-key",
+          metaReviewModel: "claude-sonnet-4-6",
+          dashboardRead: f.dashboardRead,
+          metaLinear: f.metaLinear,
+          storage: f.storage,
+          hindsight: { github, linear },
+          delayHours: 0,
+        },
+      ),
+    );
+
+    expect(callRunReviewMock).toHaveBeenCalledTimes(1);
+    const llmCall = callRunReviewMock.mock.calls[0]?.[0] as
+      | { userPrompt?: string }
+      | undefined;
+    expect(llmCall?.userPrompt).toContain("# Hindsight signals");
+    expect(llmCall?.userPrompt).toContain('"state": "merged"');
   });
 });

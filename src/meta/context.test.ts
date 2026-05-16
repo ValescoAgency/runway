@@ -148,4 +148,112 @@ describe("loadContextFor — pass: run-review (VA-402)", () => {
     if (result.context.reviewerReport.ok) return;
     expect(result.context.reviewerReport.kind).toBe("missing");
   });
+
+  // VA-403: hindsight wiring. Optional argument — when omitted,
+  // hindsightSignals stays null (back-compat). When present, it
+  // composes PR state + Linear follow-ups concurrently into the
+  // populated v1.1.0 shape.
+
+  it("leaves hindsightSignals null when no hindsight gateways are wired (v1.0.0 back-compat)", async () => {
+    const gateway = makeGateway();
+    const result = await Effect.runPromise(
+      loadContextFor(
+        { pass: "run-review", traceId: "trace-abc", issueIdentifier: "VA-401" },
+        gateway,
+      ),
+    );
+    if (result.pass !== "run-review") return;
+    expect(result.context.hindsightSignals).toBeNull();
+  });
+
+  it("composes hindsight from injected gateways when wired", async () => {
+    const gateway = makeGateway({
+      loadIssueProcess: vi.fn(() =>
+        Effect.succeed({
+          ...baseIssueProcess,
+          prUrl: "https://github.com/foo/bar/pull/103",
+        }),
+      ),
+    });
+    const github = {
+      fetchPrState: vi.fn(() =>
+        Effect.succeed({
+          url: "https://github.com/foo/bar/pull/103",
+          state: "merged" as const,
+          mergedAt: "2026-05-15T01:23Z",
+          humanComments: [],
+        }),
+      ),
+    };
+    const linear = {
+      findFollowUpIssues: vi.fn(() =>
+        Effect.succeed([
+          { identifier: "VA-501", title: "Follow-up to VA-401" },
+        ]),
+      ),
+    };
+    const result = await Effect.runPromise(
+      loadContextFor(
+        {
+          pass: "run-review",
+          traceId: "trace-abc",
+          issueIdentifier: "VA-401",
+          hindsight: { github, linear },
+        },
+        gateway,
+      ),
+    );
+    if (result.pass !== "run-review") return;
+    expect(result.context.hindsightSignals).not.toBeNull();
+    if (result.context.hindsightSignals === null) return;
+    expect(result.context.hindsightSignals.pr?.state).toBe("merged");
+    expect(result.context.hindsightSignals.follow_up_issues).toHaveLength(1);
+    // Linear follow-up gateway received an ISO cutoff in the past
+    // (default 48h window). Don't assert on the exact value (test
+    // would race the clock); just assert it was called.
+    expect(linear.findFollowUpIssues).toHaveBeenCalledTimes(1);
+    const call = (linear.findFollowUpIssues as unknown as {
+      readonly mock: { readonly calls: ReadonlyArray<[{ sourceIdentifier: string; sinceIso: string }]> };
+    }).mock.calls[0]?.[0];
+    expect(call?.sourceIdentifier).toBe("VA-401");
+    expect(typeof call?.sinceIso).toBe("string");
+  });
+
+  it("respects an operator-supplied followUpWindowHours override", async () => {
+    const gateway = makeGateway({
+      loadIssueProcess: vi.fn(() =>
+        Effect.succeed({ ...baseIssueProcess, prUrl: null }),
+      ),
+    });
+    const github = {
+      fetchPrState: vi.fn(() => Effect.succeed(null)),
+    };
+    const linear = {
+      findFollowUpIssues: vi.fn(() => Effect.succeed([])),
+    };
+    const before = Date.now();
+    await Effect.runPromise(
+      loadContextFor(
+        {
+          pass: "run-review",
+          traceId: "trace-abc",
+          issueIdentifier: "VA-401",
+          hindsight: { github, linear, followUpWindowHours: 24 },
+        },
+        gateway,
+      ),
+    );
+    const sinceIso = ((
+      linear.findFollowUpIssues as unknown as {
+        readonly mock: { readonly calls: ReadonlyArray<[{ sinceIso: string }]> };
+      }
+    ).mock.calls[0]?.[0]?.sinceIso) as string;
+    const sinceMs = Date.parse(sinceIso);
+    // 24h window: cutoff should be ~24h before "now" (with a tiny
+    // slack for test runtime). Lower bound: at least 24h - 1min ago.
+    // Upper bound: at most 24h + 1min ago.
+    const expectedCutoff = before - 24 * 60 * 60 * 1000;
+    expect(sinceMs).toBeLessThanOrEqual(expectedCutoff + 60_000);
+    expect(sinceMs).toBeGreaterThanOrEqual(expectedCutoff - 60_000);
+  });
 });
