@@ -1,10 +1,12 @@
 import { Effect } from "effect";
-import type {
-  CapturedCodingAgentReport,
-  CapturedIssueProcess,
-  CapturedReviewerReport,
-  MetaDashboardRead,
-  MetaReadError,
+import {
+  categoryFromIssueIdentifier,
+  type CapturedCodingAgentReport,
+  type CapturedIssueProcess,
+  type CapturedNorms,
+  type CapturedReviewerReport,
+  type MetaDashboardRead,
+  type MetaReadError,
 } from "./dashboard-read.js";
 import {
   fetchHindsightSignals,
@@ -37,10 +39,10 @@ import type { HindsightSignals } from "./templates.js";
 // ---------------------------------------------------------------------------
 
 /**
- * Run Review pass context (v1.1.0 — adds hindsight; norms still
- * reserved). The three `Captured*` shapes carry their own success /
- * failure variants — see `dashboard-read.ts`. The pass never
- * crashes on a report parse failure; it grades on what it has.
+ * Run Review pass context (v1.2.0 — adds rolling norms). The
+ * `Captured*` shapes carry their own success / failure variants — see
+ * `dashboard-read.ts`. The pass never crashes on a report parse
+ * failure; it grades on what it has.
  */
 export interface RunReviewContext {
   readonly issueProcess: CapturedIssueProcess;
@@ -56,9 +58,13 @@ export interface RunReviewContext {
   // hindsight gateways were wired in (back-compat for v1.0.0
   // callers that haven't been updated to construct them).
   readonly hindsightSignals: HindsightSignals | null;
-  // VA-405 wires rolling norms from the VA-399 read-model. Same
-  // null-reserved pattern.
-  readonly norms: null;
+  // VA-405: rolling norms (median/p95 iteration, wall-time, rejection
+  // / revert / hitl / infra rates) for the issue category, sourced
+  // from VA-399's evaluator-facing read-model. Null when (a) the
+  // caller didn't ask for norms (back-compat with v1.1.0), (b) the
+  // category has no rows in the configured window, or (c) the gateway
+  // failed (degraded read — the pass continues without).
+  readonly norms: CapturedNorms | null;
 }
 
 /**
@@ -93,6 +99,12 @@ export type LoadContextArgs =
       // fetches PR state + follow-ups; when absent `hindsightSignals`
       // stays null (back-compat with v1.0.0 callers).
       readonly hindsight?: HindsightWiring;
+      // VA-405: rolling-norm window in drains. When present the
+      // loader queries `loadNorms(category, window)` and projects the
+      // result into `context.norms`. When absent, `norms` stays null
+      // (v1.0.0 / v1.1.0 back-compat — older callers that haven't been
+      // updated keep the legacy "no relative axis" behavior).
+      readonly normsWindow?: number;
     };
 
 export type LoadContextResult =
@@ -123,6 +135,7 @@ const loadRunReviewContext = (
     readonly traceId: string;
     readonly issueIdentifier: string;
     readonly hindsight?: HindsightWiring;
+    readonly normsWindow?: number;
   },
   gateway: MetaDashboardRead,
 ): Effect.Effect<RunReviewContext, MetaReadError> =>
@@ -186,13 +199,26 @@ const loadRunReviewContext = (
           },
         )
       : null;
+    // VA-405: rolling norms via VA-399's read-model. Tolerant — the
+    // gateway error collapses to null so the IRA still grades (just
+    // without a relative axis). Callers that pass `normsWindow=0` /
+    // omit it entirely keep the v1.1.0 contract.
+    const norms =
+      args.normsWindow !== undefined && args.normsWindow > 0
+        ? yield* gateway
+            .loadNorms(
+              categoryFromIssueIdentifier(issueProcess.issueIdentifier),
+              args.normsWindow,
+            )
+            .pipe(Effect.orElseSucceed((): CapturedNorms | null => null))
+        : null;
     return {
       issueProcess,
       codingAgentReport,
       reviewerReport,
       reviewAttemptCount,
       hindsightSignals,
-      norms: null,
+      norms,
     };
   });
 

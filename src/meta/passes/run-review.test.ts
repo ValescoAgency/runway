@@ -91,6 +91,10 @@ const buildFixtures = () => {
     // the fixture (single review = clean). Tests that exercise the
     // retry-then-success skip-gate override per-test.
     countReviewAttempts: vi.fn(() => Effect.succeed(1)),
+    // VA-405: norms gateway. Default returns null ("no norms for
+    // this category"). The pass only calls through when deps.normsWindow
+    // is set + non-zero — most existing tests don't opt in.
+    loadNorms: vi.fn(() => Effect.succeed(null)),
   } as unknown as import("../dashboard-read.js").MetaDashboardRead;
 
   const metaLinear = {
@@ -531,6 +535,85 @@ describe("runRunReviewPass (VA-402)", () => {
   // VA-403: hindsight wiring. The pass passes ctx.hindsightSignals
   // into composeUserPrompt; we verify the LLM was called with a
   // prompt that mentions the hindsight section.
+
+  // VA-405: norms wiring. When `normsWindow` is set on deps, the
+  // pass threads it through the context loader and the IRA's user
+  // prompt grows a `# Norms` section. When omitted, behavior is the
+  // v1.1.0 path: no norms in the prompt, no loadNorms call.
+
+  it("includes norms in the LLM user prompt when normsWindow is set", async () => {
+    const f = buildFixtures();
+    callRunReviewMock.mockReturnValueOnce(
+      Effect.succeed({ ok: true, report: validReview }),
+    );
+    f.dashboardRead.loadNorms = vi.fn(() =>
+      Effect.succeed({
+        category: "VA",
+        windowDrains: 30,
+        sampleSize: 12,
+        medianIterationCount: 2,
+        p95IterationCount: 4,
+        medianWallTimeMs: 60_000,
+        p95WallTimeMs: 180_000,
+        reviewerRejectionRate: 0.1,
+        revertRate: 0,
+        hitlEscapeRate: 0.15,
+        infraErrorRate: 0,
+      }),
+    ) as unknown as typeof f.dashboardRead.loadNorms;
+
+    await Effect.runPromise(
+      runRunReviewPass(
+        { traceId: "trace-abc", issueIdentifier: "VA-401" },
+        {
+          anthropicApiKey: "test-key",
+          metaReviewModel: "claude-sonnet-4-6",
+          dashboardRead: f.dashboardRead,
+          metaLinear: f.metaLinear,
+          storage: f.storage,
+          delayHours: 0,
+          normsWindow: 30,
+        },
+      ),
+    );
+
+    expect(f.dashboardRead.loadNorms).toHaveBeenCalledWith("VA", 30);
+    const llmCall = callRunReviewMock.mock.calls[0]?.[0] as
+      | { userPrompt?: string }
+      | undefined;
+    expect(llmCall?.userPrompt).toContain("# Norms");
+    expect(llmCall?.userPrompt).toContain('"category": "VA"');
+    expect(llmCall?.userPrompt).toContain("populate every `relative`");
+  });
+
+  it("omits the # Norms section when norms aren't wired (back-compat)", async () => {
+    const f = buildFixtures();
+    callRunReviewMock.mockReturnValueOnce(
+      Effect.succeed({ ok: true, report: validReview }),
+    );
+
+    await Effect.runPromise(
+      runRunReviewPass(
+        { traceId: "trace-abc", issueIdentifier: "VA-401" },
+        {
+          anthropicApiKey: "test-key",
+          metaReviewModel: "claude-sonnet-4-6",
+          dashboardRead: f.dashboardRead,
+          metaLinear: f.metaLinear,
+          storage: f.storage,
+          delayHours: 0,
+          // no normsWindow
+        },
+      ),
+    );
+
+    const llmCall = callRunReviewMock.mock.calls[0]?.[0] as
+      | { userPrompt?: string }
+      | undefined;
+    expect(llmCall?.userPrompt).not.toContain("# Norms");
+    expect(llmCall?.userPrompt).toContain("leave every `relative` slot as null");
+    expect(f.dashboardRead.loadNorms).not.toHaveBeenCalled();
+  });
 
   it("includes hindsight signals in the LLM user prompt when wired", async () => {
     const f = buildFixtures();

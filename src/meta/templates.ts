@@ -194,15 +194,15 @@ export function parseReviewerReport(
 // Run Review (v1.0.0) — IRA's per-issue retrospective verdict
 // ---------------------------------------------------------------------------
 
-export const RUN_REVIEW_VERSION = "1.1.0";
+export const RUN_REVIEW_VERSION = "1.2.0";
 export const RUN_REVIEW_FENCE_TAG = "runway-run-review";
 
 /**
  * VA-402: PRD-spec absolute quality axis. STRONG / ADEQUATE / WEAK /
  * FAILED captures the IRA's view of how well runway performed each
- * dimension on this run. Independent of the relative axis (BETTER /
- * STEADY / WORSE vs. recent norms), which lands in VA-405 — at this
- * slice the relative slots stay null.
+ * dimension on this run. Paired with the VA-405 relative axis
+ * (BETTER / STEADY / WORSE vs. recent norms) — each grading section
+ * carries both.
  */
 const QualityAbsoluteSchema = z.enum([
   "STRONG",
@@ -214,10 +214,13 @@ const QualityAbsoluteSchema = z.enum([
 const QualityRelativeSchema = z.enum(["BETTER", "STEADY", "WORSE"]);
 
 /**
- * Each quality dimension has an absolute axis + (eventually) a
- * relative axis. The relative slot stays `null` at this slice; VA-405
- * populates it once rolling norms exist. Justification is one short
- * sentence — the IRA's reason for the absolute grade.
+ * Each quality dimension has an absolute axis + a relative axis. The
+ * relative slot is populated when the IRA had rolling norms to
+ * compare against (v1.2.0+ when norms were wired) and `null`
+ * otherwise (v1.1.0 callers, or v1.2.0 runs where the category has
+ * no rows in the configured window). Justification is one short
+ * sentence — the IRA's reason for the absolute grade; ideally also
+ * mentions how the relative grade was derived when populated.
  */
 const QualitySectionSchema = z.object({
   absolute: QualityAbsoluteSchema,

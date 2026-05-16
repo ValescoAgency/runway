@@ -100,6 +100,51 @@ export type CapturedReviewerReport =
       readonly message: string;
     };
 
+/**
+ * VA-405: rolling norms for one issue category, sourced from the
+ * VA-399 evaluator-facing read-model. Field shapes mirror
+ * `EvaluatorAggregate` (the dashboard's `evaluator_aggregates_v1`
+ * view) so a SQL-side and IRA-side reference both point at the same
+ * named columns — see `src/dashboard/read-model.md` for the contract.
+ *
+ * `windowDrains` is echoed back from the loader's request so a Run
+ * Review's `# Norms` user-prompt section is self-describing — the
+ * IRA's grade can reason about "vs typical of the last N drains"
+ * without an out-of-band lookup.
+ *
+ * `sampleSize < 5` rows are returned verbatim — the IRA's prompt is
+ * instructed to caveat small-sample comparisons rather than the
+ * gateway pretending they don't exist. Operators inspecting the user
+ * prompt should see exactly what the IRA was given.
+ */
+export interface CapturedNorms {
+  readonly category: string;
+  readonly windowDrains: number;
+  readonly sampleSize: number;
+  readonly medianIterationCount: number | null;
+  readonly p95IterationCount: number | null;
+  readonly medianWallTimeMs: number | null;
+  readonly p95WallTimeMs: number | null;
+  readonly reviewerRejectionRate: number;
+  readonly revertRate: number;
+  readonly hitlEscapeRate: number;
+  readonly infraErrorRate: number;
+}
+
+/**
+ * VA-405: derive a comparison cohort from an issue identifier. Mirrors
+ * the SQL `CASE WHEN instr(id, '-') > 0 THEN substr(...) ELSE id END`
+ * in `evaluator_aggregates_v1` so the gateway and the view agree on
+ * what "same kind of issue" means.
+ *
+ *   "VA-401" → "VA"
+ *   "OPS"    → "OPS"
+ */
+export function categoryFromIssueIdentifier(identifier: string): string {
+  const dash = identifier.indexOf("-");
+  return dash > 0 ? identifier.slice(0, dash) : identifier;
+}
+
 // ---------------------------------------------------------------------------
 // Gateway interface
 // ---------------------------------------------------------------------------
@@ -161,6 +206,23 @@ export interface MetaDashboardRead {
     traceId: string,
     issueProcessSpanId: string,
   ): Effect.Effect<number, MetaReadError>;
+  /**
+   * VA-405: rolling norms for one issue category over the last N
+   * drains. Mirrors the SQL of `evaluator_aggregates_v1` (VA-399's
+   * read-model) but is parameterized by `windowDrains` so the IRA can
+   * pick its own comparison window without depending on the dashboard
+   * process's view configuration. Returns `null` when the category
+   * has no rows in the window — first run for a new team prefix, or
+   * the window is too short.
+   *
+   * Reads raw event tables directly rather than the view: the IRA's
+   * SQLite handle is read-only, and re-`CREATE VIEW`-ing per call
+   * would race the dashboard's UI queries against the same name.
+   */
+  loadNorms(
+    category: string,
+    windowDrains: number,
+  ): Effect.Effect<CapturedNorms | null, MetaReadError>;
 }
 
 /**
@@ -223,6 +285,76 @@ export function createMetaDashboardRead(path: string): MetaDashboardRead {
     WHERE trace_id = ?
       AND name = 'review'
       AND json_extract(payload, '$.parentSpanId') = ?
+  `);
+
+  // VA-405: rolling norms for one issue-category, computed inline
+  // from the raw event tables. The shape mirrors the view in
+  // `src/dashboard/storage.ts` (VA-399) — same percentile semantics
+  // (nearest-rank), same outcome-kind clauses, same wall-time math —
+  // but the window N is a bound parameter so the IRA picks per call
+  // rather than inheriting the dashboard process's setting.
+  //
+  // SQLite's prepared-statement compiler can't bind LIMIT (in older
+  // versions) so the window is inlined as a positional `?` inside a
+  // CTE that filters drains by start time. The first parameter is the
+  // window N; the second is the issue category.
+  const selectNorms = db.prepare(`
+    WITH recent_drains AS (
+      SELECT trace_id
+      FROM drains
+      ORDER BY CAST(start_time_unix_nano AS INTEGER) DESC
+      LIMIT ?
+    ),
+    process_rows AS (
+      SELECT
+        ip.outcome_kind,
+        COALESCE(ip.outcome_detail, '') AS outcome_detail,
+        (CAST(ip.end_time_unix_nano AS INTEGER) - CAST(ip.start_time_unix_nano AS INTEGER)) / 1000000 AS wall_time_ms,
+        (
+          SELECT COUNT(*) FROM agent_iterations a
+          WHERE a.trace_id = ip.trace_id AND a.issue_process_id = ip.span_id
+        ) AS iteration_count
+      FROM issue_processes ip
+      WHERE ip.trace_id IN (SELECT trace_id FROM recent_drains)
+        AND (
+          CASE
+            WHEN instr(ip.issue_identifier, '-') > 0
+              THEN substr(ip.issue_identifier, 1, instr(ip.issue_identifier, '-') - 1)
+            ELSE ip.issue_identifier
+          END
+        ) = ?
+    ),
+    wt_ranked AS (
+      SELECT wall_time_ms,
+             ROW_NUMBER() OVER (ORDER BY wall_time_ms) AS rn,
+             COUNT(*) OVER () AS cnt
+      FROM process_rows
+    ),
+    it_ranked AS (
+      SELECT iteration_count,
+             ROW_NUMBER() OVER (ORDER BY iteration_count) AS rn,
+             COUNT(*) OVER () AS cnt
+      FROM process_rows
+    )
+    SELECT
+      (SELECT COUNT(*) FROM process_rows) AS sample_size,
+      (SELECT AVG(iteration_count * 1.0) FROM it_ranked
+         WHERE rn IN ((cnt + 1) / 2, (cnt / 2) + 1))                      AS median_iteration_count,
+      (SELECT MIN(iteration_count) FROM it_ranked
+         WHERE rn >= (cnt * 95 + 99) / 100)                               AS p95_iteration_count,
+      (SELECT AVG(wall_time_ms * 1.0) FROM wt_ranked
+         WHERE rn IN ((cnt + 1) / 2, (cnt / 2) + 1))                      AS median_wall_time_ms,
+      (SELECT MIN(wall_time_ms) FROM wt_ranked
+         WHERE rn >= (cnt * 95 + 99) / 100)                               AS p95_wall_time_ms,
+      COALESCE((SELECT AVG(CASE WHEN outcome_kind = 'hitl' AND outcome_detail LIKE 'Sub-agent review rejected%'
+                                THEN 1.0 ELSE 0.0 END)
+                FROM process_rows), 0)                                    AS reviewer_rejection_rate,
+      COALESCE((SELECT AVG(CASE WHEN outcome_kind = 'reverted' THEN 1.0 ELSE 0.0 END)
+                FROM process_rows), 0)                                    AS revert_rate,
+      COALESCE((SELECT AVG(CASE WHEN outcome_kind = 'hitl' THEN 1.0 ELSE 0.0 END)
+                FROM process_rows), 0)                                    AS hitl_escape_rate,
+      COALESCE((SELECT AVG(CASE WHEN outcome_kind = 'errored' THEN 1.0 ELSE 0.0 END)
+                FROM process_rows), 0)                                    AS infra_error_rate
   `);
 
   const wrap = <A>(
@@ -347,6 +479,38 @@ export function createMetaDashboardRead(path: string): MetaDashboardRead {
         return Number(row?.attempts ?? 0);
       });
     },
+
+    loadNorms(category, windowDrains) {
+      return wrap("loadNorms", () => {
+        // Window must be a positive integer; coerce here so a typo in
+        // config (`0`, `-1`, `"30"`) lands as a sane SQL bind rather
+        // than confusing SQLite.
+        const n = Math.max(1, Math.floor(windowDrains));
+        const row = selectNorms.get(n, category) as
+          | Record<string, unknown>
+          | undefined;
+        // The aggregator returns a single-row result; sample_size is
+        // the only field that distinguishes "no rows" from "rows with
+        // null medians". A sample of zero is the null case — the IRA
+        // sees no norms for this category and gracefully emits null
+        // relatives.
+        const sampleSize = Number(row?.sample_size ?? 0);
+        if (sampleSize === 0) return null;
+        return {
+          category,
+          windowDrains: n,
+          sampleSize,
+          medianIterationCount: nullableNum(row?.median_iteration_count),
+          p95IterationCount: nullableNum(row?.p95_iteration_count),
+          medianWallTimeMs: nullableNum(row?.median_wall_time_ms),
+          p95WallTimeMs: nullableNum(row?.p95_wall_time_ms),
+          reviewerRejectionRate: Number(row?.reviewer_rejection_rate ?? 0),
+          revertRate: Number(row?.revert_rate ?? 0),
+          hitlEscapeRate: Number(row?.hitl_escape_rate ?? 0),
+          infraErrorRate: Number(row?.infra_error_rate ?? 0),
+        } satisfies CapturedNorms;
+      });
+    },
   };
 }
 
@@ -354,6 +518,12 @@ function nullableStr(v: unknown): string | null {
   if (v === null || v === undefined) return null;
   const s = String(v);
   return s.length === 0 ? null : s;
+}
+
+function nullableNum(v: unknown): number | null {
+  if (v === null || v === undefined) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 
 function extractAttrs(payloadJson: string): Record<string, unknown> {
