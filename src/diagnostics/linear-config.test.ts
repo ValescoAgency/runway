@@ -77,7 +77,7 @@ describe("linearConfigDiagnostic", () => {
     loadConfigMock.mockReturnValue({
       linearTeam: "VA",
       readyLabel: "ready-for-agent",
-      hitlLabel: "needs-human",
+      hitlLabel: "missing-label-on-purpose",
     });
     validateLinearConfigMock.mockResolvedValue({
       team: { kind: "ok", id: "team-uuid" },

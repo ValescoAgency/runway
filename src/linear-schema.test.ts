@@ -336,11 +336,12 @@ describe("VA-416 — applyLabel resolves workspace-scope labels, not just team-s
 });
 
 // VA-423: pickup-time claim signal. The orchestrator calls
-// `removeLabel(issueId, config.readyLabel)` once an issue is chosen
-// so the next drain doesn't re-pick it. Idempotent — a no-op write
-// when the label is already absent.
+// `removeLabel(issueId, config.readyLabel)` once an issue is chosen.
+// The returned `{ removed }` lets the caller distinguish the claim-
+// winner branch from the lost-race branch so the loser can skip
+// before doing visible work.
 describe("VA-423 — removeLabel claim signal", () => {
-  it("issues an updateIssue write with the label filtered out of the labelIds set", async () => {
+  it("issues an updateIssue write and returns `removed: true` when the label was present", async () => {
     updateIssueMock.mockResolvedValueOnce({});
     issueGetMock.mockResolvedValueOnce({
       labels: vi.fn().mockResolvedValueOnce({
@@ -358,12 +359,15 @@ describe("VA-423 — removeLabel claim signal", () => {
         .pipe(Effect.either),
     );
     expect(Either.isRight(result)).toBe(true);
+    if (Either.isRight(result)) {
+      expect(result.right).toEqual({ removed: true });
+    }
     expect(updateIssueMock).toHaveBeenCalledWith("issue-uuid", {
       labelIds: ["lbl-other"],
     });
   });
 
-  it("is a no-op when the label is already absent (idempotent re-run / operator-removed)", async () => {
+  it("returns `removed: false` and skips the write when the label is already absent (lost claim race / operator-removed)", async () => {
     issueGetMock.mockResolvedValueOnce({
       labels: vi.fn().mockResolvedValueOnce({
         nodes: [{ id: "lbl-other", name: "Bug" }],
@@ -377,8 +381,14 @@ describe("VA-423 — removeLabel claim signal", () => {
         .pipe(Effect.either),
     );
     expect(Either.isRight(result)).toBe(true);
+    if (Either.isRight(result)) {
+      // The orchestrator branches on this flag — losers must see
+      // `removed: false` so they can short-circuit before the
+      // pickup comment lands.
+      expect(result.right).toEqual({ removed: false });
+    }
     // No write issued at all — the gateway short-circuits before the
-    // updateIssue call when nothing needs to change.
+    // updateIssue call when the label was absent at read time.
     expect(updateIssueMock).not.toHaveBeenCalled();
   });
 });

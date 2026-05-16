@@ -32,7 +32,7 @@ type MockedLinear = {
 function makeLinear(): MockedLinear {
   return {
     applyLabel: vi.fn().mockReturnValue(Effect.succeed(undefined)),
-    removeLabel: vi.fn().mockReturnValue(Effect.succeed(undefined)),
+    removeLabel: vi.fn().mockReturnValue(Effect.succeed({ removed: true })),
     comment: vi.fn().mockReturnValue(Effect.succeed(undefined)),
   };
 }

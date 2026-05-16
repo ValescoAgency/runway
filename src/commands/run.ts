@@ -236,14 +236,14 @@ export async function runCommand(argv: readonly string[]): Promise<void> {
 
   const result = await Effect.runPromise(program);
   console.log(
-    `[runway] done — attempts=${result.attempts} opened=${result.opened} hitl=${result.hitl} errored=${result.errored}`,
+    `[runway] done — attempts=${result.attempts} opened=${result.opened} hitl=${result.hitl} errored=${result.errored} skipped=${result.skipped}`,
   );
   // Single-line, parser-friendly completion marker. Background
   // watchers (Claude Code's `run_in_background` bash task, CI,
   // scripts) can grep for `[runway:exit]` instead of guessing
   // whether the drain is still in flight.
   console.log(
-    `[runway:exit] status=success attempts=${result.attempts} opened=${result.opened} hitl=${result.hitl} errored=${result.errored}`,
+    `[runway:exit] status=success attempts=${result.attempts} opened=${result.opened} hitl=${result.hitl} errored=${result.errored} skipped=${result.skipped}`,
   );
   // Hard exit so any lingering handle (OTel BatchSpanProcessor's
   // interval when OTEL_EXPORTER_OTLP_ENDPOINT is set, a Docker

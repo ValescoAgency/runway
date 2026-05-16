@@ -73,7 +73,7 @@ describe("validateLinearConfig (VA-354 / VA-423)", () => {
 
     const out = await validateLinearConfig({
       ...config,
-      hitlLabel: "needs-human",
+      hitlLabel: "missing-label-on-purpose",
     });
     expect(out.team).toEqual({ kind: "ok", id: "team-1" });
     expect(out.readyLabel).toEqual({
@@ -82,7 +82,7 @@ describe("validateLinearConfig (VA-354 / VA-423)", () => {
     });
     expect(out.hitlLabel).toEqual({
       kind: "missing",
-      name: "needs-human",
+      name: "missing-label-on-purpose",
       available: ["ready-for-agent", "needs-info", "wontfix"],
     });
   });

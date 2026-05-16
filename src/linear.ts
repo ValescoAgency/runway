@@ -350,14 +350,27 @@ export interface LinearGateway {
   /**
    * VA-423: remove `labelName` from `issueId`. Used by the
    * orchestrator to claim an issue at pickup time (remove
-   * `ready-for-agent`) — the atomic claim signal that prevents the
-   * next drain from re-picking the issue while the current run is
-   * in flight. Idempotent: a no-op if the label isn't present.
+   * `ready-for-agent`) — the claim signal that takes the issue out
+   * of the next drain's queue.
+   *
+   * Returns `{ removed }` so the caller can detect a lost claim
+   * race: when the label was already absent at the time of the read
+   * (another runner picked the issue first, or an operator removed
+   * the label manually), the gateway short-circuits the write and
+   * returns `removed: false`. The orchestrator treats `removed:
+   * false` as "skip this issue" so the loser doesn't proceed to
+   * post a pickup comment or push an agent branch.
+   *
+   * Caveat: this is NOT a true CAS — Linear's `updateIssue` is a
+   * full set assignment with no version field. Two runners that
+   * both read the labels before either has written can both report
+   * `removed: true`; the design assumes the predominant operator
+   * pattern of a single drain instance running sequentially.
    */
   removeLabel(
     issueId: string,
     labelName: string,
-  ): Effect.Effect<void, LinearError>;
+  ): Effect.Effect<{ readonly removed: boolean }, LinearError>;
   comment(issueId: string, body: string): Effect.Effect<void, LinearError>;
   /**
    * VA-383: fetch every comment on an issue, ordered ascending by
@@ -601,15 +614,17 @@ export function createLinearGateway(
 
     // VA-423: pickup-time claim signal. The orchestrator calls this
     // with `config.readyLabel` (`ready-for-agent`) once an issue is
-    // chosen for processing, which removes it from the drain queue
-    // so a concurrent / immediately-following drain doesn't double-
-    // pick it. The Linear API has no label-level CAS — `updateIssue`
-    // assigns the full `labelIds` set — so this isn't truly atomic
-    // against two parallel drains; it IS atomic against the
-    // canonical "single runway, sequential drains" pattern. If the
-    // label was already absent (idempotent re-run, operator-removed,
-    // etc.) the resulting set is the same as the input and Linear
-    // accepts the no-op write.
+    // chosen for processing. When the label was present at read
+    // time we issue the write and return `removed: true` (claim
+    // won); when the label was already absent we short-circuit and
+    // return `removed: false` (claim lost — another runner picked
+    // it first, or operator-removed). The orchestrator uses the
+    // returned signal to skip a losing run before it does any of
+    // the work that would be visible to a human (pickup comment,
+    // agent branch push, etc.).
+    //
+    // Not truly atomic — see the interface doc for the residual
+    // race window.
     removeLabel(issueId, labelName) {
       return gate(applyLinearPolicy(
         Effect.tryPromise({
@@ -623,12 +638,12 @@ export function createLinearGateway(
               (l) => l.name !== labelName,
             );
             if (remaining.length === existingDecoded.length) {
-              // Label not present — no-op write skipped.
-              return;
+              return { removed: false } as const;
             }
             await client.updateIssue(issueId, {
               labelIds: remaining.map((l) => l.id),
             });
+            return { removed: true } as const;
           },
           catch: (err) => classifyLinearError(err, `removeLabel(${labelName})`),
         }),

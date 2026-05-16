@@ -45,7 +45,8 @@ Linear (label=ready-for-agent, team=VA)
   ↓ poll
 runway (this CLI, on your Mac, run from inside the target repo)
   ↓ for each issue
-  │   removeLabel(ready-for-agent)   # atomic claim signal — VA-423
+  │   removeLabel(ready-for-agent)   # claim signal — VA-423; skip
+  │                                  # if already absent (lost race)
   │   sandcastle.run({ agent: claudeCode, sandbox: docker, cwd: process.cwd(), ... })
   │     iter 1 → IMPL: DONE | IMPL: BLOCKED — <reason> | IMPL: CONTINUE
   │     iter 2 → same, with previous iteration's summary injected
@@ -237,7 +238,14 @@ state-label contract:
   auto-mutates status when a PR cross-references an issue, which would
   drain a status-gated queue silently every time someone mentioned the
   issue from a PR. Labels are immune to that integration. Runway
-  removes the label on pickup as an atomic claim signal.
+  removes the label on pickup as the claim signal: the gateway returns
+  whether the label was actually present at write time, and a runner
+  that loses the claim race (label was already absent) skips the issue
+  cleanly without posting a pickup comment or pushing an agent branch.
+  Linear's API has no label-level compare-and-swap, so two runners
+  that both read the labels before either has written can still both
+  proceed — the design assumes the predominant operator pattern of a
+  single drain instance running sequentially.
 - `RUNWAY_HITL_LABEL` (default `ready-for-human`) is applied when the
   agent or reviewer can't finish, AND when a run fails outright.
   Runway never re-applies the ready label on failure — terminal
@@ -341,9 +349,9 @@ from a PR.
 
 What runway does on each pickup:
 
-- removes the `ready-for-agent` label (atomic claim signal —
-  prevents the next drain from re-picking the issue while the
-  current one is in flight)
+- removes the `ready-for-agent` label (claim signal — takes the
+  issue out of the next drain's queue; a runner that finds the
+  label already gone skips the issue without doing visible work)
 - comments and works the issue on `agent/<id>`
 - on approve, pushes the branch, opens the PR; Linear's GitHub
   integration then auto-transitions the issue (`In Progress` on PR

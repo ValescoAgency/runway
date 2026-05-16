@@ -70,7 +70,10 @@ function makeLinear(): MockedLinear {
   return {
     fetchReady: vi.fn(),
     applyLabel: vi.fn().mockReturnValue(Effect.succeed(undefined)),
-    removeLabel: vi.fn().mockReturnValue(Effect.succeed(undefined)),
+    // VA-423: default to `{ removed: true }` so the orchestrator
+    // treats the test as the claim-winner branch. Lost-race tests
+    // override with `Effect.succeed({ removed: false })`.
+    removeLabel: vi.fn().mockReturnValue(Effect.succeed({ removed: true })),
     comment: vi.fn().mockReturnValue(Effect.succeed(undefined)),
     fetchComments: vi.fn().mockReturnValue(Effect.succeed([])),
     viewer: vi
@@ -221,6 +224,55 @@ describe("drainQueue --max semantics (VA-344 / VA-423)", () => {
       (c) => c[1] === "ready-for-agent",
     );
     expect(picked).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests — VA-423 lost-claim-race short-circuit
+// ---------------------------------------------------------------------------
+
+describe("drainQueue lost-claim-race (VA-423)", () => {
+  it("a runner that loses the claim race skips the issue cleanly: no pickup comment, no agent branch, no sandcastle invocation, no PR", async () => {
+    routeExeca({ revListCount: "1" });
+    const linear = makeLinear();
+    // Simulate another runner having stripped `ready-for-agent`
+    // between our `fetchReady` and our claim write.
+    linear.removeLabel.mockReturnValueOnce(
+      Effect.succeed({ removed: false }),
+    );
+    linear.fetchReady
+      .mockReturnValueOnce(Effect.succeed([issue]))
+      .mockReturnValueOnce(Effect.succeed([]));
+
+    const github = makeGithub();
+    const result = await drainQueue({
+      config,
+      linear: asLinear(linear),
+      github,
+      cwd: "/tmp/repo",
+    });
+
+    expect(result).toMatchObject({
+      attempts: 1,
+      opened: 0,
+      hitl: 0,
+      errored: 0,
+      skipped: 1,
+    });
+    expect(result.outcomes[0]).toMatchObject({
+      identifier: "VA-312",
+      kind: "skipped",
+    });
+    // No pickup comment, no sandcastle invocation, no github
+    // side-effects — the losing runner did none of the work the
+    // winner is doing.
+    expect(linear.comment).not.toHaveBeenCalled();
+    expect(sandcastleRunMock).not.toHaveBeenCalled();
+    expect(github.pushBranch).not.toHaveBeenCalled();
+    expect(github.openPullRequest).not.toHaveBeenCalled();
+    // And specifically: no flagHitl-side `applyLabel` either — a
+    // lost race is not a failure.
+    expect(linear.applyLabel).not.toHaveBeenCalled();
   });
 });
 
