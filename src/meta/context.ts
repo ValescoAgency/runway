@@ -5,6 +5,7 @@ import {
   type CapturedIssueProcess,
   type CapturedNorms,
   type CapturedReviewerReport,
+  type DrainMetaRow,
   type MetaDashboardRead,
   type MetaReadError,
 } from "./dashboard-read.js";
@@ -105,10 +106,33 @@ export type LoadContextArgs =
       // (v1.0.0 / v1.1.0 back-compat — older callers that haven't been
       // updated keep the legacy "no relative axis" behavior).
       readonly normsWindow?: number;
+    }
+  | {
+      // VA-406: drain-review pass context — every issue_process for
+      // the drain plus every per-issue meta_reviews row (including
+      // skipped/failed). The loader doesn't pull norms or hindsight
+      // for the drain pass; the drain-level prompt is composition-
+      // shaped, not per-issue-quality-shaped, so the inputs are
+      // distinct.
+      readonly pass: "drain-review";
+      readonly traceId: string;
     };
 
 export type LoadContextResult =
-  | { readonly pass: "run-review"; readonly context: RunReviewContext };
+  | { readonly pass: "run-review"; readonly context: RunReviewContext }
+  | { readonly pass: "drain-review"; readonly context: DrainReviewContext };
+
+/**
+ * VA-406: per-drain context payload. Mirrors the shape Run Review
+ * passes through to its prompt builder — typed inputs, no in-loader
+ * formatting — so the pass body can compose its own prompt without
+ * the loader leaking serialization decisions.
+ */
+export interface DrainReviewContext {
+  readonly traceId: string;
+  readonly issueProcesses: readonly CapturedIssueProcess[];
+  readonly metaRows: readonly DrainMetaRow[];
+}
 
 /**
  * VA-402: PRD's `loadContextFor(pass, scope)` seam. One function,
@@ -125,8 +149,34 @@ export const loadContextFor = (
       return loadRunReviewContext(args, gateway).pipe(
         Effect.map((context) => ({ pass: "run-review" as const, context })),
       );
+    case "drain-review":
+      return loadDrainReviewContext(args, gateway).pipe(
+        Effect.map((context) => ({ pass: "drain-review" as const, context })),
+      );
   }
 };
+
+const loadDrainReviewContext = (
+  args: { readonly traceId: string },
+  gateway: MetaDashboardRead,
+): Effect.Effect<DrainReviewContext, MetaReadError> =>
+  Effect.gen(function* () {
+    // VA-406: pull both in parallel — issue_processes and meta_reviews
+    // rows live in independent tables and the queries don't depend on
+    // each other.
+    const [issueProcesses, metaRows] = yield* Effect.all(
+      [
+        gateway.loadIssueProcessesForDrain(args.traceId),
+        gateway.loadDrainMetaRows(args.traceId),
+      ],
+      { concurrency: "unbounded" },
+    );
+    return {
+      traceId: args.traceId,
+      issueProcesses,
+      metaRows,
+    };
+  });
 
 const DEFAULT_FOLLOW_UP_WINDOW_HOURS = 48;
 

@@ -229,6 +229,89 @@ export interface MetaDashboardRead {
     category: string,
     windowDrains: number,
   ): Effect.Effect<CapturedNorms | null, MetaReadError>;
+  /**
+   * VA-406: every issue_process row for a drain, projected to the same
+   * shape Run Review uses. The Drain Review pass consumes the rollup
+   * (outcome distribution + per-issue events). Distinct from
+   * `loadIssueProcess` which loads a single (trace, issue) pair.
+   *
+   * Ordered by start_time_unix_nano ASC so the IRA's prompt can
+   * reason about sequencing — "did the schema migration run before or
+   * after the UI fix that depends on it?" — without a second pass.
+   */
+  loadIssueProcessesForDrain(
+    traceId: string,
+  ): Effect.Effect<readonly CapturedIssueProcess[], MetaReadError>;
+  /**
+   * VA-406: count of distinct `issue_identifier` values in
+   * issue_processes for a drain. The Run Review → Drain Review
+   * trigger compares this against `countCompletedRunReviews` to
+   * decide if its write was the LAST Run Review for the drain. A
+   * dedicated COUNT(DISTINCT ...) query keeps the no-fire hot path
+   * cheap — pulling every issue_process row + label JSON + outcome
+   * cols just to dedupe in JS would scale linearly with drain size.
+   */
+  countDistinctIssuesForDrain(
+    traceId: string,
+  ): Effect.Effect<number, MetaReadError>;
+  /**
+   * VA-406: count meta_reviews rows for a drain whose kind belongs to
+   * the "Run Review pass completed" set (`meta-run-review`,
+   * `meta-skipped`, `meta-failed`). Used by the Run Review pass to
+   * decide whether its write was the LAST one that the drain was
+   * waiting on — if yes, fire Drain Review in-process.
+   *
+   * Skipped + failed both count as "complete" per the VA-406 AC:
+   * "accounting for `meta-skipped` and `meta-failed` rows as
+   * \"complete\"." The IRA's drain pass treats them as evidence-of-no-
+   * evidence rather than blocking on a retry.
+   */
+  countCompletedRunReviews(
+    traceId: string,
+  ): Effect.Effect<number, MetaReadError>;
+  /**
+   * VA-406: count meta_reviews rows for a drain of kind
+   * `meta-drain-review`. The Run Review trigger uses this to avoid
+   * firing Drain Review twice for the same drain — operators may
+   * legitimately re-run a Run Review (e.g. after a corruption fix),
+   * which writes a new completion row, but the drain pass has already
+   * fired and we don't want a duplicate verdict.
+   */
+  countDrainReviews(
+    traceId: string,
+  ): Effect.Effect<number, MetaReadError>;
+  /**
+   * VA-406: pull every successful Run Review's contentJson for a
+   * drain. The Drain Review pass loads these to grade composition +
+   * sequencing + cross-issue patterns. Skipped / failed rows are
+   * INCLUDED so the IRA can note "two of the seven runs had no IRA
+   * grade — orchestration gap" — that's a drain-review-relevant
+   * pattern, not a row to silently drop.
+   *
+   * Ordered by `created_at ASC` so the prompt reads in pickup order.
+   * Returns the raw `MetaReviewRow` shape so the pass can decide how
+   * to project (a Drain Review row would just shuttle review.content
+   * straight to the LLM; a skipped row carries `reason` and renders
+   * as "no IRA grade — uneventful run").
+   */
+  loadDrainMetaRows(
+    traceId: string,
+  ): Effect.Effect<readonly DrainMetaRow[], MetaReadError>;
+}
+
+/**
+ * VA-406: minimal shape per meta_reviews row the Drain Review pass
+ * needs. Mirrors `StoredMetaReview` (in dashboard/storage.ts) but
+ * lives here so dashboard-read's consumers don't have to import from
+ * the write-side gateway.
+ */
+export interface DrainMetaRow {
+  readonly id: string;
+  readonly kind: string;
+  readonly issueId: string | null;
+  readonly contentJson: string;
+  readonly templateVersion: string;
+  readonly createdAt: string;
 }
 
 /**
@@ -318,6 +401,60 @@ export function createMetaDashboardRead(path: string): MetaDashboardRead {
     WHERE category = ?
   `);
 
+  // VA-406: every issue_process row for one drain, ordered by start
+  // time. Returns the same projected shape the single-row gateway uses
+  // so callers can reuse `CapturedIssueProcess` consumers.
+  const selectIssueProcessesForDrain = db.prepare(`
+    SELECT trace_id, span_id, issue_identifier, issue_id, issue_title,
+           issue_labels, branch, outcome_kind, outcome_detail, pr_url,
+           hitl_reason, start_time_unix_nano, end_time_unix_nano
+    FROM issue_processes
+    WHERE trace_id = ?
+    ORDER BY CAST(start_time_unix_nano AS INTEGER) ASC, span_id ASC
+  `);
+
+  // VA-406: distinct-identifier count for trigger checks. SQL handles
+  // the dedupe so the trigger doesn't pay to load + project every row
+  // on every Run Review write.
+  const selectDistinctIssueCount = db.prepare(`
+    SELECT COUNT(DISTINCT issue_identifier) AS n
+    FROM issue_processes
+    WHERE trace_id = ?
+  `);
+
+  // VA-406: count meta_reviews rows for a drain whose kind belongs to
+  // the "Run Review pass completed" set. Skipped + failed both count
+  // as "complete" per the AC — they're terminal Run Review outcomes,
+  // not retries.
+  const selectCompletedRunReviewCount = db.prepare(`
+    SELECT COUNT(*) AS n
+    FROM meta_reviews
+    WHERE drain_id = ?
+      AND kind IN ('meta-run-review', 'meta-skipped', 'meta-failed')
+  `);
+
+  // VA-406: count meta_reviews rows for a drain of kind meta-drain-review.
+  // Used by the Run Review trigger to avoid firing the Drain Review
+  // pass twice for the same drain.
+  const selectDrainReviewCount = db.prepare(`
+    SELECT COUNT(*) AS n
+    FROM meta_reviews
+    WHERE drain_id = ?
+      AND kind = 'meta-drain-review'
+  `);
+
+  // VA-406: pull every meta_reviews row for a drain so the Drain Review
+  // pass can project per-issue summaries + cross-link URLs. Includes
+  // skipped + failed rows alongside meta-run-review — the drain pass
+  // notes their absence-of-grade as an observation.
+  const selectDrainMetaRows = db.prepare(`
+    SELECT id, kind, issue_id, content_json, template_version, created_at
+    FROM meta_reviews
+    WHERE drain_id = ?
+      AND kind IN ('meta-run-review', 'meta-skipped', 'meta-failed')
+    ORDER BY created_at ASC, id ASC
+  `);
+
   const wrap = <A>(
     call: string,
     thunk: () => A,
@@ -350,31 +487,7 @@ export function createMetaDashboardRead(path: string): MetaDashboardRead {
             }),
           );
         }
-        const labels = (() => {
-          const raw = row.issue_labels;
-          if (typeof raw !== "string" || raw.length === 0) return [];
-          try {
-            const parsed = JSON.parse(raw);
-            return Array.isArray(parsed) ? parsed.map(String) : [];
-          } catch {
-            return [];
-          }
-        })();
-        return {
-          traceId: String(row.trace_id ?? ""),
-          spanId: String(row.span_id ?? ""),
-          issueIdentifier: String(row.issue_identifier ?? ""),
-          issueId: nullableStr(row.issue_id),
-          issueTitle: nullableStr(row.issue_title),
-          issueLabels: labels,
-          branch: nullableStr(row.branch),
-          outcomeKind: nullableStr(row.outcome_kind),
-          outcomeDetail: nullableStr(row.outcome_detail),
-          prUrl: nullableStr(row.pr_url),
-          hitlReason: nullableStr(row.hitl_reason),
-          startTimeUnixNano: String(row.start_time_unix_nano ?? ""),
-          endTimeUnixNano: String(row.end_time_unix_nano ?? ""),
-        };
+        return projectIssueProcessRow(row);
       });
     },
 
@@ -474,7 +587,92 @@ export function createMetaDashboardRead(path: string): MetaDashboardRead {
         } satisfies CapturedNorms;
       });
     },
+
+    loadIssueProcessesForDrain(traceId) {
+      return wrap("loadIssueProcessesForDrain", () => {
+        const rows = selectIssueProcessesForDrain.all(traceId) as Array<
+          Record<string, unknown>
+        >;
+        return rows.map(projectIssueProcessRow);
+      });
+    },
+
+    countDistinctIssuesForDrain(traceId) {
+      return wrap("countDistinctIssuesForDrain", () => {
+        const row = selectDistinctIssueCount.get(traceId) as
+          | Record<string, unknown>
+          | undefined;
+        return Number(row?.n ?? 0);
+      });
+    },
+
+    countCompletedRunReviews(traceId) {
+      return wrap("countCompletedRunReviews", () => {
+        const row = selectCompletedRunReviewCount.get(traceId) as
+          | Record<string, unknown>
+          | undefined;
+        return Number(row?.n ?? 0);
+      });
+    },
+
+    countDrainReviews(traceId) {
+      return wrap("countDrainReviews", () => {
+        const row = selectDrainReviewCount.get(traceId) as
+          | Record<string, unknown>
+          | undefined;
+        return Number(row?.n ?? 0);
+      });
+    },
+
+    loadDrainMetaRows(traceId) {
+      return wrap("loadDrainMetaRows", () => {
+        const rows = selectDrainMetaRows.all(traceId) as Array<
+          Record<string, unknown>
+        >;
+        return rows.map((row) => ({
+          id: String(row.id ?? ""),
+          kind: String(row.kind ?? ""),
+          issueId: nullableStr(row.issue_id),
+          contentJson: String(row.content_json ?? ""),
+          templateVersion: String(row.template_version ?? ""),
+          createdAt: String(row.created_at ?? ""),
+        } satisfies DrainMetaRow));
+      });
+    },
   };
+}
+
+// VA-406: shared row projection for both single-row (`loadIssueProcess`)
+// and per-drain (`loadIssueProcessesForDrain`) reads. Kept module-private
+// because the projection couples directly to the SQL column shape.
+function projectIssueProcessRow(
+  row: Record<string, unknown>,
+): CapturedIssueProcess {
+  return {
+    traceId: String(row.trace_id ?? ""),
+    spanId: String(row.span_id ?? ""),
+    issueIdentifier: String(row.issue_identifier ?? ""),
+    issueId: nullableStr(row.issue_id),
+    issueTitle: nullableStr(row.issue_title),
+    issueLabels: parseIssueLabels(row.issue_labels),
+    branch: nullableStr(row.branch),
+    outcomeKind: nullableStr(row.outcome_kind),
+    outcomeDetail: nullableStr(row.outcome_detail),
+    prUrl: nullableStr(row.pr_url),
+    hitlReason: nullableStr(row.hitl_reason),
+    startTimeUnixNano: String(row.start_time_unix_nano ?? ""),
+    endTimeUnixNano: String(row.end_time_unix_nano ?? ""),
+  };
+}
+
+function parseIssueLabels(raw: unknown): readonly string[] {
+  if (typeof raw !== "string" || raw.length === 0) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch {
+    return [];
+  }
 }
 
 function nullableStr(v: unknown): string | null {

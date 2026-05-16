@@ -52,6 +52,13 @@ const RunwayConfigFileSchema = z.object({
       minReviewerRejections: z.number().int().min(1).optional(),
     })
     .optional(),
+  /**
+   * VA-406: optional Linear project name where the runway repo's own
+   * issues live (e.g. "Runway"). When set, severity-critical Drain
+   * Review escalations file in that project; when unset, they land
+   * team-only. Overridden by `RUNWAY_REPO_PROJECT_NAME` if set in env.
+   */
+  runwayRepoProjectName: z.string().optional(),
 });
 
 export type RunwayConfigFile = z.infer<typeof RunwayConfigFileSchema>;

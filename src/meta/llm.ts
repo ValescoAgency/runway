@@ -1,8 +1,10 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { Data, Effect, Schedule } from "effect";
 import {
+  type DrainReview,
   type ReportParseResult,
   type RunReview,
+  parseDrainReview,
   parseRunReview,
 } from "./templates.js";
 
@@ -151,6 +153,39 @@ export const callRunReview = (
       { call: "messages.create(run-review)" },
     );
     return parseRunReview(text);
+  });
+
+/**
+ * VA-406: one Drain Review LLM round-trip. Same shape as
+ * `callRunReview` — the Anthropic call + retry policy + structured
+ * parse are identical, only the parser differs. Kept as a separate
+ * function (rather than parameterizing `callRunReview`) so the LLM
+ * span name stays distinct in the OTel trace and the per-pass error
+ * paths can fork cleanly. Default max_tokens is bumped to 6144 because
+ * Drain Reviews summarise N issue processes plus cross-issue patterns
+ * — the payload is correspondingly larger than a single Run Review.
+ */
+export const callDrainReview = (
+  args: RunReviewLlmArgs,
+): Effect.Effect<ReportParseResult<DrainReview>, AnthropicError> =>
+  Effect.gen(function* () {
+    const client = new Anthropic({ apiKey: args.apiKey });
+    const text = yield* applyAnthropicPolicy(
+      Effect.tryPromise({
+        try: async () => {
+          const res = await client.messages.create({
+            model: args.model,
+            max_tokens: args.maxTokens ?? 6144,
+            system: args.systemPrompt,
+            messages: [{ role: "user", content: args.userPrompt }],
+          });
+          return collectText(res.content);
+        },
+        catch: (err) => classifyAnthropicError(err),
+      }),
+      { call: "messages.create(drain-review)" },
+    );
+    return parseDrainReview(text);
   });
 
 // ---------------------------------------------------------------------------

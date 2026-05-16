@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { Effect } from "effect";
-import type { Storage } from "../../dashboard/storage.js";
+import { META_REVIEW_KIND, type Storage } from "../../dashboard/storage.js";
 import { loadContextFor, type HindsightWiring, type RunReviewContext } from "../context.js";
 import type {
   CapturedCodingAgentReport,
@@ -13,14 +13,21 @@ import {
   shouldRunIRA,
   type MetaFilterThresholds,
 } from "../heuristic-filter.js";
+import {
+  formatAnthropicError,
+  formatParseError,
+  messageOf,
+  nowIso,
+  shortenTrace,
+} from "../format.js";
 import type { MetaLinearGateway } from "../linear-meta.js";
-import { callRunReview, type AnthropicError } from "../llm.js";
+import { callRunReview } from "../llm.js";
 import {
   RUN_REVIEW_VERSION,
   type HindsightSignals,
-  type ReportParseError,
   type RunReview,
 } from "../templates.js";
+import { runDrainReviewPass } from "./drain-review.js";
 
 /**
  * VA-402: the per-issue IRA pass. Loads the captured Coding Agent +
@@ -186,9 +193,19 @@ export const runRunReviewPass = (
         args,
         deps,
         `failed to load context: ${
-          (contextResult.left as { message?: string }).message ??
-          String(contextResult.left)
+          messageOf(contextResult.left)
         }`,
+      );
+    }
+    if (contextResult.right.pass !== "run-review") {
+      // Defensive narrowing — the loader switches on `pass` so this
+      // branch is unreachable in practice. Kept so the union widens
+      // cleanly in later slices (drain-review = VA-406, weekly-review =
+      // VA-408) without re-checking every consumer.
+      return yield* writeFailedStub(
+        args,
+        deps,
+        `context loader returned unexpected pass kind: ${contextResult.right.pass}`,
       );
     }
     const ctx: RunReviewContext = contextResult.right.context;
@@ -252,8 +269,7 @@ export const runRunReviewPass = (
         args,
         deps,
         `Linear issue create failed: ${
-          (issueResult.left as { message?: string }).message ??
-          String(issueResult.left)
+          messageOf(issueResult.left)
         }`,
         parsed.report,
       );
@@ -262,7 +278,7 @@ export const runRunReviewPass = (
     const metaReviewId = randomUUID();
     deps.storage.saveMetaReview({
       id: metaReviewId,
-      kind: "meta-run-review",
+      kind: META_REVIEW_KIND.RUN,
       scope: args.issueIdentifier,
       drainId: args.traceId,
       issueId: args.issueIdentifier,
@@ -274,6 +290,8 @@ export const runRunReviewPass = (
       templateVersion: parsed.report.template_version,
       createdAt: nowIso(),
     });
+
+    yield* triggerDrainReviewIfComplete(args, deps);
 
     return {
       kind: "review",
@@ -292,11 +310,11 @@ const writeSkippedRow = (
   deps: RunReviewPassDeps,
   reason: string,
 ): Effect.Effect<RunReviewPassOutcome, never, never> =>
-  Effect.sync(() => {
+  Effect.gen(function* () {
     const metaReviewId = randomUUID();
     deps.storage.saveMetaReview({
       id: metaReviewId,
-      kind: "meta-skipped",
+      kind: META_REVIEW_KIND.SKIPPED,
       scope: args.issueIdentifier,
       drainId: args.traceId,
       issueId: args.issueIdentifier,
@@ -304,6 +322,7 @@ const writeSkippedRow = (
       templateVersion: RUN_REVIEW_VERSION,
       createdAt: nowIso(),
     });
+    yield* triggerDrainReviewIfComplete(args, deps);
     return { kind: "skipped", metaReviewId, reason };
   });
 
@@ -334,13 +353,12 @@ const writeFailedStub = (
     const secondaryLinearError =
       linearResult._tag === "Left"
         ? `linear stub write also failed: ${
-            (linearResult.left as { message?: string }).message ??
-            String(linearResult.left)
+            messageOf(linearResult.left)
           }`
         : null;
     deps.storage.saveMetaReview({
       id: metaReviewId,
-      kind: "meta-failed",
+      kind: META_REVIEW_KIND.FAILED,
       scope: args.issueIdentifier,
       drainId: args.traceId,
       issueId: args.issueIdentifier,
@@ -357,7 +375,105 @@ const writeFailedStub = (
       templateVersion: RUN_REVIEW_VERSION,
       createdAt: nowIso(),
     });
+    yield* triggerDrainReviewIfComplete(args, deps);
     return { kind: "failed", metaReviewId, reason };
+  });
+
+/**
+ * VA-406: AC4 — every Run Review write checks whether all Run Reviews
+ * for the drain are now present (count of meta_reviews completion
+ * rows for the drain equals the count of distinct issue_processes
+ * for the drain, treating `meta-skipped` and `meta-failed` rows as
+ * "complete"). If complete AND no drain-review row exists yet, the
+ * Drain Review pass runs in-process.
+ *
+ * In-process (vs spawning `runway review drain --id X` as a child
+ * subprocess) for three reasons:
+ *
+ *   1. The trigger runs INSIDE `runway review run`, which already
+ *      has the same gateways + storage handle wired. Reusing them
+ *      avoids env propagation + handle-reopen overhead.
+ *   2. Deterministic in tests — we mock `runDrainReviewPass` and
+ *      assert call shape, instead of poking around in subprocess
+ *      lifecycle.
+ *   3. Subprocess failure modes (zombie children, env leaks) add
+ *      operational complexity for no behavioural gain — the drain
+ *      pass is short-lived and Effect-cancellable.
+ *
+ * Failure handling: this is best-effort. A drain-review LLM error
+ * lands a `meta-failed` stub via the drain pass's own failure path
+ * (mirrors Run Review). A drain-review *trigger* error (gateway
+ * read failure on the completion check) is logged and swallowed —
+ * the Run Review pass's contract is to return its own outcome
+ * cleanly; the drain pass is downstream side-effect, not a
+ * pre-condition.
+ */
+const triggerDrainReviewIfComplete = (
+  args: RunReviewPassArgs,
+  deps: RunReviewPassDeps,
+): Effect.Effect<void, never, never> =>
+  Effect.gen(function* () {
+    // Three independent reads in parallel — SQLite handles are sync
+    // under the hood but Effect's concurrency cancels cleanly on
+    // failure + makes the intent explicit. Per-read failures are
+    // tolerated via `Effect.either` so a transient db error doesn't
+    // crash the Run Review pass on the trigger's behalf.
+    const [completedResult, distinctResult, existingDrainReviewsResult] =
+      yield* Effect.all(
+        [
+          deps.dashboardRead
+            .countCompletedRunReviews(args.traceId)
+            .pipe(Effect.either),
+          deps.dashboardRead
+            .countDistinctIssuesForDrain(args.traceId)
+            .pipe(Effect.either),
+          deps.dashboardRead
+            .countDrainReviews(args.traceId)
+            .pipe(Effect.either),
+        ],
+        { concurrency: "unbounded" },
+      );
+    if (
+      completedResult._tag === "Left" ||
+      distinctResult._tag === "Left" ||
+      existingDrainReviewsResult._tag === "Left"
+    ) {
+      return;
+    }
+    if (existingDrainReviewsResult.right > 0) return;
+    if (
+      distinctResult.right === 0 ||
+      completedResult.right < distinctResult.right
+    ) {
+      return;
+    }
+    // All Run Reviews for the drain are in. Fire the Drain Review pass.
+    // The drain pass owns its own success / failure paths — we don't
+    // surface its outcome through our return type, but we do log it so
+    // operators see the chain on the dashboard.
+    //
+    // Race window: two concurrent Run Reviews on the same drain could
+    // both pass the `existingDrainReviewsResult.right > 0` check and
+    // both fire the drain pass. In practice runway processes one
+    // Run Review at a time per drain, so the window is narrow; the
+    // downside on a race is one duplicate Drain Review (+ one extra
+    // Anthropic spend). A future SQL uniqueness constraint
+    // (idx_meta_reviews_drain_review_unique on drain_id WHERE kind =
+    // 'meta-drain-review') would close the window — out of scope for
+    // VA-406, which keeps the schema additive.
+    const drainOutcome = yield* runDrainReviewPass(
+      { traceId: args.traceId },
+      {
+        anthropicApiKey: deps.anthropicApiKey,
+        metaReviewModel: deps.metaReviewModel,
+        dashboardRead: deps.dashboardRead,
+        metaLinear: deps.metaLinear,
+        storage: deps.storage,
+      },
+    );
+    yield* Effect.logInfo(
+      `[run-review trigger] drain ${shortenTrace(args.traceId)} complete — drain-review outcome: ${drainOutcome.kind}`,
+    );
   });
 
 const renderFailedStubMarkdown = (
@@ -397,18 +513,6 @@ const renderFailedStubMarkdown = (
   ]
     .filter((line) => line !== "")
     .join("\n");
-
-const missingCodingReport = (msg: string): CapturedCodingAgentReport => ({
-  ok: false,
-  kind: "missing",
-  message: msg,
-});
-
-const missingReviewerReport = (msg: string): CapturedReviewerReport => ({
-  ok: false,
-  kind: "missing",
-  message: msg,
-});
 
 const SYSTEM_PROMPT = [
   "You are the Independent Review Agent (IRA) — a retrospective evaluator",
@@ -626,19 +730,6 @@ const renderReviewMarkdown = (
   ].join("\n");
 };
 
-const formatAnthropicError = (err: AnthropicError): string =>
-  `${err._tag}: ${err.message}`;
-
-const formatParseError = (err: ReportParseError): string => {
-  if (err.kind === "version-mismatch") {
-    return `version-mismatch (expected ${err.expectedMajor}.x.x, observed ${err.observed})`;
-  }
-  return `${err.kind}: ${err.message}`;
-};
-
-const shortenTrace = (traceId: string): string =>
-  traceId.length > 8 ? traceId.slice(0, 8) : traceId;
-
 const hoursBetween = (endNanoStr: string, nowMs: number): number => {
   // end_time_unix_nano arrives as a string-encoded int64 (the OTel
   // SDK keeps it that way to avoid JS number precision drift).
@@ -650,5 +741,3 @@ const hoursBetween = (endNanoStr: string, nowMs: number): number => {
 };
 
 const round1 = (n: number): number => Math.round(n * 10) / 10;
-
-const nowIso = (): string => new Date().toISOString().replace("T", " ").slice(0, 19);
