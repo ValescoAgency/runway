@@ -950,3 +950,169 @@ describe("dashboard HTTP server — explicit bind env vars (VA-392)", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// VA-407: GET /meta-reviews list view + GET /meta-reviews/:id detail
+// ---------------------------------------------------------------------------
+
+const baseMetaRow = (over: Record<string, unknown> = {}) =>
+  ({
+    id: "default-id",
+    kind: "meta-run-review" as const,
+    scope: "VA-401",
+    drainId: "trace-1",
+    issueId: "VA-401",
+    contentJson: JSON.stringify({
+      review: {
+        issue_identifier: "VA-401",
+        agent_quality: { absolute: "STRONG", justification: "Surgical." },
+        recommendations: [],
+        hindsight_signals: null,
+      },
+    }),
+    templateVersion: "1.2.0",
+    createdAt: "2026-05-15 12:00:00",
+    ...over,
+  });
+
+describe("dashboard HTTP server — /meta-reviews (VA-407)", () => {
+  it("GET /meta-reviews renders the list view with the row's scope + summary link", async () => {
+    storage.saveMetaReview(baseMetaRow({ id: "row-1", scope: "VA-401" }));
+    const res = await fetch(`${base}/meta-reviews`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toMatch(/text\/html/);
+    const html = await res.text();
+    expect(html).toContain("VA-401");
+    expect(html).toContain('href="/meta-reviews/row-1"');
+  });
+
+  it("GET /meta-reviews?kind=meta-failed filters to one kind", async () => {
+    storage.saveMetaReview(
+      baseMetaRow({ id: "good", kind: "meta-run-review" }),
+    );
+    storage.saveMetaReview(
+      baseMetaRow({
+        id: "bad",
+        kind: "meta-failed",
+        contentJson: JSON.stringify({ reason: "anthropic 5xx" }),
+      }),
+    );
+    const res = await fetch(`${base}/meta-reviews?kind=meta-failed`);
+    const html = await res.text();
+    expect(html).toContain('href="/meta-reviews/bad"');
+    expect(html).not.toContain('href="/meta-reviews/good"');
+  });
+
+  it("GET /meta-reviews?page=2 paginates correctly (offset = page-1 × page_size)", async () => {
+    // 25 rows; page_size 20 → page 2 shows the remaining 5.
+    for (let i = 1; i <= 25; i += 1) {
+      storage.saveMetaReview(
+        baseMetaRow({
+          id: `row-${i.toString().padStart(2, "0")}`,
+          scope: `VA-${100 + i}`,
+          // Distinct timestamps so DESC ordering is deterministic;
+          // row-25 is freshest.
+          createdAt: `2026-05-15 12:00:${i.toString().padStart(2, "0")}`,
+        }),
+      );
+    }
+    const page1Html = await (await fetch(`${base}/meta-reviews`)).text();
+    expect(page1Html).toContain("1–20 of 25");
+    expect(page1Html).toContain('href="/meta-reviews/row-25"');
+    expect(page1Html).not.toContain('href="/meta-reviews/row-05"');
+    const page2Html = await (
+      await fetch(`${base}/meta-reviews?page=2`)
+    ).text();
+    expect(page2Html).toContain("21–25 of 25");
+    expect(page2Html).toContain('href="/meta-reviews/row-05"');
+    expect(page2Html).not.toContain('href="/meta-reviews/row-25"');
+  });
+
+  it("GET /meta-reviews/:id renders the Run Review detail with source-run cross-link", async () => {
+    storage.saveIssueProcess({
+      traceId: "trace-1",
+      spanId: "source-span-1",
+      parentSpanId: null,
+      issueIdentifier: "VA-401",
+      issueId: null,
+      issueTitle: null,
+      issueLabels: [],
+      branch: null,
+      outcomeKind: "opened",
+      outcomeDetail: null,
+      prUrl: null,
+      hitlReason: null,
+      startTimeUnixNano: "1000000000000000000",
+      endTimeUnixNano: "1000000001000000000",
+      statusCode: 1,
+      statusMessage: null,
+    });
+    storage.saveMetaReview(baseMetaRow({ id: "rr-1" }));
+    const res = await fetch(`${base}/meta-reviews/rr-1`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("Quality grades");
+    expect(html).toContain("STRONG");
+    // AC: cross-link to canonical /issue-processes/:spanId.
+    expect(html).toContain('href="/issue-processes/source-span-1"');
+  });
+
+  it("GET /meta-reviews/:id returns 404 for an unknown id", async () => {
+    const res = await fetch(`${base}/meta-reviews/does-not-exist`);
+    expect(res.status).toBe(404);
+  });
+
+  it("GET /meta-reviews/:id for a Drain Review links to the drain's issue_processes filter", async () => {
+    storage.saveMetaReview(
+      baseMetaRow({
+        id: "dr-1",
+        kind: "meta-drain-review",
+        scope: "trace-1",
+        drainId: "trace-1",
+        issueId: null,
+        contentJson: JSON.stringify({
+          review: {
+            severity: "routine",
+            severity_justification: "fine",
+            issue_count: 2,
+            outcomes_summary: { opened: 2 },
+            recommendations: [],
+          },
+        }),
+      }),
+    );
+    const html = await (await fetch(`${base}/meta-reviews/dr-1`)).text();
+    expect(html).toContain('href="/?drain=trace-1"');
+  });
+
+  it("GET /meta-reviews/:id renders an older v1.0.0 Run Review without crashing", async () => {
+    // Legacy v1.0.0 carried `relative: null` nested inside each
+    // quality section and no top-level relative axis. The detail
+    // view should tolerate the older shape.
+    storage.saveMetaReview(
+      baseMetaRow({
+        id: "old-rr",
+        templateVersion: "1.0.0",
+        contentJson: JSON.stringify({
+          review: {
+            issue_identifier: "VA-1",
+            agent_quality: {
+              absolute: "WEAK",
+              relative: null,
+              justification: "legacy",
+            },
+            recommendations: [
+              { target: "prompt", change: "tighten", confidence: "LOW" },
+            ],
+            hindsight_signals: null,
+          },
+        }),
+      }),
+    );
+    const res = await fetch(`${base}/meta-reviews/old-rr`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("WEAK");
+    expect(html).toContain("tighten");
+  });
+});

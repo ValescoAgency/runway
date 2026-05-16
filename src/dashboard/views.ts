@@ -1,12 +1,14 @@
 import type {
   ActiveDrain,
   LinearSnapshotRow,
+  MetaReviewKind,
   OutcomeFilterKind,
   PhaseSpan,
   RecentDrain,
   StoredAgentIteration,
   StoredIssueProcess,
   StoredLogRecord,
+  StoredMetaReview,
 } from "./storage.js";
 
 /**
@@ -827,4 +829,644 @@ const ESC: Record<string, string> = {
 
 export function escapeHtml(input: string): string {
   return input.replace(/[&<>"']/g, (c) => ESC[c] ?? c);
+}
+
+// ---------------------------------------------------------------------------
+// VA-407: meta-reviews list + detail views. The list view paginates
+// `meta_reviews` and lets the operator filter by `kind`; the detail
+// view dispatches per kind to a tolerant renderer that walks the
+// stored content_json shape with optional chaining so an older
+// `template_version` row never crashes the page.
+// ---------------------------------------------------------------------------
+
+/**
+ * Filter state encoded into the `/meta-reviews` URL. `kind === null` ⇒
+ * "all kinds"; the chip strip renders both states. `page` is 1-based
+ * so the URL reads naturally (`?page=2` is the second page). The
+ * server clamps it to ≥ 1 before computing OFFSET.
+ */
+export interface MetaReviewListFilterState {
+  readonly kind: MetaReviewKind | null;
+  readonly page: number;
+}
+
+export const META_REVIEW_PAGE_SIZE = 20;
+
+export interface MetaReviewListViewModel {
+  readonly rows: readonly StoredMetaReview[];
+  readonly totalCount: number;
+  readonly filterState: MetaReviewListFilterState;
+}
+
+const META_REVIEW_KIND_LABELS: ReadonlyMap<MetaReviewKind, string> = new Map([
+  ["meta-run-review", "run"],
+  ["meta-drain-review", "drain"],
+  ["meta-weekly-review", "weekly"],
+  ["meta-skipped", "skipped"],
+  ["meta-failed", "failed"],
+]);
+
+const META_REVIEW_KIND_ORDER: readonly MetaReviewKind[] = [
+  "meta-run-review",
+  "meta-drain-review",
+  "meta-weekly-review",
+  "meta-skipped",
+  "meta-failed",
+];
+
+/**
+ * VA-407: serialize the filter state back to the canonical query
+ * string. Mirrors `filterStateToQueryString`'s pattern — chip clicks
+ * pivot one field while keeping the others, page resets to 1 on every
+ * filter change because the row set changes underneath.
+ */
+export function metaReviewFilterToQuery(
+  state: MetaReviewListFilterState,
+): string {
+  const parts: string[] = [];
+  if (state.kind !== null) parts.push(`kind=${encodeURIComponent(state.kind)}`);
+  if (state.page > 1) parts.push(`page=${state.page}`);
+  return parts.length === 0 ? "" : `?${parts.join("&")}`;
+}
+
+const META_REVIEW_SHARED_STYLE = `
+    .meta-row-skipped, .meta-row-failed { opacity: 0.55; }
+    .meta-row-failed .kind { color: #f87171; }
+    .meta-row-skipped .kind { color: #9ca3af; }
+    .meta-row-skipped .kind::before { content: "⏭ "; }
+    .meta-row-failed .kind::before { content: "✗ "; }
+    .meta-row-meta-run-review .kind { color: #93c5fd; }
+    .meta-row-meta-drain-review .kind { color: #c4b5fd; }
+    .meta-row-meta-weekly-review .kind { color: #6ee7b7; }
+    .meta-scope { color: #d4d4d8; font-size: 12px; }
+    .meta-section { margin: 16px 0; }
+    .meta-section h3 { font-size: 12px; color: #9ca3af; margin: 16px 0 4px;
+                       text-transform: uppercase; letter-spacing: 0.05em; }
+    .meta-grade { display: inline-block; padding: 1px 6px; border-radius: 3px;
+                  font-size: 11px; margin-right: 4px; background: #1f2937; }
+    .meta-grade-STRONG { background: #065f46; color: #d1fae5; }
+    .meta-grade-ADEQUATE { background: #1e3a8a; color: #dbeafe; }
+    .meta-grade-WEAK { background: #78350f; color: #fef3c7; }
+    .meta-grade-FAILED { background: #7f1d1d; color: #fee2e2; }
+    .meta-grade-BETTER { background: #065f46; color: #d1fae5; }
+    .meta-grade-STEADY { background: #374151; color: #d4d4d8; }
+    .meta-grade-WORSE { background: #7f1d1d; color: #fee2e2; }
+    .meta-verdict-HELD { background: #065f46; color: #d1fae5; }
+    .meta-verdict-PARTIAL { background: #78350f; color: #fef3c7; }
+    .meta-verdict-MISSED { background: #7f1d1d; color: #fee2e2; }
+    .meta-verdict-PENDING { background: #374151; color: #d4d4d8; }
+    .meta-verdict-QUALITATIVE { background: #4c1d95; color: #ede9fe; }
+    .pager { margin: 16px 0; font-size: 12px; color: #9ca3af; }
+    .pager a { margin-right: 12px; }
+    .pager-current { color: #d4d4d8; font-weight: 600; }
+    .json-fallback { font-size: 11px; background: #16161a; padding: 8px;
+                     overflow-x: auto; max-height: 320px; }
+    .meta-failed-banner { background: #7f1d1d; color: #fee2e2;
+                          padding: 8px 12px; border-radius: 4px; margin: 12px 0; }
+    .meta-skipped-banner { background: #374151; color: #d4d4d8;
+                           padding: 8px 12px; border-radius: 4px; margin: 12px 0; }
+`;
+
+export function renderMetaReviewListView(
+  vm: MetaReviewListViewModel,
+): string {
+  const chips = renderMetaReviewKindChips(vm.filterState);
+  const rows = vm.rows.length === 0
+    ? `<tr><td class="empty" colspan="4">No meta-reviews match the filter.</td></tr>`
+    : vm.rows.map(renderMetaReviewListRow).join("");
+  const pager = renderMetaReviewPager(vm);
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>meta-reviews · runway dashboard</title>
+  <style>${SHARED_STYLE}${META_REVIEW_SHARED_STYLE}</style>
+</head>
+<body>
+  <h1>meta-reviews</h1>
+  <div class="breadcrumb"><a href="/">← back to issue processes</a></div>
+  <div class="filters">
+    <div class="filter-row"><span class="filter-label">Kind</span>${chips}</div>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>Kind</th>
+        <th>Scope</th>
+        <th>Created</th>
+        <th>Summary</th>
+      </tr>
+    </thead>
+    <tbody>${rows}</tbody>
+  </table>
+  ${pager}
+</body>
+</html>`;
+}
+
+function renderMetaReviewKindChips(
+  state: MetaReviewListFilterState,
+): string {
+  const allActive = state.kind === null;
+  const allHref =
+    metaReviewFilterToQuery({ kind: null, page: 1 }) || "/meta-reviews";
+  const allChip = `<a class="filter-chip${allActive ? " active" : ""}" href="/meta-reviews${allHref}">all</a>`;
+  const chips = META_REVIEW_KIND_ORDER.map((kind) => {
+    const active = state.kind === kind;
+    const next = active ? null : kind;
+    const href = `/meta-reviews${metaReviewFilterToQuery({ kind: next, page: 1 })}`;
+    return `<a class="filter-chip${active ? " active" : ""}" href="${escapeHtml(href)}">${escapeHtml(META_REVIEW_KIND_LABELS.get(kind) ?? kind)}</a>`;
+  }).join("");
+  return allChip + chips;
+}
+
+function renderMetaReviewListRow(row: StoredMetaReview): string {
+  const href = `/meta-reviews/${encodeURIComponent(row.id)}`;
+  const kindLabel = META_REVIEW_KIND_LABELS.get(row.kind) ?? row.kind;
+  // VA-407 AC: skipped + failed rows render with a distinct visual
+  // treatment so they're scannable. Class hooks defined in
+  // `META_REVIEW_SHARED_STYLE`.
+  const rowCls = `meta-row-${row.kind}`;
+  return `<tr class="${escapeHtml(rowCls)}">
+    <td class="kind">${escapeHtml(kindLabel)}</td>
+    <td class="meta-scope">${escapeHtml(row.scope || "(no scope)")}</td>
+    <td>${escapeHtml(row.createdAt)}</td>
+    <td><a href="${escapeHtml(href)}">${escapeHtml(summariseMetaReview(row))}</a></td>
+  </tr>`;
+}
+
+/**
+ * VA-407: one-line summary for the list view. Reads the row's
+ * content_json with optional chaining so an older template_version
+ * still surfaces a useful row. Falls back to "(no summary)" when the
+ * content_json is unparseable or the expected fields are absent.
+ */
+function summariseMetaReview(row: StoredMetaReview): string {
+  const parsed = safeParseJson(row.contentJson);
+  if (!parsed) return "(unparseable content_json)";
+  const obj = parsed as Record<string, unknown>;
+  switch (row.kind) {
+    case "meta-skipped": {
+      const reason =
+        typeof obj.reason === "string" ? obj.reason : "(no reason)";
+      return `Skipped — ${reason}`;
+    }
+    case "meta-failed": {
+      const reason =
+        typeof obj.reason === "string" ? obj.reason : "(no reason)";
+      return `FAILED — ${reason}`;
+    }
+    case "meta-run-review": {
+      const review = obj.review as Record<string, unknown> | undefined;
+      const agentAbsolute =
+        (review?.agent_quality as { absolute?: unknown } | undefined)?.absolute;
+      const recCount = Array.isArray(review?.recommendations)
+        ? (review.recommendations as unknown[]).length
+        : 0;
+      return `agent=${typeof agentAbsolute === "string" ? agentAbsolute : "?"} · ${recCount} recommendations`;
+    }
+    case "meta-drain-review": {
+      const review = obj.review as Record<string, unknown> | undefined;
+      const severity =
+        typeof review?.severity === "string" ? review.severity : "?";
+      const issueCount =
+        typeof review?.issue_count === "number" ? review.issue_count : 0;
+      return `severity=${severity} · ${issueCount} issues`;
+    }
+    case "meta-weekly-review": {
+      const review = obj.review as Record<string, unknown> | undefined;
+      const promotions = Array.isArray(review?.promotions)
+        ? (review.promotions as unknown[]).length
+        : 0;
+      const shipped = Array.isArray(review?.shipped_promotions)
+        ? (review.shipped_promotions as unknown[]).length
+        : 0;
+      return `${promotions} promotions · ${shipped} shipped`;
+    }
+  }
+  return "(no summary)";
+}
+
+function renderMetaReviewPager(vm: MetaReviewListViewModel): string {
+  const { page } = vm.filterState;
+  const totalPages = Math.max(
+    1,
+    Math.ceil(vm.totalCount / META_REVIEW_PAGE_SIZE),
+  );
+  const start = vm.totalCount === 0 ? 0 : (page - 1) * META_REVIEW_PAGE_SIZE + 1;
+  const end = Math.min(vm.totalCount, page * META_REVIEW_PAGE_SIZE);
+  const prevHref =
+    page > 1
+      ? `/meta-reviews${metaReviewFilterToQuery({ ...vm.filterState, page: page - 1 })}`
+      : null;
+  const nextHref =
+    page < totalPages
+      ? `/meta-reviews${metaReviewFilterToQuery({ ...vm.filterState, page: page + 1 })}`
+      : null;
+  const prev = prevHref
+    ? `<a href="${escapeHtml(prevHref)}">← prev</a>`
+    : `<span class="muted">← prev</span>`;
+  const next = nextHref
+    ? `<a href="${escapeHtml(nextHref)}">next →</a>`
+    : `<span class="muted">next →</span>`;
+  return `<div class="pager">
+    ${prev}
+    <span class="pager-current">${start}–${end} of ${vm.totalCount}</span>
+    ${next}
+  </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// VA-407: meta-review detail view
+// ---------------------------------------------------------------------------
+
+export interface MetaReviewDetailViewModel {
+  readonly metaReview: StoredMetaReview;
+  /**
+   * For meta-run-review rows, the span_id of the source
+   * `issue_processes` row — looked up server-side by
+   * `findIssueProcessByIdentifier`. Used to cross-link the detail
+   * header back to the canonical `/issue-processes/:spanId` route per
+   * the AC. Null when no matching process row was found (older runs
+   * or a Run Review pointing at the wrong drain).
+   */
+  readonly sourceIssueProcessSpanId?: string | null;
+}
+
+export function renderMetaReviewDetailView(
+  vm: MetaReviewDetailViewModel,
+): string {
+  const { metaReview: r } = vm;
+  const kindLabel = META_REVIEW_KIND_LABELS.get(r.kind) ?? r.kind;
+  const parsed = safeParseJson(r.contentJson);
+  const section = renderMetaReviewKindSection(vm, parsed);
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>${escapeHtml(kindLabel)} · ${escapeHtml(r.scope || r.id)} · runway dashboard</title>
+  <style>${SHARED_STYLE}${META_REVIEW_SHARED_STYLE}</style>
+</head>
+<body>
+  <div class="breadcrumb"><a href="/meta-reviews">← all meta-reviews</a></div>
+  <h1>${escapeHtml(kindLabel)} · ${escapeHtml(r.scope || "(no scope)")}</h1>
+  <div class="meta">
+    <div><span class="label">id:</span> <code>${escapeHtml(r.id)}</code></div>
+    <div><span class="label">template_version:</span> <code>${escapeHtml(r.templateVersion)}</code></div>
+    <div><span class="label">created:</span> ${escapeHtml(r.createdAt)}</div>
+    ${r.drainId ? `<div><span class="label">drain:</span> <a href="/?drain=${encodeURIComponent(r.drainId)}"><code>${escapeHtml(shortenId(r.drainId))}</code></a></div>` : ""}
+    ${r.issueId ? `<div><span class="label">issue:</span> <code>${escapeHtml(r.issueId)}</code></div>` : ""}
+    ${vm.sourceIssueProcessSpanId ? `<div><span class="label">source run:</span> <a href="/issue-processes/${encodeURIComponent(vm.sourceIssueProcessSpanId)}">${escapeHtml(r.issueId ?? vm.sourceIssueProcessSpanId)}</a></div>` : ""}
+  </div>
+  ${section}
+</body>
+</html>`;
+}
+
+function renderMetaReviewKindSection(
+  vm: MetaReviewDetailViewModel,
+  parsed: unknown,
+): string {
+  const kind = vm.metaReview.kind;
+  if (!parsed || typeof parsed !== "object") {
+    return `<div class="meta-failed-banner">content_json could not be parsed.</div>
+      <pre class="json-fallback">${escapeHtml(vm.metaReview.contentJson.slice(0, 4096))}</pre>`;
+  }
+  const obj = parsed as Record<string, unknown>;
+  switch (kind) {
+    case "meta-skipped":
+      return renderSkippedSection(obj);
+    case "meta-failed":
+      return renderFailedSection(obj);
+    case "meta-run-review":
+      return renderRunReviewSection(vm, obj);
+    case "meta-drain-review":
+      return renderDrainReviewSection(vm, obj);
+    case "meta-weekly-review":
+      return renderWeeklyReviewSection(obj);
+  }
+  return "";
+}
+
+function renderSkippedSection(obj: Record<string, unknown>): string {
+  const reason =
+    typeof obj.reason === "string" ? obj.reason : "(no reason recorded)";
+  return `<div class="meta-skipped-banner">Skipped — ${escapeHtml(reason)}</div>`;
+}
+
+function renderFailedSection(obj: Record<string, unknown>): string {
+  const reason =
+    typeof obj.reason === "string" ? obj.reason : "(no reason recorded)";
+  const blocks: string[] = [
+    `<div class="meta-failed-banner">FAILED — ${escapeHtml(reason)}</div>`,
+  ];
+  if (typeof obj.linear_url === "string" && obj.linear_url.length > 0) {
+    blocks.push(
+      `<div class="meta"><span class="label">linear stub:</span> <a href="${escapeHtml(obj.linear_url)}" rel="noopener noreferrer" target="_blank">${escapeHtml(String(obj.linear_identifier ?? obj.linear_url))}</a></div>`,
+    );
+  }
+  if (typeof obj.secondary_linear_error === "string") {
+    blocks.push(
+      `<div class="meta-failed-banner">${escapeHtml(String(obj.secondary_linear_error))}</div>`,
+    );
+  }
+  // Preserved partial review (when the LLM succeeded but persistence
+  // failed) — render as a JSON block so an operator can recover.
+  if (obj.preserved_review && typeof obj.preserved_review === "object") {
+    blocks.push(
+      `<div class="meta-section"><h3>Preserved review</h3><pre class="json-fallback">${escapeHtml(JSON.stringify(obj.preserved_review, null, 2))}</pre></div>`,
+    );
+  }
+  return blocks.join("\n");
+}
+
+function renderRunReviewSection(
+  vm: MetaReviewDetailViewModel,
+  obj: Record<string, unknown>,
+): string {
+  const review = (obj.review ?? obj) as Record<string, unknown>;
+  const blocks: string[] = [];
+  const linearUrl =
+    typeof obj.linear_url === "string"
+      ? obj.linear_url
+      : typeof obj.linear_url === "object"
+        ? null
+        : null;
+  const linearIdentifier =
+    typeof obj.linear_issue_identifier === "string"
+      ? obj.linear_issue_identifier
+      : null;
+  if (linearUrl && linearIdentifier) {
+    blocks.push(
+      `<div class="meta"><span class="label">linear:</span> <a href="${escapeHtml(linearUrl)}" rel="noopener noreferrer" target="_blank">${escapeHtml(linearIdentifier)}</a></div>`,
+    );
+  }
+  if (typeof review.final_outcome === "string") {
+    blocks.push(
+      `<div class="meta"><span class="label">outcome:</span> <code>${escapeHtml(review.final_outcome)}</code></div>`,
+    );
+  }
+  const qualityDims = [
+    ["issue_quality", "issue_quality_relative", "Issue"],
+    ["prompt_quality", "prompt_quality_relative", "Prompt"],
+    ["agent_quality", "agent_quality_relative", "Agent"],
+    ["reviewer_quality", "reviewer_quality_relative", "Reviewer"],
+    ["orchestration_quality", "orchestration_quality_relative", "Orchestration"],
+  ] as const;
+  const qualityRows = qualityDims
+    .map(([absKey, relKey, label]) => {
+      const section = review[absKey] as
+        | { absolute?: unknown; justification?: unknown }
+        | undefined;
+      if (!section || typeof section !== "object") return "";
+      const absolute =
+        typeof section.absolute === "string" ? section.absolute : null;
+      const relative =
+        typeof review[relKey] === "string" ? (review[relKey] as string) : null;
+      const just =
+        typeof section.justification === "string" ? section.justification : "";
+      return `<tr>
+        <td>${escapeHtml(label)}</td>
+        <td>${absolute ? `<span class="meta-grade meta-grade-${escapeHtml(absolute)}">${escapeHtml(absolute)}</span>` : ""}</td>
+        <td>${relative ? `<span class="meta-grade meta-grade-${escapeHtml(relative)}">${escapeHtml(relative)}</span>` : ""}</td>
+        <td class="detail">${escapeHtml(just)}</td>
+      </tr>`;
+    })
+    .filter((s) => s.length > 0)
+    .join("");
+  if (qualityRows.length > 0) {
+    blocks.push(`<div class="meta-section"><h3>Quality grades</h3>
+      <table>
+        <thead><tr><th>Dimension</th><th>Absolute</th><th>Relative</th><th>Justification</th></tr></thead>
+        <tbody>${qualityRows}</tbody>
+      </table>
+    </div>`);
+  }
+  if (Array.isArray(review.recommendations) && review.recommendations.length > 0) {
+    const items = review.recommendations
+      .map((rec) => {
+        if (!rec || typeof rec !== "object") return "";
+        const r = rec as { target?: unknown; change?: unknown; confidence?: unknown };
+        return `<li><code>${escapeHtml(String(r.target ?? "?"))}</code> (${escapeHtml(String(r.confidence ?? "?"))}) — ${escapeHtml(String(r.change ?? ""))}</li>`;
+      })
+      .join("");
+    blocks.push(`<div class="meta-section"><h3>Recommendations</h3><ul>${items}</ul></div>`);
+  }
+  // VA-403: hindsight signals (when present). Older v1.0.0 carried
+  // hindsight_signals=null; we only render the section when populated.
+  const hs = review.hindsight_signals as
+    | {
+        pr?: { url?: unknown; state?: unknown; merged_at?: unknown } | null;
+        human_verdict?: { sentiment?: unknown; comment_count?: unknown; summary?: unknown } | null;
+        follow_up_issues?: ReadonlyArray<{ identifier?: unknown; title?: unknown }>;
+      }
+      | null
+      | undefined;
+  if (hs && typeof hs === "object") {
+    const parts: string[] = [];
+    if (hs.pr && typeof hs.pr === "object") {
+      const prUrl = typeof hs.pr.url === "string" ? hs.pr.url : null;
+      const prState = typeof hs.pr.state === "string" ? hs.pr.state : "?";
+      parts.push(
+        `<div><span class="label">PR:</span> ${prUrl ? `<a href="${escapeHtml(prUrl)}" rel="noopener noreferrer" target="_blank">${escapeHtml(prUrl)}</a>` : "—"} (<code>${escapeHtml(prState)}</code>)</div>`,
+      );
+    }
+    if (hs.human_verdict && typeof hs.human_verdict === "object") {
+      parts.push(
+        `<div><span class="label">human verdict:</span> ${escapeHtml(String(hs.human_verdict.sentiment ?? "?"))} (${escapeHtml(String(hs.human_verdict.comment_count ?? 0))} comments) — ${escapeHtml(String(hs.human_verdict.summary ?? ""))}</div>`,
+      );
+    }
+    if (Array.isArray(hs.follow_up_issues) && hs.follow_up_issues.length > 0) {
+      const items = hs.follow_up_issues
+        .map(
+          (i) =>
+            `<li><code>${escapeHtml(String(i?.identifier ?? "?"))}</code> ${escapeHtml(String(i?.title ?? ""))}</li>`,
+        )
+        .join("");
+      parts.push(
+        `<div><span class="label">follow-ups:</span><ul>${items}</ul></div>`,
+      );
+    }
+    if (parts.length > 0) {
+      blocks.push(
+        `<div class="meta-section"><h3>Hindsight signals</h3>${parts.join("")}</div>`,
+      );
+    }
+  }
+  // Cross-link footer to the source issue process if known. Also
+  // rendered in the meta header but a footer reinforces the path.
+  if (vm.sourceIssueProcessSpanId) {
+    blocks.push(
+      `<div class="meta-section"><a href="/issue-processes/${encodeURIComponent(vm.sourceIssueProcessSpanId)}">→ source run (${escapeHtml(vm.metaReview.issueId ?? vm.sourceIssueProcessSpanId)})</a></div>`,
+    );
+  }
+  return blocks.join("\n");
+}
+
+function renderDrainReviewSection(
+  vm: MetaReviewDetailViewModel,
+  obj: Record<string, unknown>,
+): string {
+  const review = (obj.review ?? obj) as Record<string, unknown>;
+  const blocks: string[] = [];
+  if (typeof obj.linear_url === "string" && typeof obj.linear_identifier === "string") {
+    blocks.push(
+      `<div class="meta"><span class="label">linear:</span> <a href="${escapeHtml(obj.linear_url)}" rel="noopener noreferrer" target="_blank">${escapeHtml(obj.linear_identifier)}</a></div>`,
+    );
+  }
+  if (typeof review.severity === "string") {
+    const sev = review.severity;
+    const cls = sev === "critical" ? "meta-failed-banner" : "meta";
+    blocks.push(
+      `<div class="${cls}"><strong>severity:</strong> ${escapeHtml(sev)} — ${escapeHtml(String(review.severity_justification ?? ""))}</div>`,
+    );
+  }
+  if (typeof review.sequencing_assessment === "string") {
+    blocks.push(
+      `<div class="meta-section"><h3>Sequencing</h3><div class="detail">${escapeHtml(review.sequencing_assessment)}</div></div>`,
+    );
+  }
+  if (Array.isArray(review.cross_issue_patterns) && review.cross_issue_patterns.length > 0) {
+    const items = review.cross_issue_patterns
+      .map((p) => `<li>${escapeHtml(String(p))}</li>`)
+      .join("");
+    blocks.push(
+      `<div class="meta-section"><h3>Cross-issue patterns</h3><ul>${items}</ul></div>`,
+    );
+  }
+  if (review.outcomes_summary && typeof review.outcomes_summary === "object") {
+    const entries = Object.entries(review.outcomes_summary as Record<string, unknown>)
+      .map(([k, v]) => `<li><code>${escapeHtml(k)}</code>: ${escapeHtml(String(v))}</li>`)
+      .join("");
+    blocks.push(
+      `<div class="meta-section"><h3>Outcomes</h3><ul>${entries}</ul></div>`,
+    );
+  }
+  if (Array.isArray(review.notable_events) && review.notable_events.length > 0) {
+    const items = review.notable_events
+      .map((e) => {
+        if (!e || typeof e !== "object") return "";
+        const ev = e as { issue_identifier?: unknown; event?: unknown; run_review_url?: unknown };
+        const idText = String(ev.issue_identifier ?? "?");
+        const link =
+          typeof ev.run_review_url === "string"
+            ? `<a href="${escapeHtml(ev.run_review_url)}" rel="noopener noreferrer" target="_blank">${escapeHtml(idText)}</a>`
+            : escapeHtml(idText);
+        return `<li>${link}: ${escapeHtml(String(ev.event ?? ""))}</li>`;
+      })
+      .join("");
+    blocks.push(`<div class="meta-section"><h3>Notable events</h3><ul>${items}</ul></div>`);
+  }
+  if (Array.isArray(review.recommendations) && review.recommendations.length > 0) {
+    const items = review.recommendations
+      .map((rec) => {
+        if (!rec || typeof rec !== "object") return "";
+        const r = rec as { target?: unknown; change?: unknown; confidence?: unknown };
+        return `<li><code>${escapeHtml(String(r.target ?? "?"))}</code> (${escapeHtml(String(r.confidence ?? "?"))}) — ${escapeHtml(String(r.change ?? ""))}</li>`;
+      })
+      .join("");
+    blocks.push(`<div class="meta-section"><h3>Recommendations</h3><ul>${items}</ul></div>`);
+  }
+  // VA-407 AC: drain detail links to drain's issue_processes list.
+  if (vm.metaReview.drainId) {
+    blocks.push(
+      `<div class="meta-section"><a href="/?drain=${encodeURIComponent(vm.metaReview.drainId)}">→ drain's issue_processes</a></div>`,
+    );
+  }
+  return blocks.join("\n");
+}
+
+function renderWeeklyReviewSection(obj: Record<string, unknown>): string {
+  const review = (obj.review ?? obj) as Record<string, unknown>;
+  const blocks: string[] = [];
+  if (typeof obj.linear_url === "string" && typeof obj.linear_identifier === "string") {
+    blocks.push(
+      `<div class="meta"><span class="label">linear:</span> <a href="${escapeHtml(obj.linear_url)}" rel="noopener noreferrer" target="_blank">${escapeHtml(obj.linear_identifier)}</a></div>`,
+    );
+  }
+  if (typeof review.narrative === "string" && review.narrative.length > 0) {
+    blocks.push(
+      `<div class="meta-section"><h3>Narrative</h3><div class="detail">${escapeHtml(review.narrative)}</div></div>`,
+    );
+  }
+  if (review.rates && typeof review.rates === "object") {
+    const rates = review.rates as Record<string, unknown>;
+    const rows = Object.entries(rates)
+      .map(([k, v]) => `<tr><td>${escapeHtml(k)}</td><td>${escapeHtml(String(v))}</td></tr>`)
+      .join("");
+    blocks.push(
+      `<div class="meta-section"><h3>Rates</h3><table>${rows}</table></div>`,
+    );
+  }
+  // VA-409: *What we shipped* section. Cross-links each shipped row to
+  // its runway-meta-promoted Linear issue.
+  if (Array.isArray(review.shipped_promotions) && review.shipped_promotions.length > 0) {
+    const items = review.shipped_promotions
+      .map((s) => {
+        if (!s || typeof s !== "object") return "";
+        const sp = s as {
+          linear_identifier?: unknown;
+          linear_url?: unknown;
+          linear_title?: unknown;
+          verdict?: unknown;
+          comment?: unknown;
+        };
+        const id = typeof sp.linear_identifier === "string" ? sp.linear_identifier : "?";
+        const url = typeof sp.linear_url === "string" ? sp.linear_url : null;
+        const verdict = typeof sp.verdict === "string" ? sp.verdict : "?";
+        const link = url
+          ? `<a href="${escapeHtml(url)}" rel="noopener noreferrer" target="_blank">${escapeHtml(id)}</a>`
+          : escapeHtml(id);
+        return `<li><span class="meta-grade meta-verdict-${escapeHtml(verdict)}">${escapeHtml(verdict)}</span> ${link} — ${escapeHtml(String(sp.linear_title ?? ""))} <br /><span class="muted">${escapeHtml(String(sp.comment ?? ""))}</span></li>`;
+      })
+      .join("");
+    blocks.push(`<div class="meta-section"><h3>What we shipped</h3><ul>${items}</ul></div>`);
+  }
+  // VA-407 AC: promotions block cross-links to runway-meta Linear
+  // issues. Promotion URLs live in `obj.promotion_filings[*].url`
+  // (stamped by the weekly review pass after each runway-repo issue
+  // is filed).
+  if (Array.isArray(review.promotions) && review.promotions.length > 0) {
+    const filings = Array.isArray(obj.promotion_filings)
+      ? (obj.promotion_filings as ReadonlyArray<Record<string, unknown>>)
+      : [];
+    const filingByThemeKey = new Map<string, { identifier?: unknown; url?: unknown }>();
+    for (const f of filings) {
+      if (f && typeof f === "object" && typeof f.theme_key === "string") {
+        filingByThemeKey.set(f.theme_key, f);
+      }
+    }
+    const items = review.promotions
+      .map((p) => {
+        if (!p || typeof p !== "object") return "";
+        const promo = p as { title?: unknown; theme_key?: unknown; target?: unknown };
+        const themeKey =
+          typeof promo.theme_key === "string" ? promo.theme_key : "";
+        const filing = themeKey ? filingByThemeKey.get(themeKey) : undefined;
+        const linearId =
+          filing && typeof filing.identifier === "string" ? filing.identifier : null;
+        const linearUrl =
+          filing && typeof filing.url === "string" ? filing.url : null;
+        const linkHtml =
+          linearUrl && linearId
+            ? ` → <a href="${escapeHtml(linearUrl)}" rel="noopener noreferrer" target="_blank">${escapeHtml(linearId)}</a>`
+            : "";
+        return `<li><strong>${escapeHtml(String(promo.title ?? "(untitled)"))}</strong> <code>${escapeHtml(String(promo.target ?? "?"))}</code>${linkHtml}</li>`;
+      })
+      .join("");
+    blocks.push(`<div class="meta-section"><h3>Promotions</h3><ul>${items}</ul></div>`);
+  }
+  return blocks.join("\n");
+}
+
+function safeParseJson(json: string): unknown {
+  try {
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
+
+function shortenId(id: string): string {
+  return id.length > 12 ? `${id.slice(0, 8)}…` : id;
 }
