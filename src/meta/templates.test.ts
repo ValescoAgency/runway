@@ -540,7 +540,7 @@ describe("parseRunReview (VA-402)", () => {
   // can find norm-aware reviews in the meta-project. v1.0.0 / v1.1.0
   // reviews still parse (forward-compat on the minor bump).
 
-  it("accepts a v1.2.0 payload with all relative axes populated", () => {
+  it("accepts a v1.2.0 payload with both nested and top-level relative axes populated", () => {
     const v120 = {
       ...VALID_RUN_REVIEW,
       template_version: "1.2.0",
@@ -569,12 +569,54 @@ describe("parseRunReview (VA-402)", () => {
         relative: "BETTER",
         justification: "Wall-time well under category median.",
       },
+      // VA-405 AC: five top-level relative-axis fields. The IRA emits
+      // both these and the nested slots; v1.2.0 consumers read these.
+      issue_quality_relative: "BETTER",
+      prompt_quality_relative: "STEADY",
+      agent_quality_relative: "BETTER",
+      reviewer_quality_relative: "STEADY",
+      orchestration_quality_relative: "BETTER",
     };
     const result = parseRunReview(wrapRunReview(JSON.stringify(v120)));
     expect(result.ok).toBe(true);
     if (!result.ok) return;
+    // Nested slots round-trip (back-compat).
     expect(result.report.agent_quality.relative).toBe("BETTER");
     expect(result.report.reviewer_quality.relative).toBe("STEADY");
+    // VA-405 AC: named top-level fields are present and typed.
+    expect(result.report.issue_quality_relative).toBe("BETTER");
+    expect(result.report.prompt_quality_relative).toBe("STEADY");
+    expect(result.report.agent_quality_relative).toBe("BETTER");
+    expect(result.report.reviewer_quality_relative).toBe("STEADY");
+    expect(result.report.orchestration_quality_relative).toBe("BETTER");
+  });
+
+  it("v1.2.0 omitting the top-level *_quality_relative fields parses (norms-unavailable case)", () => {
+    // Norms unavailable / sample too small → IRA omits the named
+    // fields entirely AND sets every nested relative slot to null.
+    // The schema must accept this shape so the runtime path doesn't
+    // need to fabricate a sentinel.
+    const v120NoNorms = {
+      ...VALID_RUN_REVIEW,
+      template_version: "1.2.0",
+    };
+    const result = parseRunReview(wrapRunReview(JSON.stringify(v120NoNorms)));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.issue_quality_relative).toBeUndefined();
+    expect(result.report.agent_quality_relative).toBeUndefined();
+  });
+
+  it("rejects an invalid value in a top-level *_quality_relative field", () => {
+    const bad = {
+      ...VALID_RUN_REVIEW,
+      template_version: "1.2.0",
+      agent_quality_relative: "MUCH_BETTER",
+    };
+    const result = parseRunReview(wrapRunReview(JSON.stringify(bad)));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.kind).toBe("schema-mismatch");
   });
 
   it("v1.0.0 payloads (all relative=null) still parse under v1.2.0 (forward-compat)", () => {

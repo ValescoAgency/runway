@@ -320,13 +320,27 @@ const RunReviewSchema = z.object({
   drain_trace_id: z.string().min(1),
   final_outcome: z.string().min(1),
   // Five quality dimensions per PRD. Each is a QualitySection
-  // (absolute + relative + justification). At this slice all
-  // `relative` slots are `null` because no rolling norms exist yet.
+  // (absolute + relative + justification). The nested `relative`
+  // slot was added pre-emptively in VA-402 (so v1.0.0 fixtures
+  // could already carry `null`); VA-405 adds the named top-level
+  // mirrors below so consumers that don't drill into the nested
+  // struct can still find the relative axis.
   issue_quality: QualitySectionSchema,
   prompt_quality: QualitySectionSchema,
   agent_quality: QualitySectionSchema,
   reviewer_quality: QualitySectionSchema,
   orchestration_quality: QualitySectionSchema,
+  // VA-405 v1.2.0: top-level relative-axis fields per the AC. Each
+  // is a `BETTER | STEADY | WORSE` enum, optional so v1.0.0 / v1.1.0
+  // payloads (which don't emit them) still parse. The IRA emits both
+  // these AND the nested `relative` slot when norms were available
+  // (the two should agree); v1.2.0 consumers should prefer the
+  // top-level fields — they're the contract field names the AC pinned.
+  issue_quality_relative: QualityRelativeSchema.optional(),
+  prompt_quality_relative: QualityRelativeSchema.optional(),
+  agent_quality_relative: QualityRelativeSchema.optional(),
+  reviewer_quality_relative: QualityRelativeSchema.optional(),
+  orchestration_quality_relative: QualityRelativeSchema.optional(),
   recommendations: z.array(RecommendationSchema),
   hindsight_signals: HindsightSignalsSchema,
 });

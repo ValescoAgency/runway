@@ -218,43 +218,13 @@ describe("MetaDashboardRead.loadNorms (VA-405)", () => {
     expect(norms).toBeNull();
   });
 
-  it("excludes drains outside the rolling window", async () => {
-    // Two drains. Window=1 → only the most-recent drain's process
-    // contributes. The older drain's wild-iteration process must
-    // drop out so the median reflects only the new drain.
-    const oldTrace = "11111111111111111111111111111111";
-    const newTrace = "22222222222222222222222222222222";
-    seedDrain(oldTrace, "1000000000000000000");
-    seedDrain(newTrace, "2000000000000000000");
-
-    seedProcess({
-      traceId: oldTrace,
-      spanId: "oldoldoldold0001",
-      identifier: "VA-1",
-      outcomeKind: "opened",
-      wallMs: 999_999,
-      iterations: 99,
-    });
-    seedProcess({
-      traceId: newTrace,
-      spanId: "newnewnewnew0001",
-      identifier: "VA-2",
-      outcomeKind: "opened",
-      wallMs: 500,
-      iterations: 2,
-    });
-
-    const norms = await Effect.runPromise(gateway.loadNorms("VA", 1));
-    expect(norms).not.toBeNull();
-    if (norms === null) return;
-    expect(norms.sampleSize).toBe(1);
-    expect(norms.medianWallTimeMs).toBe(500);
-    expect(norms.p95WallTimeMs).toBe(500);
-    expect(norms.medianIterationCount).toBe(2);
-    expect(norms.p95IterationCount).toBe(2);
-  });
-
-  it("treats sub-zero / fractional window values as 1 (coerced safely)", async () => {
+  it("echoes the caller's requested window in CapturedNorms.windowDrains for prompt traceability", async () => {
+    // The view's actual N is owned by the dashboard process
+    // (`DASHBOARD_AGGREGATE_WINDOW`, default 30); see
+    // `read-model.md`. `loadNorms`' window parameter is recorded in
+    // the projected `CapturedNorms` so the IRA's user prompt can say
+    // "vs last 7 drains" even when the underlying numbers reflect
+    // the dashboard's setting.
     const trace = "33333333333333333333333333333333";
     seedDrain(trace, "1000000000000000000");
     seedProcess({
@@ -266,13 +236,15 @@ describe("MetaDashboardRead.loadNorms (VA-405)", () => {
       iterations: 1,
     });
 
-    // -3 floors to 1 (sane SQL bind for LIMIT) rather than confusing
-    // SQLite or crashing.
-    const norms = await Effect.runPromise(gateway.loadNorms("VA", -3));
+    const norms = await Effect.runPromise(gateway.loadNorms("VA", 7));
     expect(norms).not.toBeNull();
     if (norms === null) return;
-    expect(norms.windowDrains).toBe(1);
-    expect(norms.sampleSize).toBe(1);
+    expect(norms.windowDrains).toBe(7);
+
+    // Out-of-band / nonsense window values floor to 1 so the prompt
+    // doesn't advertise `-3` or `NaN`.
+    const coerced = await Effect.runPromise(gateway.loadNorms("VA", -3));
+    expect(coerced?.windowDrains).toBe(1);
   });
 
   it("returns null when the event store has no drains yet", async () => {
