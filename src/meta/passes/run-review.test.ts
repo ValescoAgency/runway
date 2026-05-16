@@ -46,6 +46,10 @@ const buildFixtures = () => {
     }),
   } as unknown as import("../../dashboard/storage.js").Storage;
 
+  // VA-404: the existing happy-path fixture is opened/iter=1 — that's
+  // a clean run the heuristic filter would skip. Bump iterationIndex
+  // so VA-402's outcome assertions still drive the LLM path; tests
+  // that exercise the skip path build their own fixture below.
   const captured = {
     spanId: "span-issue-process",
     issueIdentifier: "VA-401",
@@ -67,7 +71,7 @@ const buildFixtures = () => {
     loadCodingAgentReport: vi.fn(() =>
       Effect.succeed({
         ok: true as const,
-        iterationIndex: 1,
+        iterationIndex: 3,
         templateVersion: "1.0.0",
         payload: JSON.stringify({ approach: "fixture" }),
       }),
@@ -261,6 +265,83 @@ describe("runRunReviewPass (VA-402)", () => {
     expect(f.metaLinear.createRunReviewIssue).toHaveBeenCalledTimes(2);
     expect(content.secondary_linear_error).toContain("boom");
     expect(content.linear_stub_identifier).toBeNull();
+  });
+
+  it("VA-404: skips uneventful runs — writes meta-skipped, no LLM, no Linear", async () => {
+    const f = buildFixtures();
+    // Override the agent report to a clean one-iteration run; the
+    // base fixture's outcomeKind=opened plus iter=1 is the canonical
+    // skip case the PRD calls out.
+    f.dashboardRead.loadCodingAgentReport = vi.fn(() =>
+      Effect.succeed({
+        ok: true as const,
+        iterationIndex: 1,
+        templateVersion: "1.0.0",
+        payload: JSON.stringify({ approach: "fixture" }),
+      }),
+    ) as unknown as typeof f.dashboardRead.loadCodingAgentReport;
+
+    const outcome = await Effect.runPromise(
+      runRunReviewPass(
+        { traceId: "trace-abc", issueIdentifier: "VA-401" },
+        {
+          anthropicApiKey: "test-key",
+          metaReviewModel: "claude-sonnet-4-6",
+          dashboardRead: f.dashboardRead,
+          metaLinear: f.metaLinear,
+          storage: f.storage,
+        },
+      ),
+    );
+
+    expect(outcome.kind).toBe("skipped");
+    if (outcome.kind !== "skipped") return;
+    expect(outcome.reason).toMatch(/clean run/);
+    expect(f.saved).toHaveLength(1);
+    expect(f.saved[0]?.kind).toBe("meta-skipped");
+    expect(f.saved[0]?.drainId).toBe("trace-abc");
+    expect(f.saved[0]?.issueId).toBe("VA-401");
+    const content = JSON.parse(f.saved[0]?.contentJson ?? "{}");
+    expect(content.reason).toMatch(/clean run/);
+    // The skip path is the whole point — neither the LLM nor Linear
+    // should be touched.
+    expect(callRunReviewMock).not.toHaveBeenCalled();
+    expect(f.metaLinear.createRunReviewIssue).not.toHaveBeenCalled();
+  });
+
+  it("VA-404: respects custom thresholds — minIterationCount=2 routes a 2-iter run to LLM", async () => {
+    callRunReviewMock.mockReturnValueOnce(
+      Effect.succeed({ ok: true, report: validReview }),
+    );
+    const f = buildFixtures();
+    f.dashboardRead.loadCodingAgentReport = vi.fn(() =>
+      Effect.succeed({
+        ok: true as const,
+        iterationIndex: 2,
+        templateVersion: "1.0.0",
+        payload: JSON.stringify({ approach: "fixture" }),
+      }),
+    ) as unknown as typeof f.dashboardRead.loadCodingAgentReport;
+
+    const outcome = await Effect.runPromise(
+      runRunReviewPass(
+        { traceId: "trace-abc", issueIdentifier: "VA-401" },
+        {
+          anthropicApiKey: "test-key",
+          metaReviewModel: "claude-sonnet-4-6",
+          dashboardRead: f.dashboardRead,
+          metaLinear: f.metaLinear,
+          storage: f.storage,
+          metaFilterThresholds: {
+            minIterationCount: 2,
+            minReviewerRejections: 2,
+          },
+        },
+      ),
+    );
+
+    expect(outcome.kind).toBe("review");
+    expect(callRunReviewMock).toHaveBeenCalledTimes(1);
   });
 
   it("stubs out when the issue_process row hasn't been observed yet", async () => {

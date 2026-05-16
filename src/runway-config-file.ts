@@ -32,6 +32,17 @@ const RunwayConfigFileSchema = z.object({
    * Overridden by `RUNWAY_META_PROJECT_NAME` if set in env.
    */
   metaProjectName: z.string().optional(),
+  /**
+   * VA-404: thresholds for the IRA heuristic pre-filter. Either or
+   * both fields may be set; missing fields fall through to the
+   * hardcoded defaults (3 iterations, 2 reviewer rejections).
+   */
+  metaFilterThresholds: z
+    .object({
+      minIterationCount: z.number().int().min(1).optional(),
+      minReviewerRejections: z.number().int().min(1).optional(),
+    })
+    .optional(),
 });
 
 export type RunwayConfigFile = z.infer<typeof RunwayConfigFileSchema>;

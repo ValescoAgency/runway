@@ -2,6 +2,10 @@ import { Effect } from "effect";
 import { createStorage } from "../dashboard/storage.js";
 import { loadRunwayConfigFile } from "../runway-config-file.js";
 import { createMetaDashboardRead } from "./dashboard-read.js";
+import {
+  DEFAULT_META_FILTER_THRESHOLDS,
+  type MetaFilterThresholds,
+} from "./heuristic-filter.js";
 import { createMetaLinearGateway } from "./linear-meta.js";
 import { runRunReviewPass, type RunReviewPassOutcome } from "./passes/run-review.js";
 
@@ -59,7 +63,12 @@ export function resolveMetaConfig(env: {
 }): {
   readonly metaReviewModel: string;
   readonly metaProjectName: string;
-  readonly source: { readonly model: string; readonly project: string };
+  readonly metaFilterThresholds: MetaFilterThresholds;
+  readonly source: {
+    readonly model: string;
+    readonly project: string;
+    readonly thresholds: string;
+  };
 } {
   const file = loadRunwayConfigFile(env.cwd);
   const model = env.config.metaReviewModel
@@ -72,12 +81,44 @@ export function resolveMetaConfig(env: {
     : file.metaProjectName
       ? { value: file.metaProjectName, source: ".runway/config.yml" }
       : { value: DEFAULT_META_PROJECT_NAME, source: "default" };
+  // VA-404: env JSON override → file block → hardcoded defaults.
+  // The env knob is one-off only — operators tuning thresholds for
+  // real edit `.runway/config.yml`. Each missing field falls through
+  // to the default individually, so a partial override (just
+  // `minIterationCount`) doesn't reset the other knob.
+  const thresholds = resolveThresholds(env.config.metaFilterThresholds, file.metaFilterThresholds);
   return {
     metaReviewModel: model.value,
     metaProjectName: project.value,
-    source: { model: model.source, project: project.source },
+    metaFilterThresholds: thresholds.value,
+    source: {
+      model: model.source,
+      project: project.source,
+      thresholds: thresholds.source,
+    },
   };
 }
+
+const resolveThresholds = (
+  fromEnv: Partial<MetaFilterThresholds> | undefined,
+  fromFile: Partial<MetaFilterThresholds> | undefined,
+): { readonly value: MetaFilterThresholds; readonly source: string } => {
+  if (!fromEnv && !fromFile) {
+    return { value: DEFAULT_META_FILTER_THRESHOLDS, source: "default" };
+  }
+  const merged: MetaFilterThresholds = {
+    minIterationCount:
+      fromEnv?.minIterationCount ??
+      fromFile?.minIterationCount ??
+      DEFAULT_META_FILTER_THRESHOLDS.minIterationCount,
+    minReviewerRejections:
+      fromEnv?.minReviewerRejections ??
+      fromFile?.minReviewerRejections ??
+      DEFAULT_META_FILTER_THRESHOLDS.minReviewerRejections,
+  };
+  const source = fromEnv ? "env" : ".runway/config.yml";
+  return { value: merged, source };
+};
 
 /**
  * VA-402: invoke the Run Review pass end-to-end. Manages storage +
@@ -108,6 +149,7 @@ export const dispatchRunReview = (
           dashboardRead,
           metaLinear,
           storage,
+          metaFilterThresholds: resolved.metaFilterThresholds,
         },
       );
     } finally {
