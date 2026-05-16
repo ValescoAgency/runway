@@ -134,6 +134,23 @@ export interface MetaDashboardRead {
     traceId: string,
     issueProcessSpanId: string,
   ): Effect.Effect<CapturedReviewerReport, MetaReadError>;
+  /**
+   * VA-404: count of `review` spans whose parent is the issue
+   * process. Each `Effect.withSpan("review")` call in `runReviewPass`
+   * opens a fresh span — when VA-418's review-retry budget fires,
+   * the orchestrator runs `runReviewPass` again, so this count is
+   * the number of review attempts the run actually made.
+   *
+   * `>= 2` means at least one mid-run review-retry happened — even
+   * if the run ultimately succeeded ("opened"). The heuristic
+   * filter uses this to honour the PRD's "retry triggered at any
+   * phase" trip clause for runs that recovered from a REJECTED-RETRY
+   * without escalating to HITL.
+   */
+  countReviewAttempts(
+    traceId: string,
+    issueProcessSpanId: string,
+  ): Effect.Effect<number, MetaReadError>;
 }
 
 /**
@@ -175,6 +192,17 @@ export function createMetaDashboardRead(path: string): MetaDashboardRead {
       AND json_extract(payload, '$.parentSpanId') = ?
     ORDER BY rowid DESC
     LIMIT 1
+  `);
+
+  // VA-404: count of review spans for the issue process. The
+  // orchestrator emits one `review` span per attempt (initial +
+  // each retry within the budget). >= 2 = at least one retry fired.
+  const selectReviewAttemptCount = db.prepare(`
+    SELECT COUNT(*) AS attempts
+    FROM raw_spans
+    WHERE trace_id = ?
+      AND name = 'review'
+      AND json_extract(payload, '$.parentSpanId') = ?
   `);
 
   const wrap = <A>(
@@ -273,6 +301,16 @@ export function createMetaDashboardRead(path: string): MetaDashboardRead {
         }
         const attrs = extractAttrs(String(row.payload ?? ""));
         return projectReviewerReport(attrs);
+      });
+    },
+
+    countReviewAttempts(traceId, issueProcessSpanId) {
+      return wrap("countReviewAttempts", () => {
+        const row = selectReviewAttemptCount.get(
+          traceId,
+          issueProcessSpanId,
+        ) as Record<string, unknown> | undefined;
+        return Number(row?.attempts ?? 0);
       });
     },
   };

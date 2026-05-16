@@ -48,10 +48,12 @@ const ctxOf = (
   ip: CapturedIssueProcess,
   agent: CapturedCodingAgentReport = okAgent(1),
   reviewer: CapturedReviewerReport = okReviewer(),
+  reviewAttemptCount = 1,
 ): RunReviewContext => ({
   issueProcess: ip,
   codingAgentReport: agent,
   reviewerReport: reviewer,
+  reviewAttemptCount,
   hindsightSignals: null,
   norms: null,
 });
@@ -106,15 +108,36 @@ describe("shouldRunIRA (VA-404)", () => {
     expect(d.reason).toMatch(/infra-error/);
   });
 
-  it("trips on reviewer-rejected proxy (HITL + iterations >= 2)", () => {
+  // VA-404 follow-up (cursor review on PR #105): "retry triggered at
+  // any phase" must catch recovered-from-REJECTED-RETRY runs, not
+  // only escalations to HITL. Each review attempt opens a fresh
+  // review span; >= 2 means at least one mid-run retry happened
+  // even if the final outcome was a clean merge.
+
+  it("trips on retry-then-success (opened outcome but reviewAttemptCount >= 2)", () => {
+    const d = shouldRunIRA(
+      ctxOf(
+        baseIp({ outcomeKind: "opened" }),
+        okAgent(2),
+        okReviewer(),
+        2, // reviewAttemptCount: review ran twice → retry fired
+      ),
+    );
+    expect(d.run).toBe(true);
+    expect(d.reason).toMatch(/retry triggered \(2 review attempts/);
+  });
+
+  it("trips on retry triggered when reviewAttemptCount meets the configured threshold", () => {
     const d = shouldRunIRA(
       ctxOf(
         baseIp({ outcomeKind: "hitl", outcomeDetail: "stuck" }),
         okAgent(2),
+        okReviewer(),
+        2,
       ),
     );
     expect(d.run).toBe(true);
-    expect(d.reason).toMatch(/reviewer-rejection proxy/);
+    expect(d.reason).toMatch(/retry triggered/);
   });
 
   it("trips when the agent report is missing (can't verify cleanliness)", () => {

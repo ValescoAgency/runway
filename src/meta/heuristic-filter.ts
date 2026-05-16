@@ -13,14 +13,14 @@ import type { RunReviewContext } from "./context.js";
  *   - infra-error outcome (`outcomeKind === "errored"`)
  *   - HITL escape       (`outcomeKind === "hitl"`)
  *   - revert outcome    (`outcomeKind === "reverted"`)
- *   - reviewer rejection retry — `outcomeKind === "hitl"` AND
- *     `outcomeDetail` starts with `"Sub-agent review rejected"`
- *     (the prefix `src/review.ts` emits and the dashboard's
- *     aggregates view keys on)
- *   - reviewer-rejected count ≥ N (default 2) — proxied via
- *     `iterationIndex` because we don't have a per-attempt rejection
- *     counter on `issue_processes` yet. A run that hit ≥N iterations
- *     and ended in HITL is almost certainly a multi-rejection escape
+ *   - retry triggered at any phase — `reviewAttemptCount >= 2` covers
+ *     the recovered-from-REJECTED-RETRY case (a run that ended
+ *     "opened" but ran review more than once); the
+ *     `Sub-agent review rejected` outcomeDetail prefix covers the
+ *     escalated-to-HITL case
+ *   - reviewer-rejected count ≥ N (default 2) — observed directly
+ *     from `reviewAttemptCount` (each rejection produces a fresh
+ *     review span)
  *   - iteration count ≥ M (default 3) when the agent report is
  *     present; when the agent report is absent / errored we treat
  *     that as a trip too — something failed before we could measure
@@ -45,13 +45,28 @@ export function shouldRunIRA(
   context: RunReviewContext,
   thresholds: MetaFilterThresholds = DEFAULT_META_FILTER_THRESHOLDS,
 ): FilterDecision {
-  const { issueProcess: ip, codingAgentReport: agent } = context;
+  const { issueProcess: ip, codingAgentReport: agent, reviewAttemptCount } =
+    context;
 
   if (ip.outcomeKind === "errored") {
     return { run: true, reason: "infra-error outcome" };
   }
   if (ip.outcomeKind === "reverted") {
     return { run: true, reason: "revert outcome" };
+  }
+
+  // VA-404 follow-up (cursor review on PR #105): "retry triggered at
+  // any phase" must catch recovered-from-REJECTED-RETRY runs, not
+  // only the ones that escalated to HITL. Each review attempt opens
+  // a fresh `review` span; >= 2 means at least one mid-run retry
+  // happened. Honour the configurable threshold so operators can
+  // dial sensitivity (`minReviewerRejections: 1` would surface even
+  // a single review attempt — useful as a debug knob).
+  if (reviewAttemptCount >= thresholds.minReviewerRejections) {
+    return {
+      run: true,
+      reason: `retry triggered (${reviewAttemptCount} review attempts >= ${thresholds.minReviewerRejections})`,
+    };
   }
 
   const isReviewRejection =
@@ -63,15 +78,6 @@ export function shouldRunIRA(
       return {
         run: true,
         reason: "retry triggered (sub-agent review rejected)",
-      };
-    }
-    if (
-      agent.ok &&
-      agent.iterationIndex >= thresholds.minReviewerRejections
-    ) {
-      return {
-        run: true,
-        reason: `HITL escape after ${agent.iterationIndex} iterations (>= ${thresholds.minReviewerRejections} reviewer-rejection proxy)`,
       };
     }
     return { run: true, reason: "HITL escape" };
@@ -93,6 +99,6 @@ export function shouldRunIRA(
 
   return {
     run: false,
-    reason: `clean run (outcome=${ip.outcomeKind ?? "unknown"}, iterations=${agent.iterationIndex})`,
+    reason: `clean run (outcome=${ip.outcomeKind ?? "unknown"}, iterations=${agent.iterationIndex}, review_attempts=${reviewAttemptCount})`,
   };
 }

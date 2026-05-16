@@ -83,6 +83,10 @@ const buildFixtures = () => {
         payload: JSON.stringify({ verdict: "APPROVE" }),
       }),
     ),
+    // VA-404 follow-up: review-attempt count gateway. Default 1 in
+    // the fixture (single review = clean). Tests that exercise the
+    // retry-then-success skip-gate override per-test.
+    countReviewAttempts: vi.fn(() => Effect.succeed(1)),
   } as unknown as import("../dashboard-read.js").MetaDashboardRead;
 
   const metaLinear = {
