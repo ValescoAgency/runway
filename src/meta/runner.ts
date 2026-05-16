@@ -3,6 +3,10 @@ import { createStorage } from "../dashboard/storage.js";
 import { loadRunwayConfigFile } from "../runway-config-file.js";
 import { createMetaDashboardRead } from "./dashboard-read.js";
 import {
+  createGitHubHindsightGateway,
+  createLinearHindsightGateway,
+} from "./hindsight.js";
+import {
   DEFAULT_META_FILTER_THRESHOLDS,
   type MetaFilterThresholds,
 } from "./heuristic-filter.js";
@@ -41,15 +45,25 @@ export interface RunnerEnv {
   readonly dashboardDbPath: string;
   /** Anthropic API key — `ANTHROPIC_API_KEY` env in the runway process. */
   readonly anthropicApiKey: string;
+  /**
+   * VA-403: optional GitHub token for hindsight PR fetching. When
+   * absent, the GitHub gateway runs unauthenticated (60 reqs/hr,
+   * public-repo-only) — sufficient for solo / OSS workflows. Source:
+   * `GITHUB_TOKEN` env in the runway process.
+   */
+  readonly githubToken?: string;
 }
 
 export interface RunReviewArgs {
   readonly traceId: string;
   readonly issueIdentifier: string;
+  /** VA-403: bypass the delay gate. Set by the CLI's `--force` flag. */
+  readonly force?: boolean;
 }
 
 const DEFAULT_META_REVIEW_MODEL = "claude-sonnet-4-6";
 const DEFAULT_META_PROJECT_NAME = "runway-meta";
+const DEFAULT_META_REVIEW_DELAY_HOURS = 18;
 
 /**
  * VA-402: resolve the meta-review model + project name through
@@ -63,10 +77,18 @@ export function resolveMetaConfig(env: {
 }): {
   readonly metaReviewModel: string;
   readonly metaProjectName: string;
+  /**
+   * VA-403: minimum drain age before the IRA grades the run. Default
+   * 18h gives hindsight (PR merge state, human comments, follow-up
+   * issues) time to land. PRD constrains operator overrides to the
+   * 12–24h band; for one-off bypass use `--force` on the CLI.
+   */
+  readonly metaReviewDelayHours: number;
   readonly metaFilterThresholds: MetaFilterThresholds;
   readonly source: {
     readonly model: string;
     readonly project: string;
+    readonly delayHours: string;
     readonly thresholds: string;
   };
 } {
@@ -81,6 +103,12 @@ export function resolveMetaConfig(env: {
     : file.metaProjectName
       ? { value: file.metaProjectName, source: ".runway/config.yml" }
       : { value: DEFAULT_META_PROJECT_NAME, source: "default" };
+  const delay =
+    env.config.metaReviewDelayHours !== undefined
+      ? { value: env.config.metaReviewDelayHours, source: "env" }
+      : file.metaReviewDelayHours !== undefined
+        ? { value: file.metaReviewDelayHours, source: ".runway/config.yml" }
+        : { value: DEFAULT_META_REVIEW_DELAY_HOURS, source: "default" };
   // VA-404: env JSON override → file block → hardcoded defaults.
   // The env knob is one-off only — operators tuning thresholds for
   // real edit `.runway/config.yml`. Each missing field falls through
@@ -90,10 +118,12 @@ export function resolveMetaConfig(env: {
   return {
     metaReviewModel: model.value,
     metaProjectName: project.value,
+    metaReviewDelayHours: delay.value,
     metaFilterThresholds: thresholds.value,
     source: {
       model: model.source,
       project: project.source,
+      delayHours: delay.source,
       thresholds: thresholds.source,
     },
   };
@@ -141,6 +171,18 @@ export const dispatchRunReview = (
         linearTeam: env.config.linearTeam,
         metaProjectName: resolved.metaProjectName,
       });
+      // VA-403: hindsight gateways. GitHub may run unauthenticated
+      // (sufficient for public repos, 60 reqs/hr); Linear uses the
+      // same workspace API key the rest of runway uses. Both are
+      // wired unconditionally — the pass falls back to v1.0.0
+      // semantics (null hindsight) if any individual fetch fails.
+      const githubHindsight = createGitHubHindsightGateway({
+        token: env.githubToken,
+      });
+      const linearHindsight = createLinearHindsightGateway({
+        linearApiKey: env.config.linearApiKey as Redacted.Redacted<string>,
+        linearTeam: env.config.linearTeam,
+      });
       return yield* runRunReviewPass(
         { traceId: args.traceId, issueIdentifier: args.issueIdentifier },
         {
@@ -149,6 +191,12 @@ export const dispatchRunReview = (
           dashboardRead,
           metaLinear,
           storage,
+          hindsight: {
+            github: githubHindsight,
+            linear: linearHindsight,
+          },
+          delayHours: resolved.metaReviewDelayHours,
+          force: args.force ?? false,
           metaFilterThresholds: resolved.metaFilterThresholds,
         },
       );

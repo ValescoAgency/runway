@@ -8,3 +8,6 @@ dist/
 
 .env.schema.bak
 .envrc
+
+# Sub-agent worktrees spawned by Claude Code (isolation: "worktree")
+.claude/

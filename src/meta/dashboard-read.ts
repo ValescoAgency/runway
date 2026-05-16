@@ -116,6 +116,16 @@ export interface MetaDashboardRead {
     issueIdentifier: string,
   ): Effect.Effect<CapturedIssueProcess, MetaReadError>;
   /**
+   * VA-403: latest `end_time_unix_nano` across every `issue_processes`
+   * row in the trace. Proxy for "drain finished processing" — the
+   * delay gate compares this against `now - delay_hours` to decide
+   * whether the drain is mature enough for the IRA. Returns null
+   * when no rows exist for the trace (drain too fresh / unknown id).
+   */
+  loadDrainEndTime(
+    traceId: string,
+  ): Effect.Effect<string | null, MetaReadError>;
+  /**
    * Pull the Coding Agent Report off the latest impl-iter span for
    * an issue process. Never fails the Effect — the "no report" /
    * "report error" cases land as tagged `ok: false` variants so the
@@ -178,6 +188,16 @@ export function createMetaDashboardRead(path: string): MetaDashboardRead {
     WHERE ai.trace_id = ? AND ai.issue_process_id = ?
     ORDER BY ai.iteration_index DESC
     LIMIT 1
+  `);
+
+  // VA-403: the drain's "done" time as max(end_time) across the
+  // trace's issue_processes. CAST to INTEGER so the int64-as-string
+  // column orders numerically — same trick `getActiveDrainStmt`
+  // uses on start_time.
+  const selectDrainEndTime = db.prepare(`
+    SELECT MAX(CAST(end_time_unix_nano AS INTEGER)) AS max_end
+    FROM issue_processes
+    WHERE trace_id = ?
   `);
 
   // Reviewer report lives on the `review` span, child of the issue
@@ -262,6 +282,20 @@ export function createMetaDashboardRead(path: string): MetaDashboardRead {
           startTimeUnixNano: String(row.start_time_unix_nano ?? ""),
           endTimeUnixNano: String(row.end_time_unix_nano ?? ""),
         };
+      });
+    },
+
+    loadDrainEndTime(traceId) {
+      return wrap("loadDrainEndTime", () => {
+        const row = selectDrainEndTime.get(traceId) as
+          | Record<string, unknown>
+          | undefined;
+        const max = row?.max_end;
+        if (max === null || max === undefined) return null;
+        // SQLite returns the MAX as a BigInt for INTEGER columns
+        // wider than 32-bit; coerce to string so the caller compares
+        // against `Date.now() * 1_000_000` without precision drift.
+        return String(max);
       });
     },
 

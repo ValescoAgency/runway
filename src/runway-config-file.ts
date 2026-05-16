@@ -33,6 +33,15 @@ const RunwayConfigFileSchema = z.object({
    */
   metaProjectName: z.string().optional(),
   /**
+   * VA-403: minimum drain age before the IRA grades it. PRD
+   * constrains the value to the 12–24h band (default 18) — too
+   * short and hindsight hasn't landed; too long and the operator
+   * loses freshness. Overridden by `RUNWAY_REVIEW_DELAY_HOURS` if
+   * set in env. The `--force` CLI flag is the supported one-off
+   * bypass; persistent disable isn't a supported mode.
+   */
+  metaReviewDelayHours: z.number().min(12).max(24).optional(),
+  /**
    * VA-404: thresholds for the IRA heuristic pre-filter. Either or
    * both fields may be set; missing fields fall through to the
    * hardcoded defaults (3 iterations, 2 reviewer rejections).

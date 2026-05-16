@@ -194,7 +194,7 @@ export function parseReviewerReport(
 // Run Review (v1.0.0) — IRA's per-issue retrospective verdict
 // ---------------------------------------------------------------------------
 
-export const RUN_REVIEW_VERSION = "1.0.0";
+export const RUN_REVIEW_VERSION = "1.1.0";
 export const RUN_REVIEW_FENCE_TAG = "runway-run-review";
 
 /**
@@ -255,13 +255,61 @@ export type RecommendationTarget = z.infer<typeof RecommendationTargetSchema>;
 export type Recommendation = z.infer<typeof RecommendationSchema>;
 
 /**
- * VA-403 adds the hindsight signals contents (PR merge state, human
- * comments on PR review threads, follow-up issues). At this slice
- * the field is reserved with a `null`-able shape so v1.0.0 payloads
- * persist a stable empty marker and the v1.1.0 schema can widen it
- * without a major bump.
+ * VA-403: hindsight signals captured ~18h after the drain so the IRA
+ * grades against what the world said about the run, not just what the
+ * agent and reviewer claimed in-band. Three orthogonal sources:
+ *
+ *   - PR state: did the PR runway opened actually merge? Closed
+ *     without merge means a human pulled the plug.
+ *   - human verdict: did a person comment on the PR review threads
+ *     (excluding the runway bot's own automated chatter)?
+ *   - follow-up issues: did anyone file new Linear issues in the 48h
+ *     window referencing the source identifier? A flurry of follow-ups
+ *     often signals a "looks fine, actually broke X" situation.
+ *
+ * Each sub-section is independently nullable — the gateway may have
+ * partial data (no PR URL on the issue, GitHub token missing, etc.)
+ * and the IRA grades on what's available rather than refusing to grade.
+ *
+ * Forward-compat on the minor bump: v1.0.0 wrote `hindsight_signals: null`
+ * to the JSON; the v1.1.0 schema accepts `null` (the entire field absent
+ * of structure) OR the populated object below. Old reviews still parse.
  */
-const HindsightSignalsSchema = z.null();
+const HindsightPrSchema = z.object({
+  url: z.string().min(1),
+  state: z.enum(["open", "merged", "closed"]),
+  merged_at: z.string().nullable(),
+});
+
+const HindsightHumanVerdictSchema = z.object({
+  // Coarse sentiment over the human review-thread comments. The IRA
+  // summarises rather than echoing every comment so the Run Review
+  // body stays bounded; the raw comments live in the user prompt.
+  sentiment: z.enum(["approving", "neutral", "rejecting"]),
+  comment_count: z.number().nonnegative(),
+  summary: z.string(),
+});
+
+const HindsightFollowUpIssueSchema = z.object({
+  identifier: z.string().min(1),
+  title: z.string(),
+});
+
+const HindsightSignalsObjectSchema = z.object({
+  pr: HindsightPrSchema.nullable(),
+  human_verdict: HindsightHumanVerdictSchema.nullable(),
+  follow_up_issues: z.array(HindsightFollowUpIssueSchema),
+});
+
+const HindsightSignalsSchema = z.union([
+  z.null(),
+  HindsightSignalsObjectSchema,
+]);
+
+export type HindsightPr = z.infer<typeof HindsightPrSchema>;
+export type HindsightHumanVerdict = z.infer<typeof HindsightHumanVerdictSchema>;
+export type HindsightFollowUpIssue = z.infer<typeof HindsightFollowUpIssueSchema>;
+export type HindsightSignals = z.infer<typeof HindsightSignalsObjectSchema>;
 
 const RunReviewSchema = z.object({
   template_version: z.string(),

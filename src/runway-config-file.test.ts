@@ -73,4 +73,33 @@ describe("loadRunwayConfigFile (VA-402)", () => {
     writeConfig("metaReviewModel: 12345");
     expect(() => loadRunwayConfigFile(cwd)).toThrow();
   });
+
+  // VA-403: metaReviewDelayHours — numeric, constrained to the
+  // PRD's 12–24h band. The `--force` CLI flag is the supported
+  // one-off bypass; persistent disable (e.g. `0`) isn't a mode.
+
+  it("parses metaReviewDelayHours inside the 12-24h band", () => {
+    writeConfig("metaReviewDelayHours: 24");
+    expect(loadRunwayConfigFile(cwd).metaReviewDelayHours).toBe(24);
+  });
+
+  it("rejects metaReviewDelayHours below the band (loud failure)", () => {
+    writeConfig("metaReviewDelayHours: 1");
+    expect(() => loadRunwayConfigFile(cwd)).toThrow();
+  });
+
+  it("rejects metaReviewDelayHours of 0 (use --force CLI flag instead)", () => {
+    writeConfig("metaReviewDelayHours: 0");
+    expect(() => loadRunwayConfigFile(cwd)).toThrow();
+  });
+
+  it("rejects metaReviewDelayHours above the band (loud failure)", () => {
+    writeConfig("metaReviewDelayHours: 999");
+    expect(() => loadRunwayConfigFile(cwd)).toThrow();
+  });
+
+  it("rejects a negative metaReviewDelayHours", () => {
+    writeConfig("metaReviewDelayHours: -1");
+    expect(() => loadRunwayConfigFile(cwd)).toThrow();
+  });
 });

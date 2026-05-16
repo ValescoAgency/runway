@@ -6,6 +6,12 @@ import type {
   MetaDashboardRead,
   MetaReadError,
 } from "./dashboard-read.js";
+import {
+  fetchHindsightSignals,
+  type GitHubHindsightGateway,
+  type LinearHindsightGateway,
+} from "./hindsight.js";
+import type { HindsightSignals } from "./templates.js";
 
 /**
  * VA-402: per-pass context loader. The PRD's module decomposition
@@ -31,10 +37,10 @@ import type {
 // ---------------------------------------------------------------------------
 
 /**
- * Run Review pass context (v1.0.0 — no hindsight, no norms). The
- * three `Captured*` shapes carry their own success / failure
- * variants — see `dashboard-read.ts`. The pass never crashes on a
- * report parse failure; it grades on what it has.
+ * Run Review pass context (v1.1.0 — adds hindsight; norms still
+ * reserved). The three `Captured*` shapes carry their own success /
+ * failure variants — see `dashboard-read.ts`. The pass never
+ * crashes on a report parse failure; it grades on what it has.
  */
 export interface RunReviewContext {
   readonly issueProcess: CapturedIssueProcess;
@@ -45,13 +51,33 @@ export interface RunReviewContext {
   // even if the run ultimately succeeded. The heuristic filter trips
   // on this so a "looked clean" recovery isn't a clean skip.
   readonly reviewAttemptCount: number;
-  // VA-403 wires hindsight (PR merge status, human review comments,
-  // follow-up issues). Reserved here as `null` so v1.0.0 callers
-  // forward-compat to v1.1.0 by reading the field.
-  readonly hindsightSignals: null;
+  // VA-403: hindsight composed of PR state, human-comment summary,
+  // and Linear follow-up issues filed in the past 48h. Null when no
+  // hindsight gateways were wired in (back-compat for v1.0.0
+  // callers that haven't been updated to construct them).
+  readonly hindsightSignals: HindsightSignals | null;
   // VA-405 wires rolling norms from the VA-399 read-model. Same
   // null-reserved pattern.
   readonly norms: null;
+}
+
+/**
+ * VA-403: optional hindsight wiring for the Run Review context
+ * loader. When present, `loadContextFor` fetches PR state +
+ * follow-up issues concurrently and projects them into
+ * `hindsightSignals`. When absent, `hindsightSignals` stays null
+ * (the pre-VA-403 contract — still parses against the v1.1.0
+ * RunReview schema since the schema accepts both).
+ *
+ * `followUpWindowHours` defaults to 48 per the VA-403 PRD
+ * ("Linear issues filed in the past 48 hours referencing the source
+ * issue identifier"). Operators can tighten / widen via
+ * `metaHindsightWindowHours` in `.runway/config.yml` (VA-403).
+ */
+export interface HindsightWiring {
+  readonly github: GitHubHindsightGateway;
+  readonly linear: LinearHindsightGateway;
+  readonly followUpWindowHours?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -63,6 +89,10 @@ export type LoadContextArgs =
       readonly pass: "run-review";
       readonly traceId: string;
       readonly issueIdentifier: string;
+      // VA-403: optional hindsight gateways. When present the loader
+      // fetches PR state + follow-ups; when absent `hindsightSignals`
+      // stays null (back-compat with v1.0.0 callers).
+      readonly hindsight?: HindsightWiring;
     };
 
 export type LoadContextResult =
@@ -86,8 +116,14 @@ export const loadContextFor = (
   }
 };
 
+const DEFAULT_FOLLOW_UP_WINDOW_HOURS = 48;
+
 const loadRunReviewContext = (
-  args: { readonly traceId: string; readonly issueIdentifier: string },
+  args: {
+    readonly traceId: string;
+    readonly issueIdentifier: string;
+    readonly hindsight?: HindsightWiring;
+  },
   gateway: MetaDashboardRead,
 ): Effect.Effect<RunReviewContext, MetaReadError> =>
   Effect.gen(function* () {
@@ -129,12 +165,36 @@ const loadRunReviewContext = (
     const reviewAttemptCount = yield* gateway
       .countReviewAttempts(args.traceId, issueProcess.spanId)
       .pipe(Effect.orElseSucceed(() => 0));
+    // VA-403: hindsight is independently optional from the dashboard
+    // gateway — the loader runs both fetches concurrently and tolerates
+    // a per-source failure inside `fetchHindsightSignals` (it projects
+    // tagged errors to nulls / empties). The whole block is null when
+    // no hindsight gateways were wired (v1.0.0 back-compat).
+    const hindsightSignals = args.hindsight
+      ? yield* fetchHindsightSignals(
+          {
+            prUrl: issueProcess.prUrl,
+            sourceIdentifier: issueProcess.issueIdentifier,
+            followUpSinceIso: hoursAgoIso(
+              args.hindsight.followUpWindowHours ??
+                DEFAULT_FOLLOW_UP_WINDOW_HOURS,
+            ),
+          },
+          {
+            github: args.hindsight.github,
+            linear: args.hindsight.linear,
+          },
+        )
+      : null;
     return {
       issueProcess,
       codingAgentReport,
       reviewerReport,
       reviewAttemptCount,
-      hindsightSignals: null,
+      hindsightSignals,
       norms: null,
     };
   });
+
+const hoursAgoIso = (hours: number): string =>
+  new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
