@@ -1,4 +1,4 @@
-import { z } from "zod";
+import { Either, ParseResult, Schema } from "effect";
 
 /**
  * VA-401 / VA-400: schemas + version-handshake parsers for every
@@ -27,6 +27,11 @@ import { z } from "zod";
  * malformed report). The PRD's "fails loudly" contract is satisfied
  * by surfacing the typed error to the dashboard, not by aborting the
  * orchestration.
+ *
+ * VA-397: validation library is Effect `Schema` to match the rest of
+ * the codebase (`src/linear.ts`). Extra properties on a struct are
+ * silently stripped by default — matches the prior zod `strip` mode
+ * the forward-compat tests rely on.
  */
 
 // ---------------------------------------------------------------------------
@@ -58,13 +63,13 @@ const err = <T>(error: ReportParseError): ReportParseResult<T> => ({
 // Per-AC self-check shape — shared by CodingAgent + Reviewer reports
 // ---------------------------------------------------------------------------
 
-const PerAcSelfCheckSchema = z.object({
-  ac: z.string().min(1),
-  verdict: z.enum(["PASS", "FAIL", "NOT_ATTEMPTED"]),
-  justification: z.string(),
+const PerAcSelfCheckSchema = Schema.Struct({
+  ac: Schema.NonEmptyString,
+  verdict: Schema.Literal("PASS", "FAIL", "NOT_ATTEMPTED"),
+  justification: Schema.String,
 });
 
-export type PerAcSelfCheck = z.infer<typeof PerAcSelfCheckSchema>;
+export type PerAcSelfCheck = typeof PerAcSelfCheckSchema.Type;
 
 // ---------------------------------------------------------------------------
 // Coding Agent Report (v1.0.0)
@@ -82,22 +87,22 @@ export const CODING_AGENT_REPORT_FENCE_TAG = "runway-agent-report";
  * spans / Linear / `meta_reviews`. The IRA reads telemetry alongside
  * the agent-emitted fields when grading the run.
  */
-const CodingAgentTelemetrySchema = z.object({
-  model: z.string(),
-  tool_call_count: z.number().nonnegative(),
-  wall_time_ms: z.number().nonnegative(),
+const CodingAgentTelemetrySchema = Schema.Struct({
+  model: Schema.String,
+  tool_call_count: Schema.Number.pipe(Schema.greaterThanOrEqualTo(0)),
+  wall_time_ms: Schema.Number.pipe(Schema.greaterThanOrEqualTo(0)),
 });
 
-export type CodingAgentTelemetry = z.infer<typeof CodingAgentTelemetrySchema>;
+export type CodingAgentTelemetry = typeof CodingAgentTelemetrySchema.Type;
 
-const CodingAgentReportSchema = z.object({
-  template_version: z.string(),
-  issue_identifier: z.string().min(1),
-  approach: z.string(),
-  files_modified: z.array(z.string()),
-  tests_added_or_modified: z.array(z.string()),
-  per_ac_self_check: z.array(PerAcSelfCheckSchema),
-  risks_unknowns: z.array(z.string()),
+const CodingAgentReportSchema = Schema.Struct({
+  template_version: Schema.String,
+  issue_identifier: Schema.NonEmptyString,
+  approach: Schema.String,
+  files_modified: Schema.Array(Schema.String),
+  tests_added_or_modified: Schema.Array(Schema.String),
+  per_ac_self_check: Schema.Array(PerAcSelfCheckSchema),
+  risks_unknowns: Schema.Array(Schema.String),
   // PRD verdict alphabet — note that this is the *report* verdict
   // (the agent's view of their work product), distinct from the
   // `IMPL:` marker that drives orchestrator control flow. Mapping:
@@ -107,12 +112,12 @@ const CodingAgentReportSchema = z.object({
   // The agent emits both — the prompt spells out the mapping so they
   // stay in sync. A divergence between marker and verdict is itself
   // a signal the IRA can grade on.
-  verdict: z.enum(["DONE", "BLOCKED", "PARTIAL"]),
-  verdict_reason: z.string(),
-  telemetry: CodingAgentTelemetrySchema.optional(),
+  verdict: Schema.Literal("DONE", "BLOCKED", "PARTIAL"),
+  verdict_reason: Schema.String,
+  telemetry: Schema.optional(CodingAgentTelemetrySchema),
 });
 
-export type CodingAgentReport = z.infer<typeof CodingAgentReportSchema>;
+export type CodingAgentReport = typeof CodingAgentReportSchema.Type;
 
 export function parseCodingAgentReport(
   text: string,
@@ -145,21 +150,21 @@ export function augmentCodingAgentReport(
 export const REVIEWER_REPORT_VERSION = "1.0.0";
 export const REVIEWER_REPORT_FENCE_TAG = "runway-reviewer-report";
 
-const PerAcValidationSchema = z.object({
-  ac: z.string().min(1),
-  agent_claim: z.enum(["PASS", "FAIL", "NOT_ATTEMPTED"]),
-  my_verdict: z.enum(["PASS", "FAIL", "NOT_ATTEMPTED"]),
-  justification: z.string(),
+const PerAcValidationSchema = Schema.Struct({
+  ac: Schema.NonEmptyString,
+  agent_claim: Schema.Literal("PASS", "FAIL", "NOT_ATTEMPTED"),
+  my_verdict: Schema.Literal("PASS", "FAIL", "NOT_ATTEMPTED"),
+  justification: Schema.String,
 });
 
-export type PerAcValidation = z.infer<typeof PerAcValidationSchema>;
+export type PerAcValidation = typeof PerAcValidationSchema.Type;
 
-const ReviewerReportSchema = z.object({
-  template_version: z.string(),
-  issue_identifier: z.string().min(1),
-  per_ac_validation: z.array(PerAcValidationSchema),
-  code_quality_concerns: z.array(z.string()),
-  test_adequacy_concerns: z.array(z.string()),
+const ReviewerReportSchema = Schema.Struct({
+  template_version: Schema.String,
+  issue_identifier: Schema.NonEmptyString,
+  per_ac_validation: Schema.Array(PerAcValidationSchema),
+  code_quality_concerns: Schema.Array(Schema.String),
+  test_adequacy_concerns: Schema.Array(Schema.String),
   // PRD verdict alphabet — the *report* verdict (the reviewer's
   // judgment of the diff), distinct from the `REVIEW:` marker that
   // drives orchestrator control flow. Mapping:
@@ -170,15 +175,15 @@ const ReviewerReportSchema = z.object({
   // the orchestrator routes on the marker. A marker / verdict
   // mismatch is a parseable signal of reviewer disagreement with
   // their own contract.
-  verdict: z.enum(["APPROVE", "REJECT", "HITL"]),
-  verdict_reason: z.string(),
+  verdict: Schema.Literal("APPROVE", "REJECT", "HITL"),
+  verdict_reason: Schema.String,
   // Guidance is optional — only required (by convention) on rejection,
   // but a reviewer that wants to leave forward-looking notes on an
   // approved diff is allowed to.
-  guidance_to_coding_agent: z.string().optional(),
+  guidance_to_coding_agent: Schema.optional(Schema.String),
 });
 
-export type ReviewerReport = z.infer<typeof ReviewerReportSchema>;
+export type ReviewerReport = typeof ReviewerReportSchema.Type;
 
 export function parseReviewerReport(
   text: string,
@@ -204,14 +209,14 @@ export const RUN_REVIEW_FENCE_TAG = "runway-run-review";
  * (BETTER / STEADY / WORSE vs. recent norms), which lives in the
  * top-level `<dim>_quality_relative` fields on `RunReviewSchema`.
  */
-const QualityAbsoluteSchema = z.enum([
+const QualityAbsoluteSchema = Schema.Literal(
   "STRONG",
   "ADEQUATE",
   "WEAK",
   "FAILED",
-]);
+);
 
-const QualityRelativeSchema = z.enum(["BETTER", "STEADY", "WORSE"]);
+const QualityRelativeSchema = Schema.Literal("BETTER", "STEADY", "WORSE");
 
 /**
  * Each quality dimension carries an absolute grade plus a one-sentence
@@ -221,17 +226,17 @@ const QualityRelativeSchema = z.enum(["BETTER", "STEADY", "WORSE"]);
  * group on for the Weekly Review promoter.
  *
  * v1.0.0 / v1.1.0 payloads may include a legacy `relative: null` key
- * inside this object; zod's default `strip` mode silently drops it so
- * forward-compat still works.
+ * inside this object; Effect Schema's default decode mode silently
+ * strips unknown properties so forward-compat still works.
  */
-const QualitySectionSchema = z.object({
+const QualitySectionSchema = Schema.Struct({
   absolute: QualityAbsoluteSchema,
-  justification: z.string(),
+  justification: Schema.String,
 });
 
-export type QualityAbsolute = z.infer<typeof QualityAbsoluteSchema>;
-export type QualityRelative = z.infer<typeof QualityRelativeSchema>;
-export type QualitySection = z.infer<typeof QualitySectionSchema>;
+export type QualityAbsolute = typeof QualityAbsoluteSchema.Type;
+export type QualityRelative = typeof QualityRelativeSchema.Type;
+export type QualitySection = typeof QualitySectionSchema.Type;
 
 /**
  * VA-402: PRD-spec target taxonomy for IRA recommendations. The
@@ -239,24 +244,24 @@ export type QualitySection = z.infer<typeof QualitySectionSchema>;
  * field as the structural pattern key — bumping the alphabet here
  * needs a coordinated change in the promoter.
  */
-const RecommendationTargetSchema = z.enum([
+const RecommendationTargetSchema = Schema.Literal(
   "prompt",
   "workflow",
   "sandcastle",
   "issue-body",
   "tooling",
-]);
+);
 
-const RecommendationConfidenceSchema = z.enum(["LOW", "MEDIUM", "HIGH"]);
+const RecommendationConfidenceSchema = Schema.Literal("LOW", "MEDIUM", "HIGH");
 
-const RecommendationSchema = z.object({
+const RecommendationSchema = Schema.Struct({
   target: RecommendationTargetSchema,
-  change: z.string().min(1),
+  change: Schema.NonEmptyString,
   confidence: RecommendationConfidenceSchema,
 });
 
-export type RecommendationTarget = z.infer<typeof RecommendationTargetSchema>;
-export type Recommendation = z.infer<typeof RecommendationSchema>;
+export type RecommendationTarget = typeof RecommendationTargetSchema.Type;
+export type Recommendation = typeof RecommendationSchema.Type;
 
 /**
  * VA-403: hindsight signals captured ~18h after the drain so the IRA
@@ -279,47 +284,44 @@ export type Recommendation = z.infer<typeof RecommendationSchema>;
  * to the JSON; the v1.1.0 schema accepts `null` (the entire field absent
  * of structure) OR the populated object below. Old reviews still parse.
  */
-const HindsightPrSchema = z.object({
-  url: z.string().min(1),
-  state: z.enum(["open", "merged", "closed"]),
-  merged_at: z.string().nullable(),
+const HindsightPrSchema = Schema.Struct({
+  url: Schema.NonEmptyString,
+  state: Schema.Literal("open", "merged", "closed"),
+  merged_at: Schema.NullOr(Schema.String),
 });
 
-const HindsightHumanVerdictSchema = z.object({
+const HindsightHumanVerdictSchema = Schema.Struct({
   // Coarse sentiment over the human review-thread comments. The IRA
   // summarises rather than echoing every comment so the Run Review
   // body stays bounded; the raw comments live in the user prompt.
-  sentiment: z.enum(["approving", "neutral", "rejecting"]),
-  comment_count: z.number().nonnegative(),
-  summary: z.string(),
+  sentiment: Schema.Literal("approving", "neutral", "rejecting"),
+  comment_count: Schema.Number.pipe(Schema.greaterThanOrEqualTo(0)),
+  summary: Schema.String,
 });
 
-const HindsightFollowUpIssueSchema = z.object({
-  identifier: z.string().min(1),
-  title: z.string(),
+const HindsightFollowUpIssueSchema = Schema.Struct({
+  identifier: Schema.NonEmptyString,
+  title: Schema.String,
 });
 
-const HindsightSignalsObjectSchema = z.object({
-  pr: HindsightPrSchema.nullable(),
-  human_verdict: HindsightHumanVerdictSchema.nullable(),
-  follow_up_issues: z.array(HindsightFollowUpIssueSchema),
+const HindsightSignalsObjectSchema = Schema.Struct({
+  pr: Schema.NullOr(HindsightPrSchema),
+  human_verdict: Schema.NullOr(HindsightHumanVerdictSchema),
+  follow_up_issues: Schema.Array(HindsightFollowUpIssueSchema),
 });
 
-const HindsightSignalsSchema = z.union([
-  z.null(),
-  HindsightSignalsObjectSchema,
-]);
+const HindsightSignalsSchema = Schema.NullOr(HindsightSignalsObjectSchema);
 
-export type HindsightPr = z.infer<typeof HindsightPrSchema>;
-export type HindsightHumanVerdict = z.infer<typeof HindsightHumanVerdictSchema>;
-export type HindsightFollowUpIssue = z.infer<typeof HindsightFollowUpIssueSchema>;
-export type HindsightSignals = z.infer<typeof HindsightSignalsObjectSchema>;
+export type HindsightPr = typeof HindsightPrSchema.Type;
+export type HindsightHumanVerdict = typeof HindsightHumanVerdictSchema.Type;
+export type HindsightFollowUpIssue = typeof HindsightFollowUpIssueSchema.Type;
+export type HindsightSignals = typeof HindsightSignalsObjectSchema.Type;
 
-const RunReviewSchema = z.object({
-  template_version: z.string(),
-  issue_identifier: z.string().min(1),
-  drain_trace_id: z.string().min(1),
-  final_outcome: z.string().min(1),
+const RunReviewSchema = Schema.Struct({
+  template_version: Schema.String,
+  issue_identifier: Schema.NonEmptyString,
+  drain_trace_id: Schema.NonEmptyString,
+  final_outcome: Schema.NonEmptyString,
   // Five quality dimensions per PRD. The absolute grade lives in
   // each section (STRONG/ADEQUATE/WEAK/FAILED); the relative grade
   // lives in the top-level fields below.
@@ -331,19 +333,20 @@ const RunReviewSchema = z.object({
   // VA-405 v1.2.0: top-level relative-axis fields per the AC. Each
   // is a `BETTER | STEADY | WORSE` enum, optional so v1.0.0 / v1.1.0
   // payloads (which don't emit them — and may carry a legacy nested
-  // `relative` slot that zod strips silently) still parse. The IRA
-  // populates these when norms were available and omits them when
-  // not (category has < 5 runs in the window, or norms gateway error).
-  issue_quality_relative: QualityRelativeSchema.optional(),
-  prompt_quality_relative: QualityRelativeSchema.optional(),
-  agent_quality_relative: QualityRelativeSchema.optional(),
-  reviewer_quality_relative: QualityRelativeSchema.optional(),
-  orchestration_quality_relative: QualityRelativeSchema.optional(),
-  recommendations: z.array(RecommendationSchema),
+  // `relative` slot Effect Schema strips silently) still parse. The
+  // IRA populates these when norms were available and omits them
+  // when not (category has < 5 runs in the window, or norms gateway
+  // error).
+  issue_quality_relative: Schema.optional(QualityRelativeSchema),
+  prompt_quality_relative: Schema.optional(QualityRelativeSchema),
+  agent_quality_relative: Schema.optional(QualityRelativeSchema),
+  reviewer_quality_relative: Schema.optional(QualityRelativeSchema),
+  orchestration_quality_relative: Schema.optional(QualityRelativeSchema),
+  recommendations: Schema.Array(RecommendationSchema),
   hindsight_signals: HindsightSignalsSchema,
 });
 
-export type RunReview = z.infer<typeof RunReviewSchema>;
+export type RunReview = typeof RunReviewSchema.Type;
 
 export function parseRunReview(text: string): ReportParseResult<RunReview> {
   return parseReport(text, {
@@ -364,10 +367,13 @@ export const DRAIN_REVIEW_FENCE_TAG = "runway-drain-review";
  * VA-406: outcome rollup for the drain. Counts mirror the run-review
  * outcome alphabet plus the IRA-specific `meta-failed` / `meta-skipped`
  * kinds so the operator can read drain composition from a single
- * section. Open shape (`z.record`) so a future outcome variant (e.g.
- * "skipped-claim-race" from VA-423) lands without a schema bump.
+ * section. Open shape (`Schema.Record`) so a future outcome variant
+ * (e.g. "skipped-claim-race" from VA-423) lands without a schema bump.
  */
-const DrainOutcomeSummarySchema = z.record(z.string(), z.number());
+const DrainOutcomeSummarySchema = Schema.Record({
+  key: Schema.String,
+  value: Schema.Number,
+});
 
 /**
  * VA-406: one notable per-issue event for the drain review body. The
@@ -377,10 +383,10 @@ const DrainOutcomeSummarySchema = z.record(z.string(), z.number());
  * the operator can drill from the drain summary into the per-issue
  * review without searching.
  */
-const NotableEventSchema = z.object({
-  issue_identifier: z.string().min(1),
-  event: z.string().min(1),
-  run_review_url: z.string().nullable(),
+const NotableEventSchema = Schema.Struct({
+  issue_identifier: Schema.NonEmptyString,
+  event: Schema.NonEmptyString,
+  run_review_url: Schema.NullOr(Schema.String),
 });
 
 /**
@@ -391,30 +397,30 @@ const NotableEventSchema = z.object({
  * prompt: "only mark critical if this finding makes the next drain
  * unsafe or loses captured data."
  */
-const SeveritySchema = z.enum(["critical", "routine"]);
+const SeveritySchema = Schema.Literal("critical", "routine");
 
-const DrainReviewSchema = z.object({
-  template_version: z.string(),
-  drain_trace_id: z.string().min(1),
-  issue_count: z.number().nonnegative(),
+const DrainReviewSchema = Schema.Struct({
+  template_version: Schema.String,
+  drain_trace_id: Schema.NonEmptyString,
+  issue_count: Schema.Number.pipe(Schema.greaterThanOrEqualTo(0)),
   outcomes_summary: DrainOutcomeSummarySchema,
-  sequencing_assessment: z.string(),
-  cross_issue_patterns: z.array(z.string()),
-  notable_events: z.array(NotableEventSchema),
-  recommendations: z.array(RecommendationSchema),
+  sequencing_assessment: Schema.String,
+  cross_issue_patterns: Schema.Array(Schema.String),
+  notable_events: Schema.Array(NotableEventSchema),
+  recommendations: Schema.Array(RecommendationSchema),
   severity: SeveritySchema,
   // Required when severity === "critical" — gives the operator the
   // line of reasoning behind the escalation. The IRA's prompt
   // instructs the model to write this even for `routine` (one line
   // explaining why it's not critical) so a future audit can read
   // the model's confidence either way.
-  severity_justification: z.string(),
+  severity_justification: Schema.String,
 });
 
-export type DrainOutcomeSummary = z.infer<typeof DrainOutcomeSummarySchema>;
-export type NotableEvent = z.infer<typeof NotableEventSchema>;
-export type Severity = z.infer<typeof SeveritySchema>;
-export type DrainReview = z.infer<typeof DrainReviewSchema>;
+export type DrainOutcomeSummary = typeof DrainOutcomeSummarySchema.Type;
+export type NotableEvent = typeof NotableEventSchema.Type;
+export type Severity = typeof SeveritySchema.Type;
+export type DrainReview = typeof DrainReviewSchema.Type;
 
 export function parseDrainReview(text: string): ReportParseResult<DrainReview> {
   return parseReport(text, {
@@ -450,27 +456,27 @@ export const WEEKLY_REVIEW_FENCE_TAG = "runway-weekly-review";
  * percentage points vs last week. Delta is nullable because the first
  * Weekly Review for a fresh workspace has no prior week to diff against.
  */
-const WeeklyRatesSchema = z.object({
-  throughput: z.number().nonnegative(),
-  success_pct: z.number().min(0).max(100),
-  hitl_pct: z.number().min(0).max(100),
-  revert_pct: z.number().min(0).max(100),
-  infra_error_pct: z.number().min(0).max(100),
+const WeeklyRatesSchema = Schema.Struct({
+  throughput: Schema.Number.pipe(Schema.greaterThanOrEqualTo(0)),
+  success_pct: Schema.Number.pipe(Schema.between(0, 100)),
+  hitl_pct: Schema.Number.pipe(Schema.between(0, 100)),
+  revert_pct: Schema.Number.pipe(Schema.between(0, 100)),
+  infra_error_pct: Schema.Number.pipe(Schema.between(0, 100)),
 });
 
-const WeeklyRatesDeltaSchema = z.object({
-  throughput: z.number(),
-  success_pct: z.number(),
-  hitl_pct: z.number(),
-  revert_pct: z.number(),
-  infra_error_pct: z.number(),
+const WeeklyRatesDeltaSchema = Schema.Struct({
+  throughput: Schema.Number,
+  success_pct: Schema.Number,
+  hitl_pct: Schema.Number,
+  revert_pct: Schema.Number,
+  infra_error_pct: Schema.Number,
 });
 
 /**
  * VA-408: PRD-spec promotion category. Mirrors the Linear label set the
  * runway-repo project uses to triage new issues.
  */
-const PromotionCategorySchema = z.enum(["Bug", "Feature", "Improvement"]);
+const PromotionCategorySchema = Schema.Literal("Bug", "Feature", "Improvement");
 
 /**
  * VA-409: machine-readable metrics the attribution loop can grade
@@ -480,7 +486,7 @@ const PromotionCategorySchema = z.enum(["Bug", "Feature", "Improvement"]);
  * `src/dashboard/read-model.md`. The enum is closed so the IRA can't
  * smuggle in a metric name we can't actually read post-ship.
  */
-const AttributionMetricSchema = z.enum([
+const AttributionMetricSchema = Schema.Literal(
   "median_iteration_count",
   "p95_iteration_count",
   "median_wall_time_ms",
@@ -489,7 +495,7 @@ const AttributionMetricSchema = z.enum([
   "revert_rate",
   "hitl_escape_rate",
   "infra_error_rate",
-]);
+);
 
 /**
  * VA-409: structured attribution block on a promotion's predicted
@@ -515,11 +521,11 @@ const AttributionMetricSchema = z.enum([
  *     metric must reach to count the claim as held. The "load-bearing
  *     falsifiability" number.
  */
-const PredictedEffectAttributionSchema = z.object({
+const PredictedEffectAttributionSchema = Schema.Struct({
   metric: AttributionMetricSchema,
-  baseline_value: z.number(),
-  direction: z.enum(["decrease", "increase"]),
-  threshold_value: z.number(),
+  baseline_value: Schema.Number,
+  direction: Schema.Literal("decrease", "increase"),
+  threshold_value: Schema.Number,
 });
 
 /**
@@ -533,16 +539,16 @@ const PredictedEffectAttributionSchema = z.object({
  * to `QUALITATIVE` and an operator reads the post-ship evidence
  * narrative themselves.
  */
-const PredictedEffectSchema = z.object({
-  claim: z.string().min(1),
-  min_sample_size: z.number().int().positive(),
+const PredictedEffectSchema = Schema.Struct({
+  claim: Schema.NonEmptyString,
+  min_sample_size: Schema.Int.pipe(Schema.greaterThan(0)),
   // Free-text description of the sample — e.g. "post-ship runs of
   // refactor-class issues". The attribution loop reads this to know
   // which runs count toward the n=X threshold.
-  sample_description: z.string().min(1),
+  sample_description: Schema.NonEmptyString,
   // VA-409: optional structured attribution block. Present → numeric
   // verdict path. Absent → QUALITATIVE.
-  attribution: PredictedEffectAttributionSchema.optional(),
+  attribution: Schema.optional(PredictedEffectAttributionSchema),
 });
 
 /**
@@ -565,26 +571,28 @@ export const RUNWAY_META_THEME_KEY_MARKER = "runway-meta-theme-key";
 export const RUNWAY_META_PREDICTED_EFFECT_MARKER =
   "runway-meta-predicted-effect";
 
-const PromotionSchema = z.object({
+const PromotionSchema = Schema.Struct({
   // The promoter's stable theme key, echoed back in the parsed payload.
   // Stamped into the runway-repo issue body so the next Weekly Review
   // can match against the open promoted queue.
-  theme_key: z.string().min(1),
+  theme_key: Schema.NonEmptyString,
   target: RecommendationTargetSchema,
   category: PromotionCategorySchema,
   // Short title for the runway-repo issue (the LLM's job — turning a
   // recommendation into a shippable phrasing).
-  title: z.string().min(1),
+  title: Schema.NonEmptyString,
   // Multi-line change spec for the issue body. Markdown.
-  change_spec: z.string().min(1),
+  change_spec: Schema.NonEmptyString,
   // Acceptance criteria as a list of bullet strings. The runway-repo
   // issue body renders these as a markdown checklist.
-  acceptance_criteria: z.array(z.string().min(1)).min(1),
+  acceptance_criteria: Schema.Array(Schema.NonEmptyString).pipe(
+    Schema.minItems(1),
+  ),
   // VA-NNN identifiers of the Run / Drain Reviews that corroborated
   // this theme. The promoter computed this; the LLM echoes it back.
-  source_meta_review_identifiers: z.array(z.string().min(1)),
+  source_meta_review_identifiers: Schema.Array(Schema.NonEmptyString),
   predicted_effect: PredictedEffectSchema,
-  corroboration_count: z.number().int().min(2),
+  corroboration_count: Schema.Int.pipe(Schema.greaterThanOrEqualTo(2)),
   recommendation_confidence: RecommendationConfidenceSchema,
 });
 
@@ -594,23 +602,23 @@ const PromotionSchema = z.object({
  * Weekly Review want to know which themes are pending vs which lost
  * the ranking vs which match a prior rejection.
  */
-const NotedThemeReasonSchema = z.enum([
+const NotedThemeReasonSchema = Schema.Literal(
   "budget-cap",
   "deferred-open-promotion",
   "out-of-scope",
   "low-confidence",
-]);
+);
 
-const NotedThemeSchema = z.object({
-  theme_key: z.string().min(1),
+const NotedThemeSchema = Schema.Struct({
+  theme_key: Schema.NonEmptyString,
   target: RecommendationTargetSchema,
-  description: z.string().min(1),
-  corroboration_count: z.number().int().min(1),
+  description: Schema.NonEmptyString,
+  corroboration_count: Schema.Int.pipe(Schema.greaterThanOrEqualTo(1)),
   reason: NotedThemeReasonSchema,
   // Populated when `reason === "deferred-open-promotion"` — the
   // identifier of the open promoted issue the new theme is deferring
   // behind. Null otherwise.
-  deferred_behind: z.string().nullable(),
+  deferred_behind: Schema.NullOr(Schema.String),
 });
 
 /**
@@ -619,10 +627,10 @@ const NotedThemeSchema = z.object({
  * corroboration threshold (>= 2 Run Reviews) still get a one-liner so
  * the operator can spot pre-emergent patterns before they harden.
  */
-const RecurringThemeSchema = z.object({
+const RecurringThemeSchema = Schema.Struct({
   target: RecommendationTargetSchema,
-  description: z.string().min(1),
-  corroboration_count: z.number().int().min(1),
+  description: Schema.NonEmptyString,
+  corroboration_count: Schema.Int.pipe(Schema.greaterThanOrEqualTo(1)),
 });
 
 /**
@@ -645,13 +653,13 @@ const RecurringThemeSchema = z.object({
  *   - `QUALITATIVE` — no attribution block to grade against; the IRA
  *     quotes the observable post-ship evidence and an operator decides.
  */
-const VerdictSchema = z.enum([
+const VerdictSchema = Schema.Literal(
   "HELD",
   "PARTIAL",
   "MISSED",
   "PENDING",
   "QUALITATIVE",
-]);
+);
 
 /**
  * VA-409: post-ship observation alongside a shipped promotion. The
@@ -661,10 +669,10 @@ const VerdictSchema = z.enum([
  * when the verdict is `QUALITATIVE`) so a reader of the *What we
  * shipped* section sees what was measured.
  */
-const ObservedMetricSchema = z.object({
-  metric: AttributionMetricSchema.nullable(),
-  value: z.number().nullable(),
-  sample_size: z.number().int().nonnegative(),
+const ObservedMetricSchema = Schema.Struct({
+  metric: Schema.NullOr(AttributionMetricSchema),
+  value: Schema.NullOr(Schema.Number),
+  sample_size: Schema.Int.pipe(Schema.greaterThanOrEqualTo(0)),
 });
 
 /**
@@ -679,26 +687,26 @@ const ObservedMetricSchema = z.object({
  * post-ship metric, computes the verdict, and hands the LLM the
  * structured row to write narrative around.
  */
-const ShippedPromotionSchema = z.object({
-  theme_key: z.string().min(1),
-  linear_identifier: z.string().min(1),
-  linear_url: z.string().min(1),
-  linear_title: z.string().min(1),
-  source_meta_review_identifiers: z.array(z.string().min(1)),
+const ShippedPromotionSchema = Schema.Struct({
+  theme_key: Schema.NonEmptyString,
+  linear_identifier: Schema.NonEmptyString,
+  linear_url: Schema.NonEmptyString,
+  linear_title: Schema.NonEmptyString,
+  source_meta_review_identifiers: Schema.Array(Schema.NonEmptyString),
   predicted_effect: PredictedEffectSchema,
   observed: ObservedMetricSchema,
   verdict: VerdictSchema,
-  comment: z.string(),
+  comment: Schema.String,
 });
 
-const WeeklyReviewSchema = z.object({
-  template_version: z.string(),
+const WeeklyReviewSchema = Schema.Struct({
+  template_version: Schema.String,
   // ISO8601 boundaries of the week. The cron-driven cadence sets the
   // window; ad-hoc `runway review weekly` invocations may pick custom
   // windows for backfill / replay.
-  time_window: z.object({
-    start_iso: z.string().min(1),
-    end_iso: z.string().min(1),
+  time_window: Schema.Struct({
+    start_iso: Schema.NonEmptyString,
+    end_iso: Schema.NonEmptyString,
   }),
   // Aggregates: throughput, success / HITL / revert / infra-error
   // rates. The LLM computes these off the raw Reviews surface — the
@@ -707,38 +715,40 @@ const WeeklyReviewSchema = z.object({
   rates: WeeklyRatesSchema,
   // Delta vs prior week. Null on the first weekly review for a fresh
   // workspace (no prior week to diff against).
-  rates_delta_vs_prior_week: WeeklyRatesDeltaSchema.nullable(),
+  rates_delta_vs_prior_week: Schema.NullOr(WeeklyRatesDeltaSchema),
   // Free-form prose summarizing the week. The operator reads this on
   // a Sunday evening — readability matters more than rigid structure.
-  narrative: z.string(),
-  recurring_themes: z.array(RecurringThemeSchema),
+  narrative: Schema.String,
+  recurring_themes: Schema.Array(RecurringThemeSchema),
   // Top-5 promotions per the PRD's hard cap. Enforced at the schema
   // level so a malformed LLM response can't slip 6+ promotions past.
-  promotions: z.array(PromotionSchema).max(5),
-  noted_but_not_promoted: z.array(NotedThemeSchema),
+  promotions: Schema.Array(PromotionSchema).pipe(Schema.maxItems(5)),
+  noted_but_not_promoted: Schema.Array(NotedThemeSchema),
   // VA-409: *What we shipped* section. Each row is one promotion that
   // moved to Done since the prior Weekly Review, with the mechanical
-  // verdict the attribution loop graded. Default empty so v1.0.0
-  // payloads still parse under v1.1.0.
-  shipped_promotions: z.array(ShippedPromotionSchema).default([]),
+  // verdict the attribution loop graded. Defaults to `[]` so v1.0.0
+  // payloads (which omit the field entirely) still parse under v1.1.0.
+  shipped_promotions: Schema.optionalWith(
+    Schema.Array(ShippedPromotionSchema),
+    { default: () => [] },
+  ),
 });
 
-export type WeeklyRates = z.infer<typeof WeeklyRatesSchema>;
-export type WeeklyRatesDelta = z.infer<typeof WeeklyRatesDeltaSchema>;
-export type PromotionCategory = z.infer<typeof PromotionCategorySchema>;
-export type AttributionMetric = z.infer<typeof AttributionMetricSchema>;
-export type PredictedEffectAttribution = z.infer<
-  typeof PredictedEffectAttributionSchema
->;
-export type PredictedEffect = z.infer<typeof PredictedEffectSchema>;
-export type Promotion = z.infer<typeof PromotionSchema>;
-export type NotedThemeReason = z.infer<typeof NotedThemeReasonSchema>;
-export type NotedTheme = z.infer<typeof NotedThemeSchema>;
-export type RecurringTheme = z.infer<typeof RecurringThemeSchema>;
-export type Verdict = z.infer<typeof VerdictSchema>;
-export type ObservedMetric = z.infer<typeof ObservedMetricSchema>;
-export type ShippedPromotion = z.infer<typeof ShippedPromotionSchema>;
-export type WeeklyReview = z.infer<typeof WeeklyReviewSchema>;
+export type WeeklyRates = typeof WeeklyRatesSchema.Type;
+export type WeeklyRatesDelta = typeof WeeklyRatesDeltaSchema.Type;
+export type PromotionCategory = typeof PromotionCategorySchema.Type;
+export type AttributionMetric = typeof AttributionMetricSchema.Type;
+export type PredictedEffectAttribution =
+  typeof PredictedEffectAttributionSchema.Type;
+export type PredictedEffect = typeof PredictedEffectSchema.Type;
+export type Promotion = typeof PromotionSchema.Type;
+export type NotedThemeReason = typeof NotedThemeReasonSchema.Type;
+export type NotedTheme = typeof NotedThemeSchema.Type;
+export type RecurringTheme = typeof RecurringThemeSchema.Type;
+export type Verdict = typeof VerdictSchema.Type;
+export type ObservedMetric = typeof ObservedMetricSchema.Type;
+export type ShippedPromotion = typeof ShippedPromotionSchema.Type;
+export type WeeklyReview = typeof WeeklyReviewSchema.Type;
 
 export function parseWeeklyReview(
   text: string,
@@ -755,16 +765,23 @@ export function parseWeeklyReview(
 // → schema validation
 // ---------------------------------------------------------------------------
 
-interface ParseSpec<T> {
+interface ParseSpec<A, I> {
   readonly fenceTag: string;
-  readonly schema: z.ZodType<T>;
+  // Two generics so each call site can keep its natural `A` (decoded
+  // type) and `I` (encoded type) — Effect Schema is invariant in both,
+  // so a single-generic `Schema.Schema<T>` would force every schema to
+  // its decoded form for both slots. We start from `unknown` via
+  // `decodeUnknownEither` anyway, so the `I` shape isn't load-bearing
+  // here — but we need to let it vary so the schemas with a non-trivial
+  // encoded shape (e.g. `optionalWith({ default })`) type-check.
+  readonly schema: Schema.Schema<A, I, never>;
   readonly expectedMajor: number;
 }
 
-function parseReport<T>(
+function parseReport<A, I>(
   text: string,
-  spec: ParseSpec<T>,
-): ReportParseResult<T> {
+  spec: ParseSpec<A, I>,
+): ReportParseResult<A> {
   const blockBody = extractFencedBlock(text, spec.fenceTag);
   if (blockBody === undefined) {
     return err({
@@ -788,7 +805,7 @@ function parseReport<T>(
   // VA-401: version handshake — major bump is a loud failure. Same
   // major (incl. older minor / patch) flows through to schema
   // validation. The version field is the FIRST gate so a v2.x.x
-  // payload doesn't get rejected by zod for unrelated reasons.
+  // payload doesn't get rejected for unrelated reasons.
   const versionField =
     parsed && typeof parsed === "object"
       ? (parsed as { template_version?: unknown }).template_version
@@ -809,14 +826,14 @@ function parseReport<T>(
     });
   }
 
-  const result = spec.schema.safeParse(parsed);
-  if (!result.success) {
+  const result = Schema.decodeUnknownEither(spec.schema)(parsed);
+  if (Either.isLeft(result)) {
     return err({
       kind: "schema-mismatch",
-      message: `${spec.fenceTag}: ${summariseZodIssues(result.error.issues)}`,
+      message: `${spec.fenceTag}: ${summariseSchemaError(result.left)}`,
     });
   }
-  return ok(result.data);
+  return ok(result.right);
 }
 
 /**
@@ -858,15 +875,17 @@ function parseMajor(version: string): number {
   return match ? Number(match[1]) : Number.NaN;
 }
 
-function summariseZodIssues(issues: readonly z.core.$ZodIssue[]): string {
-  // Keep the message compact so it fits as a span attribute without
-  // ballooning the trace payload. Path + code per issue is enough to
-  // diagnose; the full payload is in `raw_spans` anyway.
+function summariseSchemaError(error: ParseResult.ParseError): string {
+  // Project Effect's tree-shaped ParseError into a compact line so the
+  // payload fits a span attribute without ballooning the trace. Path +
+  // issue tag per leaf, truncated to the first 5 — same shape the prior
+  // zod summariser produced, with `_tag` standing in for zod's `code`.
+  const issues = ParseResult.ArrayFormatter.formatErrorSync(error);
   return issues
     .slice(0, 5)
     .map((issue) => {
       const path = issue.path.length === 0 ? "<root>" : issue.path.join(".");
-      return `${path}: ${issue.code}`;
+      return `${path}: ${issue._tag}`;
     })
     .join("; ");
 }
