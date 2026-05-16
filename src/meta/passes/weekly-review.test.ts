@@ -16,7 +16,11 @@ vi.mock("../llm.js", async () => {
 });
 
 const { runWeeklyReviewPass } = await import("./weekly-review.js");
-const { WEEKLY_REVIEW_VERSION } = await import("../templates.js");
+const {
+  RUNWAY_META_PREDICTED_EFFECT_MARKER,
+  RUNWAY_META_THEME_KEY_MARKER,
+  WEEKLY_REVIEW_VERSION,
+} = await import("../templates.js");
 
 // VA-408: pass tests cover the contracts the operator and the cron
 // scheduler observe:
@@ -89,6 +93,7 @@ const validReview = (overrides: Record<string, unknown> = {}) => ({
     },
   ],
   noted_but_not_promoted: [],
+  shipped_promotions: [],
   ...overrides,
 });
 
@@ -172,6 +177,7 @@ const buildFixtures = (
     ),
     createRunwayRepoIssue,
     listOpenPromotedQueue: vi.fn(() => Effect.succeed([])),
+    listShippedPromotionsSince: vi.fn(() => Effect.succeed([])),
   } as unknown as import("../linear-meta.js").MetaLinearGateway;
 
   return { saved, storage, dashboardRead, metaLinear };
@@ -451,6 +457,509 @@ describe("runWeeklyReviewPass (VA-408)", () => {
     const content = JSON.parse(f.saved[0]?.contentJson ?? "{}");
     expect(content.promotion_filings).toHaveLength(2);
     expect(content.promotion_filings[1].error).toBeTruthy();
+  });
+
+  // ---------------------------------------------------------------------
+  // VA-409: attribution loop — *What we shipped* verdicts.
+  //
+  // Each verdict path on fixture data: HELD / PARTIAL / MISSED / PENDING
+  // / QUALITATIVE. Asserts (a) the mechanical verdict reaches the saved
+  // SQLite row + the Linear body, (b) the LLM cannot overwrite the
+  // verdict, (c) `shipped_promotions` lands in the parsed report.
+  // ---------------------------------------------------------------------
+
+  // Build one promoted-issue body the attribution loop will read.
+  const buildPromotedBody = (opts: {
+    themeKey: string;
+    predictedEffect: unknown;
+    sources?: readonly string[];
+  }): string => {
+    const sources =
+      opts.sources?.map((s) => `[${s}](https://linear.app/x/issue/${s})`).join(", ") ??
+      "";
+    return [
+      `<!-- ${RUNWAY_META_THEME_KEY_MARKER}: ${opts.themeKey} -->`,
+      `<!-- ${RUNWAY_META_PREDICTED_EFFECT_MARKER}: ${JSON.stringify(opts.predictedEffect)} -->`,
+      "",
+      `**Target taxonomy**: \`prompt\``,
+      `**Category**: \`Improvement\``,
+      `**Source meta-reviews**: ${sources}`,
+      "",
+      "## Predicted effect",
+      "",
+      `> **Claim**: x`,
+      "> **Minimum sample size**: n ≥ 1 samples",
+    ].join("\n");
+  };
+
+  const wireShipped = (
+    f: ReturnType<typeof buildFixtures>,
+    shipped: ReadonlyArray<{
+      identifier: string;
+      url: string;
+      title: string;
+      body: string;
+      themeKey: string | null;
+      completedAt: string;
+    }>,
+    postShipMetrics:
+      | { value: number; sampleSize: number }
+      | { value: null; sampleSize: 0 }
+      | null,
+  ): void => {
+    // Prior weekly is the cutoff source — give the pass at least one
+    // recent weekly so it knows when "since" is.
+    (
+      f.dashboardRead.loadRecentWeeklyReviews as unknown as ReturnType<typeof vi.fn>
+    ).mockReturnValue(
+      Effect.succeed([
+        {
+          id: "prev-weekly-1",
+          kind: "meta-weekly-review",
+          drainId: null,
+          issueId: null,
+          contentJson: "{}",
+          templateVersion: "1.0.0",
+          createdAt: "2026-05-08T00:00:00.000Z",
+        },
+      ]),
+    );
+    (
+      f.metaLinear.listShippedPromotionsSince as unknown as ReturnType<typeof vi.fn>
+    ).mockReturnValue(Effect.succeed(shipped));
+    // Attach a `loadPostShipMetrics` mock — return either a populated
+    // PostShipMetrics row, the null (no rows) variant, or a fake
+    // attached only for tests that compute one.
+    (f.dashboardRead as unknown as {
+      loadPostShipMetrics: ReturnType<typeof vi.fn>;
+    }).loadPostShipMetrics = vi.fn(() =>
+      Effect.succeed(
+        postShipMetrics === null
+          ? null
+          : {
+              category: "VA",
+              sinceIso: "2026-05-08T00:00:00.000Z",
+              sampleSize: postShipMetrics.sampleSize,
+              medianIterationCount: null,
+              p95IterationCount: null,
+              medianWallTimeMs: null,
+              p95WallTimeMs: null,
+              reviewerRejectionRate:
+                postShipMetrics.value === null ? 0 : postShipMetrics.value,
+              revertRate: 0,
+              hitlEscapeRate: 0,
+              infraErrorRate: 0,
+            },
+      ),
+    );
+  };
+
+  it("HELD verdict: observed metric meets the predicted threshold", async () => {
+    const f = buildFixtures();
+    wireShipped(
+      f,
+      [
+        {
+          identifier: "VA-3001",
+          url: "https://linear.app/x/issue/VA-3001",
+          title: "Tighten reviewer rejection guidance",
+          themeKey: "prompt:tighten:abcd1234",
+          completedAt: "2026-05-12T00:00:00.000Z",
+          body: buildPromotedBody({
+            themeKey: "prompt:tighten:abcd1234",
+            predictedEffect: {
+              claim: "Reviewer rejection rate falls below 8%.",
+              min_sample_size: 10,
+              sample_description: "post-ship VA-prefixed runs",
+              attribution: {
+                metric: "reviewer_rejection_rate",
+                baseline_value: 0.12,
+                direction: "decrease",
+                threshold_value: 0.08,
+              },
+            },
+            sources: ["VA-1001"],
+          }),
+        },
+      ],
+      { value: 0.05, sampleSize: 15 },
+    );
+    callWeeklyReviewMock.mockReturnValueOnce(
+      Effect.succeed({ ok: true, report: validReview() }),
+    );
+
+    const outcome = await Effect.runPromise(
+      runWeeklyReviewPass(
+        {
+          startIso: "2026-05-09T00:00:00.000Z",
+          endIso: "2026-05-16T00:00:00.000Z",
+        },
+        {
+          anthropicApiKey: "test-key",
+          metaWeeklyModel: "claude-opus-4-7",
+          dashboardRead: f.dashboardRead,
+          metaLinear: f.metaLinear,
+          storage: f.storage,
+          cwd: tmpCwd,
+        },
+      ),
+    );
+
+    expect(outcome.kind).toBe("review");
+    if (outcome.kind !== "review") return;
+    expect(outcome.shippedPromotionsGraded).toBe(1);
+    const content = JSON.parse(f.saved[0]?.contentJson ?? "{}");
+    const shipped = content.review.shipped_promotions;
+    expect(shipped).toHaveLength(1);
+    expect(shipped[0].verdict).toBe("HELD");
+    expect(shipped[0].linear_identifier).toBe("VA-3001");
+    expect(shipped[0].observed.value).toBe(0.05);
+    expect(shipped[0].observed.sample_size).toBe(15);
+    // Body carries the *What we shipped* section.
+    const bodyArg = (f.metaLinear.createWeeklyReviewIssue as unknown as {
+      mock: { calls: ReadonlyArray<ReadonlyArray<{ body: string }>> };
+    }).mock.calls[0]?.[0]?.body;
+    expect(bodyArg).toContain("## What we shipped");
+    expect(bodyArg).toContain("`HELD`");
+  });
+
+  it("PARTIAL verdict: observed moved toward threshold but didn't reach", async () => {
+    const f = buildFixtures();
+    wireShipped(
+      f,
+      [
+        {
+          identifier: "VA-3002",
+          url: "https://linear.app/x/issue/VA-3002",
+          title: "Partial improvement",
+          themeKey: "prompt:partial:bbbb2222",
+          completedAt: "2026-05-12T00:00:00.000Z",
+          body: buildPromotedBody({
+            themeKey: "prompt:partial:bbbb2222",
+            predictedEffect: {
+              claim: "Rejection rate falls below 8%.",
+              min_sample_size: 10,
+              sample_description: "post-ship runs",
+              attribution: {
+                metric: "reviewer_rejection_rate",
+                baseline_value: 0.12,
+                direction: "decrease",
+                threshold_value: 0.08,
+              },
+            },
+          }),
+        },
+      ],
+      { value: 0.1, sampleSize: 12 }, // 0.12 → 0.1 → past baseline, not under 0.08
+    );
+    callWeeklyReviewMock.mockReturnValueOnce(
+      Effect.succeed({ ok: true, report: validReview() }),
+    );
+
+    await Effect.runPromise(
+      runWeeklyReviewPass(
+        {
+          startIso: "2026-05-09T00:00:00.000Z",
+          endIso: "2026-05-16T00:00:00.000Z",
+        },
+        {
+          anthropicApiKey: "test-key",
+          metaWeeklyModel: "claude-opus-4-7",
+          dashboardRead: f.dashboardRead,
+          metaLinear: f.metaLinear,
+          storage: f.storage,
+          cwd: tmpCwd,
+        },
+      ),
+    );
+
+    const content = JSON.parse(f.saved[0]?.contentJson ?? "{}");
+    expect(content.review.shipped_promotions[0].verdict).toBe("PARTIAL");
+  });
+
+  it("MISSED verdict: observed did not move past baseline", async () => {
+    const f = buildFixtures();
+    wireShipped(
+      f,
+      [
+        {
+          identifier: "VA-3003",
+          url: "https://linear.app/x/issue/VA-3003",
+          title: "Missed change",
+          themeKey: "prompt:missed:cccc3333",
+          completedAt: "2026-05-12T00:00:00.000Z",
+          body: buildPromotedBody({
+            themeKey: "prompt:missed:cccc3333",
+            predictedEffect: {
+              claim: "Rejection rate falls below 8%.",
+              min_sample_size: 10,
+              sample_description: "post-ship runs",
+              attribution: {
+                metric: "reviewer_rejection_rate",
+                baseline_value: 0.12,
+                direction: "decrease",
+                threshold_value: 0.08,
+              },
+            },
+          }),
+        },
+      ],
+      { value: 0.15, sampleSize: 11 }, // wrong direction
+    );
+    callWeeklyReviewMock.mockReturnValueOnce(
+      Effect.succeed({ ok: true, report: validReview() }),
+    );
+
+    await Effect.runPromise(
+      runWeeklyReviewPass(
+        {
+          startIso: "2026-05-09T00:00:00.000Z",
+          endIso: "2026-05-16T00:00:00.000Z",
+        },
+        {
+          anthropicApiKey: "test-key",
+          metaWeeklyModel: "claude-opus-4-7",
+          dashboardRead: f.dashboardRead,
+          metaLinear: f.metaLinear,
+          storage: f.storage,
+          cwd: tmpCwd,
+        },
+      ),
+    );
+
+    const content = JSON.parse(f.saved[0]?.contentJson ?? "{}");
+    expect(content.review.shipped_promotions[0].verdict).toBe("MISSED");
+  });
+
+  it("PENDING verdict: post-ship sample below the declared minimum (n=X of Y needed)", async () => {
+    const f = buildFixtures();
+    wireShipped(
+      f,
+      [
+        {
+          identifier: "VA-3004",
+          url: "https://linear.app/x/issue/VA-3004",
+          title: "Pending change",
+          themeKey: "prompt:pending:dddd4444",
+          completedAt: "2026-05-12T00:00:00.000Z",
+          body: buildPromotedBody({
+            themeKey: "prompt:pending:dddd4444",
+            predictedEffect: {
+              claim: "Rejection rate falls below 8%.",
+              min_sample_size: 10,
+              sample_description: "post-ship runs",
+              attribution: {
+                metric: "reviewer_rejection_rate",
+                baseline_value: 0.12,
+                direction: "decrease",
+                threshold_value: 0.08,
+              },
+            },
+          }),
+        },
+      ],
+      { value: 0.05, sampleSize: 3 }, // below n=10
+    );
+    callWeeklyReviewMock.mockReturnValueOnce(
+      Effect.succeed({ ok: true, report: validReview() }),
+    );
+
+    await Effect.runPromise(
+      runWeeklyReviewPass(
+        {
+          startIso: "2026-05-09T00:00:00.000Z",
+          endIso: "2026-05-16T00:00:00.000Z",
+        },
+        {
+          anthropicApiKey: "test-key",
+          metaWeeklyModel: "claude-opus-4-7",
+          dashboardRead: f.dashboardRead,
+          metaLinear: f.metaLinear,
+          storage: f.storage,
+          cwd: tmpCwd,
+        },
+      ),
+    );
+
+    const content = JSON.parse(f.saved[0]?.contentJson ?? "{}");
+    expect(content.review.shipped_promotions[0].verdict).toBe("PENDING");
+    // AC: phrasing locks "n=X of Y needed".
+    expect(content.review.shipped_promotions[0].comment).toMatch(
+      /n=3\s+of\s+10\s+needed/,
+    );
+  });
+
+  it("QUALITATIVE verdict: predicted_effect has no attribution block", async () => {
+    const f = buildFixtures();
+    wireShipped(
+      f,
+      [
+        {
+          identifier: "VA-3005",
+          url: "https://linear.app/x/issue/VA-3005",
+          title: "Qualitative shipped change",
+          themeKey: "issue-body:style:eeee5555",
+          completedAt: "2026-05-12T00:00:00.000Z",
+          body: buildPromotedBody({
+            themeKey: "issue-body:style:eeee5555",
+            predictedEffect: {
+              claim: "Future issue bodies cite the new style guide.",
+              min_sample_size: 5,
+              sample_description: "newly-filed issues",
+              // No attribution block — falls to QUALITATIVE.
+            },
+          }),
+        },
+      ],
+      null, // post-ship metrics unused for qualitative
+    );
+    callWeeklyReviewMock.mockReturnValueOnce(
+      Effect.succeed({ ok: true, report: validReview() }),
+    );
+
+    await Effect.runPromise(
+      runWeeklyReviewPass(
+        {
+          startIso: "2026-05-09T00:00:00.000Z",
+          endIso: "2026-05-16T00:00:00.000Z",
+        },
+        {
+          anthropicApiKey: "test-key",
+          metaWeeklyModel: "claude-opus-4-7",
+          dashboardRead: f.dashboardRead,
+          metaLinear: f.metaLinear,
+          storage: f.storage,
+          cwd: tmpCwd,
+        },
+      ),
+    );
+
+    const content = JSON.parse(f.saved[0]?.contentJson ?? "{}");
+    expect(content.review.shipped_promotions[0].verdict).toBe("QUALITATIVE");
+    // AC: comment includes "QUALITATIVE — operator review needed" and
+    // quotes the predicted claim.
+    expect(content.review.shipped_promotions[0].comment).toContain(
+      "QUALITATIVE — operator review needed",
+    );
+    expect(content.review.shipped_promotions[0].comment).toContain(
+      "Future issue bodies cite",
+    );
+  });
+
+  it("skips attribution loop entirely when no prior weekly review exists", async () => {
+    // Fresh workspace: `loadRecentWeeklyReviews` returns []. The pass
+    // should NOT call listShippedPromotionsSince and should land an
+    // empty shipped_promotions array.
+    const f = buildFixtures();
+    callWeeklyReviewMock.mockReturnValueOnce(
+      Effect.succeed({ ok: true, report: validReview() }),
+    );
+
+    const outcome = await Effect.runPromise(
+      runWeeklyReviewPass(
+        {
+          startIso: "2026-05-09T00:00:00.000Z",
+          endIso: "2026-05-16T00:00:00.000Z",
+        },
+        {
+          anthropicApiKey: "test-key",
+          metaWeeklyModel: "claude-opus-4-7",
+          dashboardRead: f.dashboardRead,
+          metaLinear: f.metaLinear,
+          storage: f.storage,
+          cwd: tmpCwd,
+        },
+      ),
+    );
+
+    expect(outcome.kind).toBe("review");
+    if (outcome.kind !== "review") return;
+    expect(outcome.shippedPromotionsGraded).toBe(0);
+    expect(f.metaLinear.listShippedPromotionsSince).not.toHaveBeenCalled();
+  });
+
+  it("LLM cannot overwrite the mechanical verdict — reconciliation drops a hallucinated one", async () => {
+    const f = buildFixtures();
+    wireShipped(
+      f,
+      [
+        {
+          identifier: "VA-3006",
+          url: "https://linear.app/x/issue/VA-3006",
+          title: "Held change",
+          themeKey: "prompt:tighten:abcd1234",
+          completedAt: "2026-05-12T00:00:00.000Z",
+          body: buildPromotedBody({
+            themeKey: "prompt:tighten:abcd1234",
+            predictedEffect: {
+              claim: "Rejection rate falls below 8%.",
+              min_sample_size: 10,
+              sample_description: "post-ship runs",
+              attribution: {
+                metric: "reviewer_rejection_rate",
+                baseline_value: 0.12,
+                direction: "decrease",
+                threshold_value: 0.08,
+              },
+            },
+          }),
+        },
+      ],
+      { value: 0.05, sampleSize: 15 }, // truth = HELD
+    );
+    // LLM tries to flip it to MISSED with a fake observed value.
+    callWeeklyReviewMock.mockReturnValueOnce(
+      Effect.succeed({
+        ok: true,
+        report: validReview({
+          shipped_promotions: [
+            {
+              theme_key: "prompt:tighten:abcd1234",
+              linear_identifier: "VA-FAKE",
+              linear_url: "https://example.com/fake",
+              linear_title: "Hallucinated title",
+              source_meta_review_identifiers: ["VA-fake"],
+              predicted_effect: {
+                claim: "fake",
+                min_sample_size: 999,
+                sample_description: "fake",
+              },
+              observed: { metric: null, value: 99, sample_size: 1 },
+              verdict: "MISSED",
+              comment: "LLM hallucinated comment.",
+            },
+          ],
+        }),
+      }),
+    );
+
+    await Effect.runPromise(
+      runWeeklyReviewPass(
+        {
+          startIso: "2026-05-09T00:00:00.000Z",
+          endIso: "2026-05-16T00:00:00.000Z",
+        },
+        {
+          anthropicApiKey: "test-key",
+          metaWeeklyModel: "claude-opus-4-7",
+          dashboardRead: f.dashboardRead,
+          metaLinear: f.metaLinear,
+          storage: f.storage,
+          cwd: tmpCwd,
+        },
+      ),
+    );
+
+    const content = JSON.parse(f.saved[0]?.contentJson ?? "{}");
+    const row = content.review.shipped_promotions[0];
+    // Verdict + observed reconciled back to the mechanical truth.
+    expect(row.verdict).toBe("HELD");
+    expect(row.linear_identifier).toBe("VA-3006");
+    expect(row.observed.value).toBe(0.05);
+    expect(row.observed.sample_size).toBe(15);
+    // But the LLM's one-sentence comment is preserved (the only field
+    // the IRA is allowed to author).
+    expect(row.comment).toBe("LLM hallucinated comment.");
   });
 
   it("uses metaWeeklyModel (not metaReviewModel) for the LLM call", async () => {

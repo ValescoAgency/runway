@@ -425,10 +425,21 @@ export function parseDrainReview(text: string): ReportParseResult<DrainReview> {
 }
 
 // ---------------------------------------------------------------------------
-// Weekly Review (v1.0.0) — IRA's weekly cadence pass (VA-408)
+// Weekly Review (v1.1.0) — IRA's weekly cadence pass (VA-408)
+// + attribution loop ("What we shipped" verdicts) (VA-409)
 // ---------------------------------------------------------------------------
 
-export const WEEKLY_REVIEW_VERSION = "1.0.0";
+/**
+ * VA-409: v1.1.0 minor bump adds `shipped_promotions` ("What we shipped"
+ * verdicts) plus optional `attribution` on `PredictedEffectSchema`. Both
+ * are forward-compatible:
+ *   - v1.0.0 reviews lacked `shipped_promotions` entirely; the schema
+ *     defaults the field to `[]` so legacy payloads still parse.
+ *   - v1.0.0 promotions stamped only the free-text claim into runway-repo
+ *     issue bodies; reading them back yields `attribution === undefined`,
+ *     which the attribution loop maps to a `QUALITATIVE` verdict.
+ */
+export const WEEKLY_REVIEW_VERSION = "1.1.0";
 export const WEEKLY_REVIEW_FENCE_TAG = "runway-weekly-review";
 
 /**
@@ -462,11 +473,65 @@ const WeeklyRatesDeltaSchema = z.object({
 const PromotionCategorySchema = z.enum(["Bug", "Feature", "Improvement"]);
 
 /**
+ * VA-409: machine-readable metrics the attribution loop can grade
+ * against. Names mirror VA-399's `evaluator_aggregates_v1` columns
+ * (snake_case) so the IRA's stamped attribution and the dashboard
+ * read-model reference the same fields by name — see
+ * `src/dashboard/read-model.md`. The enum is closed so the IRA can't
+ * smuggle in a metric name we can't actually read post-ship.
+ */
+const AttributionMetricSchema = z.enum([
+  "median_iteration_count",
+  "p95_iteration_count",
+  "median_wall_time_ms",
+  "p95_wall_time_ms",
+  "reviewer_rejection_rate",
+  "revert_rate",
+  "hitl_escape_rate",
+  "infra_error_rate",
+]);
+
+/**
+ * VA-409: structured attribution block on a promotion's predicted
+ * effect. Optional at the schema layer because some predictions are
+ * qualitative (no measurable post-ship metric) — those fall through to
+ * the `QUALITATIVE` verdict per the AC.
+ *
+ * Semantics of the four fields, all required when `attribution` is
+ * present so the verdict logic doesn't have to defend against partial
+ * shapes:
+ *   - `metric` — which `evaluator_aggregates_v1` column to read
+ *     post-ship.
+ *   - `baseline_value` — the IRA's recorded pre-ship value (sourced
+ *     from VA-405's rolling norms at the time the promotion was
+ *     written). Carried for transparency + for the PARTIAL bucket: if
+ *     the metric moved past `baseline_value` toward `threshold_value`
+ *     but didn't reach the threshold, the verdict is PARTIAL.
+ *   - `direction` — which way the IRA predicts the metric should move
+ *     to count as improvement. Drives the verdict comparison
+ *     (`decrease` → HELD when `observed <= threshold_value`;
+ *     `increase` → HELD when `observed >= threshold_value`).
+ *   - `threshold_value` — the post-ship value the IRA predicts the
+ *     metric must reach to count the claim as held. The "load-bearing
+ *     falsifiability" number.
+ */
+const PredictedEffectAttributionSchema = z.object({
+  metric: AttributionMetricSchema,
+  baseline_value: z.number(),
+  direction: z.enum(["decrease", "increase"]),
+  threshold_value: z.number(),
+});
+
+/**
  * VA-408: predicted-effect block per promotion. Falsifiability is the
  * load-bearing contract — every promotion declares the claim it makes
- * and the minimum sample of post-ship runs needed to validate it. The
- * next Weekly Review's attribution loop (VA-409) reads this block back
- * to grade HELD / PARTIAL / MISSED after the change ships.
+ * and the minimum sample of post-ship runs needed to validate it.
+ * VA-409: the optional `attribution` block lets the IRA name a
+ * specific VA-399 metric + direction + threshold so the next Weekly
+ * Review's attribution loop can grade HELD / PARTIAL / MISSED
+ * mechanically. When `attribution` is absent the verdict falls through
+ * to `QUALITATIVE` and an operator reads the post-ship evidence
+ * narrative themselves.
  */
 const PredictedEffectSchema = z.object({
   claim: z.string().min(1),
@@ -475,6 +540,9 @@ const PredictedEffectSchema = z.object({
   // refactor-class issues". The attribution loop reads this to know
   // which runs count toward the n=X threshold.
   sample_description: z.string().min(1),
+  // VA-409: optional structured attribution block. Present → numeric
+  // verdict path. Absent → QUALITATIVE.
+  attribution: PredictedEffectAttributionSchema.optional(),
 });
 
 /**
@@ -484,6 +552,18 @@ const PredictedEffectSchema = z.object({
  * promotions without re-running the LLM.
  */
 export const RUNWAY_META_THEME_KEY_MARKER = "runway-meta-theme-key";
+
+/**
+ * VA-409: machine-readable marker carrying the full `predicted_effect`
+ * JSON blob. Stamped into every promoted runway-repo issue body
+ * alongside the theme-key marker so the next Weekly Review's
+ * attribution loop can read the prediction back without trying to
+ * parse the human-readable markdown body. Falls back to a markdown
+ * regex parse for legacy issues that predate the marker (see
+ * `parsePredictedEffectFromBody` in `src/meta/attribution.ts`).
+ */
+export const RUNWAY_META_PREDICTED_EFFECT_MARKER =
+  "runway-meta-predicted-effect";
 
 const PromotionSchema = z.object({
   // The promoter's stable theme key, echoed back in the parsed payload.
@@ -545,6 +625,72 @@ const RecurringThemeSchema = z.object({
   corroboration_count: z.number().int().min(1),
 });
 
+/**
+ * VA-409: the alphabet of verdicts the attribution loop emits per
+ * shipped promotion. The first four are the AC-named numeric branches;
+ * `QUALITATIVE` is the catch-all for predictions without a structured
+ * attribution block (legacy v1.0.0 promotions, or current v1.1.0
+ * promotions where the IRA couldn't name a measurable metric).
+ *
+ * Verdict semantics, with `observed` the post-ship aggregate value and
+ * `attribution.threshold_value` the prediction:
+ *   - `HELD` — observed met or exceeded the threshold in the predicted
+ *     direction.
+ *   - `PARTIAL` — observed moved past `baseline_value` toward
+ *     `threshold_value` but didn't reach it.
+ *   - `MISSED` — observed didn't move, or moved in the wrong direction.
+ *   - `PENDING` — fewer post-ship runs than the prediction's declared
+ *     `min_sample_size`; verdict is "not enough data yet" and the next
+ *     Weekly Review re-grades.
+ *   - `QUALITATIVE` — no attribution block to grade against; the IRA
+ *     quotes the observable post-ship evidence and an operator decides.
+ */
+const VerdictSchema = z.enum([
+  "HELD",
+  "PARTIAL",
+  "MISSED",
+  "PENDING",
+  "QUALITATIVE",
+]);
+
+/**
+ * VA-409: post-ship observation alongside a shipped promotion. The
+ * mechanical attribution loop fills `value` + `sample_size` from
+ * VA-399's read-model filtered to runs after the promotion shipped.
+ * `metric` echoes the predicted-effect attribution metric (or `null`
+ * when the verdict is `QUALITATIVE`) so a reader of the *What we
+ * shipped* section sees what was measured.
+ */
+const ObservedMetricSchema = z.object({
+  metric: AttributionMetricSchema.nullable(),
+  value: z.number().nullable(),
+  sample_size: z.number().int().nonnegative(),
+});
+
+/**
+ * VA-409: one shipped promotion row in the *What we shipped* section.
+ * Echoed from the predicted-effect block stamped on the runway-repo
+ * issue body when the promotion was filed; cross-linked back to the
+ * issue identifier + url so the operator can navigate to source.
+ *
+ * The LLM authors `comment` (one sentence — the IRA's qualitative
+ * read on the verdict). Everything else is mechanical: the attribution
+ * loop reads the predicted effect off the issue body, queries the
+ * post-ship metric, computes the verdict, and hands the LLM the
+ * structured row to write narrative around.
+ */
+const ShippedPromotionSchema = z.object({
+  theme_key: z.string().min(1),
+  linear_identifier: z.string().min(1),
+  linear_url: z.string().min(1),
+  linear_title: z.string().min(1),
+  source_meta_review_identifiers: z.array(z.string().min(1)),
+  predicted_effect: PredictedEffectSchema,
+  observed: ObservedMetricSchema,
+  verdict: VerdictSchema,
+  comment: z.string(),
+});
+
 const WeeklyReviewSchema = z.object({
   template_version: z.string(),
   // ISO8601 boundaries of the week. The cron-driven cadence sets the
@@ -570,16 +716,28 @@ const WeeklyReviewSchema = z.object({
   // level so a malformed LLM response can't slip 6+ promotions past.
   promotions: z.array(PromotionSchema).max(5),
   noted_but_not_promoted: z.array(NotedThemeSchema),
+  // VA-409: *What we shipped* section. Each row is one promotion that
+  // moved to Done since the prior Weekly Review, with the mechanical
+  // verdict the attribution loop graded. Default empty so v1.0.0
+  // payloads still parse under v1.1.0.
+  shipped_promotions: z.array(ShippedPromotionSchema).default([]),
 });
 
 export type WeeklyRates = z.infer<typeof WeeklyRatesSchema>;
 export type WeeklyRatesDelta = z.infer<typeof WeeklyRatesDeltaSchema>;
 export type PromotionCategory = z.infer<typeof PromotionCategorySchema>;
+export type AttributionMetric = z.infer<typeof AttributionMetricSchema>;
+export type PredictedEffectAttribution = z.infer<
+  typeof PredictedEffectAttributionSchema
+>;
 export type PredictedEffect = z.infer<typeof PredictedEffectSchema>;
 export type Promotion = z.infer<typeof PromotionSchema>;
 export type NotedThemeReason = z.infer<typeof NotedThemeReasonSchema>;
 export type NotedTheme = z.infer<typeof NotedThemeSchema>;
 export type RecurringTheme = z.infer<typeof RecurringThemeSchema>;
+export type Verdict = z.infer<typeof VerdictSchema>;
+export type ObservedMetric = z.infer<typeof ObservedMetricSchema>;
+export type ShippedPromotion = z.infer<typeof ShippedPromotionSchema>;
 export type WeeklyReview = z.infer<typeof WeeklyReviewSchema>;
 
 export function parseWeeklyReview(

@@ -30,9 +30,25 @@ import {
   type RecurringObservation,
 } from "../promoter.js";
 import {
+  computeVerdict,
+  parsePredictedEffectFromBody,
+  parseSourceMetaReviewIdentifiers,
+} from "../attribution.js";
+import {
+  categoryFromIssueIdentifier,
+  type PostShipMetrics,
+} from "../dashboard-read.js";
+import type { ShippedPromotedQueueEntry } from "../linear-meta.js";
+import {
+  type AttributionMetric,
+  type ObservedMetric,
+  type PredictedEffect,
   type Promotion,
   type Recommendation,
+  RUNWAY_META_PREDICTED_EFFECT_MARKER,
   RUNWAY_META_THEME_KEY_MARKER,
+  type ShippedPromotion,
+  type Verdict,
   WEEKLY_REVIEW_VERSION,
   type WeeklyReview,
 } from "../templates.js";
@@ -91,6 +107,13 @@ export type WeeklyReviewPassOutcome =
        */
       readonly promotionsFiled: number;
       readonly promotionsPlanned: number;
+      /**
+       * VA-409: number of shipped-promotion rows the attribution loop
+       * graded into the *What we shipped* section. Equals the count
+       * of `runway-meta-promoted` issues that completed since the
+       * prior Weekly Review.
+       */
+      readonly shippedPromotionsGraded: number;
     }
   | {
       // VA-408 AC: "exit code is non-zero after retry exhaustion". No
@@ -175,12 +198,26 @@ export const runWeeklyReviewPass = (
       outOfScopeEntries: ctx.outOfScopeEntries,
     });
 
+    // VA-409: attribution loop. For each shipped promotion in the
+    // window, parse its predicted effect off the issue body and grade
+    // it against post-ship metrics. The result is a structured array
+    // the LLM echoes into `shipped_promotions` in its output — the
+    // LLM authors the one-sentence comment but the verdict itself is
+    // computed deterministically. Done sequentially: one
+    // `loadPostShipMetrics` query per shipped issue, bounded by
+    // category × cutoff. At most ~5 shipped per week so the latency
+    // is dwarfed by the LLM call.
+    const shippedComputed = yield* computeShippedPromotionVerdicts(
+      ctx.shippedPromotions,
+      deps.dashboardRead,
+    );
+
     // 4) Call the LLM with the structured Weekly Review prompt.
     const llmResult = yield* callWeeklyReview({
       apiKey: deps.anthropicApiKey,
       model: deps.metaWeeklyModel,
       systemPrompt: SYSTEM_PROMPT,
-      userPrompt: composeUserPrompt(args, ctx, promoterOutput),
+      userPrompt: composeUserPrompt(args, ctx, promoterOutput, shippedComputed),
     }).pipe(Effect.either);
     if (llmResult._tag === "Left") {
       // VA-408: retry exhaustion → loud failure. No stub, no row.
@@ -210,12 +247,23 @@ export const runWeeklyReviewPass = (
       sourceUrlMap,
     );
 
+    // VA-409: reconcile the LLM's `shipped_promotions` array with the
+    // mechanically-computed verdicts. The IRA authors the per-row
+    // `comment` (one sentence) but the verdict / observed value /
+    // sample size are deterministic — we overwrite those fields so a
+    // hallucinated verdict can't mislead the operator. Shipped rows
+    // the LLM missed get a fallback comment from `computeVerdict`.
+    const finalReport = reconcileShippedPromotions(
+      parsed.report,
+      shippedComputed,
+    );
+
     // 6) Weekly Review issue in runway-meta with provenance disclaimer
     //    + cross-links to the filed promotions.
     const weeklyIssueResult = yield* deps.metaLinear
       .createWeeklyReviewIssue({
         title: `Weekly Review: ${shortWindowLabel(args)}`,
-        body: renderWeeklyReviewMarkdown(parsed.report, args, filings),
+        body: renderWeeklyReviewMarkdown(finalReport, args, filings),
       })
       .pipe(Effect.either);
     if (weeklyIssueResult._tag === "Left") {
@@ -239,7 +287,7 @@ export const runWeeklyReviewPass = (
       drainId: null,
       issueId: null,
       contentJson: JSON.stringify({
-        review: parsed.report,
+        review: finalReport,
         linear_identifier: weeklyIssueResult.right.identifier,
         linear_url: weeklyIssueResult.right.url,
         promotion_filings: filings.map((f) => ({
@@ -265,7 +313,8 @@ export const runWeeklyReviewPass = (
       linearIdentifier: weeklyIssueResult.right.identifier,
       linearUrl: weeklyIssueResult.right.url,
       promotionsFiled: filings.filter((f) => f.identifier !== null).length,
-      promotionsPlanned: parsed.report.promotions.length,
+      promotionsPlanned: finalReport.promotions.length,
+      shippedPromotionsGraded: finalReport.shipped_promotions.length,
     };
   });
 
@@ -332,6 +381,170 @@ const fileEachPromotion = (
     }
     return results;
   });
+
+// ---------------------------------------------------------------------------
+// VA-409: attribution loop — shipped promotion verdict computation
+// ---------------------------------------------------------------------------
+
+/**
+ * Shape the pre-LLM attribution computation produces, one per shipped
+ * `runway-meta-promoted` issue. Carries the parsed predicted effect
+ * (or null when the issue body had no readable shape), the observed
+ * post-ship metric value, the mechanical verdict, and a default
+ * comment. The LLM may overwrite `comment` only; the other fields
+ * are reconciled back from this struct after the LLM parse.
+ */
+interface ComputedShippedPromotion {
+  readonly themeKey: string;
+  readonly linearIdentifier: string;
+  readonly linearUrl: string;
+  readonly linearTitle: string;
+  readonly category: string;
+  readonly sourceMetaReviewIdentifiers: readonly string[];
+  readonly predictedEffect: PredictedEffect | null;
+  readonly observed: ObservedMetric;
+  readonly verdict: Verdict;
+  readonly defaultComment: string;
+}
+
+const computeShippedPromotionVerdicts = (
+  shipped: readonly ShippedPromotedQueueEntry[],
+  dashboardRead: MetaDashboardRead,
+): Effect.Effect<readonly ComputedShippedPromotion[], never, never> =>
+  Effect.gen(function* () {
+    const results: ComputedShippedPromotion[] = [];
+    for (const entry of shipped) {
+      const predictedEffect = parsePredictedEffectFromBody(entry.body);
+      const category = categoryFromIssueIdentifier(entry.identifier);
+      const sourceIds = parseSourceMetaReviewIdentifiers(entry.body);
+
+      if (predictedEffect === null) {
+        // Pre-VA-409 issue with no readable predicted-effect surface,
+        // or a hand-edited body. Render a QUALITATIVE row so the
+        // operator sees the shipped issue and can audit it manually.
+        results.push({
+          themeKey: entry.themeKey ?? `unknown:${entry.identifier}`,
+          linearIdentifier: entry.identifier,
+          linearUrl: entry.url,
+          linearTitle: entry.title,
+          category,
+          sourceMetaReviewIdentifiers: sourceIds,
+          predictedEffect: null,
+          observed: { metric: null, value: null, sample_size: 0 },
+          verdict: "QUALITATIVE",
+          defaultComment:
+            "QUALITATIVE — operator review needed. No parseable predicted effect on the runway-repo issue body.",
+        });
+        continue;
+      }
+
+      // Query the post-ship metric. If the prediction has no
+      // attribution block, `metricToRead` is null and the verdict
+      // path immediately resolves to QUALITATIVE without touching
+      // the dashboard.
+      const metricToRead = predictedEffect.attribution?.metric ?? null;
+      let observedValue: number | null = null;
+      let sampleSize = 0;
+      if (metricToRead !== null) {
+        const metricsResult = yield* dashboardRead
+          .loadPostShipMetrics(category, entry.completedAt)
+          .pipe(Effect.either);
+        if (metricsResult._tag === "Right" && metricsResult.right !== null) {
+          observedValue = readMetric(metricsResult.right, metricToRead);
+          sampleSize = metricsResult.right.sampleSize;
+        }
+        // Left → degraded read; observedValue / sampleSize stay
+        // null/0 and the verdict falls to PENDING. Conservative: the
+        // operator still sees the row, the loop re-grades next week.
+      }
+
+      const verdict = computeVerdict({
+        predictedEffect,
+        observedValue,
+        observedSampleSize: sampleSize,
+      });
+      results.push({
+        themeKey: entry.themeKey ?? `unknown:${entry.identifier}`,
+        linearIdentifier: entry.identifier,
+        linearUrl: entry.url,
+        linearTitle: entry.title,
+        category,
+        sourceMetaReviewIdentifiers: sourceIds,
+        predictedEffect,
+        observed: {
+          metric: metricToRead,
+          value: verdict.observedValue,
+          sample_size: sampleSize,
+        },
+        verdict: verdict.verdict,
+        defaultComment: verdict.comment,
+      });
+    }
+    return results;
+  });
+
+const readMetric = (
+  metrics: PostShipMetrics,
+  name: AttributionMetric,
+): number | null => {
+  switch (name) {
+    case "median_iteration_count":
+      return metrics.medianIterationCount;
+    case "p95_iteration_count":
+      return metrics.p95IterationCount;
+    case "median_wall_time_ms":
+      return metrics.medianWallTimeMs;
+    case "p95_wall_time_ms":
+      return metrics.p95WallTimeMs;
+    case "reviewer_rejection_rate":
+      return metrics.reviewerRejectionRate;
+    case "revert_rate":
+      return metrics.revertRate;
+    case "hitl_escape_rate":
+      return metrics.hitlEscapeRate;
+    case "infra_error_rate":
+      return metrics.infraErrorRate;
+  }
+};
+
+/**
+ * VA-409: reconcile the LLM-emitted `shipped_promotions` array with
+ * the mechanically-computed verdicts. The IRA may author one
+ * `comment` per row (a single sentence narrating the verdict); every
+ * other field is overwritten from `shippedComputed` so a hallucinated
+ * verdict doesn't reach the operator. Rows the LLM omitted are
+ * appended with their default comment so all shipped issues land in
+ * the *What we shipped* section.
+ */
+const reconcileShippedPromotions = (
+  llmReport: WeeklyReview,
+  shippedComputed: readonly ComputedShippedPromotion[],
+): WeeklyReview => {
+  const llmCommentByKey = new Map<string, string>();
+  // Defensive against a parsed report whose schema parser didn't run
+  // — `.default([])` ensures the field is always an array post-parse,
+  // but tests sometimes hand in raw fixtures that bypass the schema.
+  const fromLlm = llmReport.shipped_promotions ?? [];
+  for (const row of fromLlm) {
+    if (row.comment.length > 0) llmCommentByKey.set(row.theme_key, row.comment);
+  }
+  const reconciled: ShippedPromotion[] = shippedComputed.map((c) => ({
+    theme_key: c.themeKey,
+    linear_identifier: c.linearIdentifier,
+    linear_url: c.linearUrl,
+    linear_title: c.linearTitle,
+    source_meta_review_identifiers: [...c.sourceMetaReviewIdentifiers],
+    predicted_effect: c.predictedEffect ?? {
+      claim: "(no readable predicted effect)",
+      min_sample_size: 1,
+      sample_description: "—",
+    },
+    observed: c.observed,
+    verdict: c.verdict,
+    comment: llmCommentByKey.get(c.themeKey) ?? c.defaultComment,
+  }));
+  return { ...llmReport, shipped_promotions: reconciled };
+};
 
 // ---------------------------------------------------------------------------
 // Recommendation extraction from raw meta_reviews rows
@@ -475,19 +688,31 @@ const SYSTEM_PROMPT = [
   "(a configurable time window — defaults to the trailing 7 days) of",
   "Run Reviews and Drain Reviews.",
   "",
-  "Your job has three parts, in priority order:",
+  "Your job has four parts, in priority order:",
   "  1. Summarize the week. Throughput, success rate, HITL escape rate,",
   "     revert rate, infra-error rate. Compare against the prior week's",
   "     Weekly Review if one exists.",
-  "  2. Write the *Promotions to runway-repo* block. The promoter (a",
+  "  2. Grade the *What we shipped* section (attribution loop). The pass",
+  "     pre-computed each shipped promotion's verdict deterministically",
+  "     (HELD / PARTIAL / MISSED / PENDING / QUALITATIVE) by reading the",
+  "     predicted effect off the runway-repo issue body and querying the",
+  "     dashboard read-model for post-ship metrics. Your job is to echo",
+  "     each shipped row VERBATIM (theme_key, linear_identifier,",
+  "     linear_url, linear_title, source_meta_review_identifiers,",
+  "     predicted_effect, observed, verdict) and author the one-sentence",
+  "     `comment` — what the verdict means in plain language. Do NOT",
+  "     change the verdict, observed value, or sample size.",
+  "  3. Write the *Promotions to runway-repo* block. The promoter (a",
   "     deterministic algorithm running BEFORE you) has already filtered",
   "     and ranked the candidate themes — you receive a pre-computed",
   "     top-N list. Your job is to write the QUALITATIVE surfaces per",
   "     promotion: a shippable title, a runway-spec-quality change spec,",
   "     concrete acceptance criteria, and a FALSIFIABLE predicted effect",
   "     with an explicit minimum sample size (e.g. n=10 post-ship runs",
-  "     of refactor-class issues).",
-  "  3. Write the *Noted but not promoted* block. The promoter has",
+  "     of refactor-class issues). When the prediction can be tied to a",
+  "     specific dashboard read-model metric, include the structured",
+  "     `attribution` block so the next Weekly Review can grade it.",
+  "  4. Write the *Noted but not promoted* block. The promoter has",
   "     pre-classified entries by reason (`budget-cap`,",
   "     `deferred-open-promotion`, `out-of-scope`). Echo each with a",
   "     one-line summary; you may add `low-confidence` reason entries",
@@ -500,9 +725,9 @@ const SYSTEM_PROMPT = [
   "short preamble before the fence, but nothing after the closing",
   "fence.",
   "",
-  "Schema (template_version 1.0.0):",
+  "Schema (template_version 1.1.0):",
   "  {",
-  '    "template_version": "1.0.0",',
+  '    "template_version": "1.1.0",',
   '    "time_window": { "start_iso": "<echo>", "end_iso": "<echo>" },',
   '    "rates": { "throughput": <n>, "success_pct": <0-100>,',
   '               "hitl_pct": <0-100>, "revert_pct": <0-100>,',
@@ -518,10 +743,13 @@ const SYSTEM_PROMPT = [
   "           recommendation_confidence verbatim from the promoter",
   "           input; YOU author title, category, change_spec,",
   "           acceptance_criteria, source_meta_review_identifiers,",
-  "           predicted_effect */ } ],",
+  "           predicted_effect (optional attribution block inside) */ } ],",
   '    "noted_but_not_promoted": [',
   "      { /* echo theme_key, target, corroboration_count, reason,",
-  "           deferred_behind verbatim; you author description */ } ]",
+  "           deferred_behind verbatim; you author description */ } ],",
+  '    "shipped_promotions": [',
+  "      { /* echo every field from the attribution-loop pre-computed",
+  "           row verbatim; YOU author the one-sentence `comment` */ } ]",
   "  }",
   "",
   "Hard cap: `promotions` has at most 5 entries. The promoter pre-filtered",
@@ -533,26 +761,59 @@ const SYSTEM_PROMPT = [
   "  - A minimum sample size (integer > 0).",
   "  - A sample description (what kind of runs count toward the n=X).",
   "If you can't write a falsifiable claim for a promotion candidate, move",
-  "it to `noted_but_not_promoted` with `reason: low-confidence`. The",
-  "attribution loop reads these blocks to grade HELD / PARTIAL / MISSED",
-  "after the change ships — vague claims defeat the whole loop.",
+  "it to `noted_but_not_promoted` with `reason: low-confidence`. When the",
+  "prediction CAN be tied to a measurable VA-399 metric, add an",
+  "`attribution` block: { metric, baseline_value, direction, threshold_value }.",
+  "  - metric: one of {median_iteration_count, p95_iteration_count,",
+  "    median_wall_time_ms, p95_wall_time_ms, reviewer_rejection_rate,",
+  "    revert_rate, hitl_escape_rate, infra_error_rate}.",
+  "  - direction: 'decrease' or 'increase' — which way is improvement.",
+  "  - baseline_value: current rolling-norms value (cite the norms",
+  "    section when available).",
+  "  - threshold_value: the post-ship value the prediction needs to",
+  "    reach to count as HELD.",
+  "The attribution block makes the next Weekly Review's *What we shipped*",
+  "verdict mechanical; without it the verdict falls to QUALITATIVE and",
+  "an operator has to read the post-ship narrative themselves.",
 ].join("\n");
 
 const composeUserPrompt = (
   args: WeeklyReviewPassArgs,
   ctx: WeeklyReviewContext,
   promoter: PromoterOutput,
+  shipped: readonly ComputedShippedPromotion[],
 ): string => {
   const lines: string[] = [];
   lines.push(`Window: ${args.startIso} → ${args.endIso}`);
   lines.push(
-    `Counts: ${ctx.runReviews.length} run reviews, ${ctx.drainReviews.length} drain reviews, ${ctx.priorWeeklyReviews.length} prior weekly reviews`,
+    `Counts: ${ctx.runReviews.length} run reviews, ${ctx.drainReviews.length} drain reviews, ${ctx.priorWeeklyReviews.length} prior weekly reviews, ${shipped.length} shipped promotions`,
   );
   if (ctx.degradedSources.outOfScope) {
     lines.push(`Degraded: ${ctx.degradedSources.outOfScope}`);
   }
   if (ctx.degradedSources.openPromotedQueue) {
     lines.push(`Degraded: ${ctx.degradedSources.openPromotedQueue}`);
+  }
+  if (ctx.degradedSources.shippedPromotions) {
+    lines.push(`Degraded: ${ctx.degradedSources.shippedPromotions}`);
+  }
+  lines.push("");
+
+  // VA-409: pre-graded shipped promotions. The IRA echoes these into
+  // `shipped_promotions` and authors the per-row `comment` only — the
+  // verdict / observed / sample_size fields are mechanically computed
+  // and will be overwritten with the values below if the IRA tries to
+  // change them.
+  lines.push("# Attribution loop — shipped promotions to grade in the *What we shipped* section");
+  lines.push("");
+  if (shipped.length === 0) {
+    lines.push(
+      "(none — no runway-meta-promoted issues completed since the prior Weekly Review, OR no prior Weekly Review exists yet)",
+    );
+  } else {
+    for (const s of shipped) {
+      lines.push(renderShippedForPrompt(s));
+    }
   }
   lines.push("");
 
@@ -652,6 +913,26 @@ const renderRecurringForPrompt = (o: RecurringObservation): string =>
     `  description: ${o.representativeChange}`,
   ].join("\n");
 
+const renderShippedForPrompt = (s: ComputedShippedPromotion): string => {
+  const pe = s.predictedEffect;
+  const peSummary = pe
+    ? pe.attribution
+      ? `${pe.claim}  [metric=${pe.attribution.metric}, baseline=${pe.attribution.baseline_value}, ${pe.attribution.direction} to threshold=${pe.attribution.threshold_value}, n≥${pe.min_sample_size}]`
+      : `${pe.claim}  [qualitative, n≥${pe.min_sample_size} ${pe.sample_description}]`
+    : "(no parseable predicted effect on issue body)";
+  return [
+    `- theme_key: ${s.themeKey}`,
+    `  linear_identifier: ${s.linearIdentifier}`,
+    `  linear_url: ${s.linearUrl}`,
+    `  linear_title: ${s.linearTitle}`,
+    `  source_meta_review_identifiers: ${JSON.stringify(s.sourceMetaReviewIdentifiers)}`,
+    `  predicted_effect: ${peSummary}`,
+    `  observed: metric=${s.observed.metric ?? "null"}, value=${s.observed.value ?? "null"}, sample_size=${s.observed.sample_size}`,
+    `  verdict: ${s.verdict}  (computed mechanically — echo verbatim; you author the one-sentence comment)`,
+    `  default_comment: ${s.defaultComment}`,
+  ].join("\n");
+};
+
 const renderRowForPrompt = (row: WindowedMetaRow): string => {
   // Compact projection — the prompt can balloon fast with N rows
   // × full content_json. Show id + kind + drain + truncated body.
@@ -699,6 +980,17 @@ const renderWeeklyReviewMarkdown = (
     }
     lines.push("");
   }
+  // VA-409: *What we shipped* — attribution-loop verdicts for every
+  // promoted runway-repo issue that completed since the prior weekly.
+  // Empty section omitted entirely (first weekly / quiet week).
+  if (review.shipped_promotions.length > 0) {
+    lines.push("## What we shipped");
+    lines.push("");
+    for (const s of review.shipped_promotions) {
+      lines.push(renderShippedPromotion(s));
+      lines.push("");
+    }
+  }
   lines.push("## Promotions to runway-repo");
   lines.push("");
   if (review.promotions.length === 0) {
@@ -741,6 +1033,40 @@ const renderWeeklyReviewMarkdown = (
   return lines.join("\n");
 };
 
+const renderShippedPromotion = (s: ShippedPromotion): string => {
+  const lines: string[] = [];
+  lines.push(`### ${s.linear_title} — [${s.linear_identifier}](${s.linear_url}) — \`${s.verdict}\``);
+  lines.push("");
+  if (s.source_meta_review_identifiers.length > 0) {
+    lines.push(
+      `**Source meta-reviews**: ${s.source_meta_review_identifiers.join(", ")}`,
+    );
+    lines.push("");
+  }
+  // Predicted line — claim + optional structured attribution.
+  const pe = s.predicted_effect;
+  lines.push(`**Predicted**: ${pe.claim}`);
+  if (pe.attribution) {
+    lines.push(
+      `> ${pe.attribution.metric} ${pe.attribution.direction === "decrease" ? "≤" : "≥"} ${pe.attribution.threshold_value} (baseline ${pe.attribution.baseline_value}, n ≥ ${pe.min_sample_size} ${pe.sample_description})`,
+    );
+  } else {
+    lines.push(`> n ≥ ${pe.min_sample_size} ${pe.sample_description}`);
+  }
+  lines.push("");
+  // Observed line — null/null/0 when no metric to report.
+  if (s.observed.value !== null && s.observed.metric !== null) {
+    lines.push(
+      `**Observed**: ${s.observed.metric} = ${s.observed.value} (n=${s.observed.sample_size} post-ship runs)`,
+    );
+  } else {
+    lines.push(`**Observed**: — (n=${s.observed.sample_size})`);
+  }
+  lines.push("");
+  lines.push(`**Verdict comment**: ${s.comment}`);
+  return lines.join("\n");
+};
+
 const renderRatesTable = (review: WeeklyReview): string => {
   const r = review.rates;
   const d = review.rates_delta_vs_prior_week;
@@ -766,6 +1092,15 @@ const renderPromotionMarkdown = (
   // VA-408: the next Weekly Review's queue-defer pass reads this to
   // skip themes that already have an open promoted issue.
   lines.push(`<!-- ${RUNWAY_META_THEME_KEY_MARKER}: ${p.theme_key} -->`);
+  // VA-409: predicted-effect marker — the attribution loop reads this
+  // back when grading shipped promotions. Carries the full structured
+  // block (claim + min_sample_size + sample_description + optional
+  // attribution). A v1.0.0-style promotion (no attribution) still
+  // stamps the marker so the markdown-fallback path is the last
+  // resort, not the first.
+  lines.push(
+    `<!-- ${RUNWAY_META_PREDICTED_EFFECT_MARKER}: ${JSON.stringify(p.predicted_effect)} -->`,
+  );
   lines.push("");
   lines.push(`**Target taxonomy**: \`${p.target}\``);
   lines.push(`**Category**: \`${p.category}\``);
@@ -824,9 +1159,13 @@ export const __testing = {
   SYSTEM_PROMPT,
   composeUserPrompt,
   buildSourceUrlMap,
+  computeShippedPromotionVerdicts,
   extractRecommendationSources,
   parseRunReviewContentJson,
+  readMetric,
+  reconcileShippedPromotions,
   renderPromotionMarkdown,
+  renderShippedPromotion,
   renderWeeklyReviewMarkdown,
   shortWindowLabel,
 };

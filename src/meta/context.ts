@@ -19,6 +19,7 @@ import type {
   MetaLinearError,
   MetaLinearGateway,
   OpenPromotedQueueEntry,
+  ShippedPromotedQueueEntry,
 } from "./linear-meta.js";
 import {
   loadOutOfScopeEntries,
@@ -181,6 +182,14 @@ export interface WeeklyReviewContext {
   readonly outOfScopeEntries: readonly OutOfScopeEntry[];
   readonly openPromotedQueue: readonly OpenPromotedQueueEntry[];
   /**
+   * VA-409: promoted runway-repo issues that moved to a `completed`
+   * Linear state since the cutoff (the prior Weekly Review's
+   * `created_at`, or the window start when no prior weekly exists).
+   * Best-effort load: a Linear-side failure degrades to an empty
+   * array with the error preserved in `degradedSources`.
+   */
+  readonly shippedPromotions: readonly ShippedPromotedQueueEntry[];
+  /**
    * Per-source error reporting — when a degraded load happened the
    * pass logs which source produced the empty array. Null means the
    * source loaded cleanly. The IRA's prompt can call out the gap so
@@ -190,6 +199,7 @@ export interface WeeklyReviewContext {
   readonly degradedSources: {
     readonly outOfScope: string | null;
     readonly openPromotedQueue: string | null;
+    readonly shippedPromotions: string | null;
   };
 }
 
@@ -234,11 +244,17 @@ const loadWeeklyReviewContext = (
   Effect.gen(function* () {
     const priorWeeklyLimit =
       args.priorWeeklyLimit ?? DEFAULT_PRIOR_WEEKLY_LIMIT;
-    // VA-408: five reads in parallel — three dashboard-SQLite, one
-    // FS, one Linear. SQLite is single-threaded but the Effect
+    // VA-408 + VA-409: six reads in parallel — three dashboard-SQLite,
+    // one FS, two Linear. SQLite is single-threaded but the Effect
     // scheduler runs the async wrappers concurrently. FS + Linear
-    // are best-effort: a failure degrades to an empty array with the
-    // error message preserved in `degradedSources`.
+    // sources are best-effort: a failure degrades to an empty array
+    // with the error message preserved in `degradedSources`. The
+    // shipped-promotion cutoff is computed AFTER prior weekly reviews
+    // resolve, but the Linear query itself can run concurrently using
+    // the window start as a pessimistic cutoff and then the loop
+    // filters to the actual prior-weekly cutoff. Simpler: just sequence
+    // the shipped query after the prior weekly read — the Linear RTT
+    // is ~150ms, dwarfed by the LLM call that follows.
     const [
       runReviews,
       drainReviews,
@@ -259,6 +275,31 @@ const loadWeeklyReviewContext = (
       outOfScopeResult._tag === "Right" ? outOfScopeResult.right : [];
     const openPromotedQueue =
       openQueueResult._tag === "Right" ? openQueueResult.right : [];
+
+    // VA-409: cutoff for "since the prior Weekly Review". When no
+    // prior weekly exists (fresh workspace / first weekly run), we
+    // skip the attribution loop entirely — there's no "since" baseline
+    // and the first weekly's role is to establish ground truth, not
+    // to grade. A null shippedResult means "no prior weekly", distinct
+    // from "Linear errored" so the prompt can render the right message.
+    const shippedCutoffIso = priorWeekly[0]?.createdAt ?? null;
+    const shippedResult =
+      shippedCutoffIso !== null
+        ? yield* args.metaLinear
+            .listShippedPromotionsSince(shippedCutoffIso)
+            .pipe(Effect.either)
+        : null;
+    const shippedPromotions: readonly ShippedPromotedQueueEntry[] =
+      shippedResult === null
+        ? []
+        : shippedResult._tag === "Right"
+          ? shippedResult.right
+          : [];
+    const shippedPromotionsDegraded =
+      shippedResult !== null && shippedResult._tag === "Left"
+        ? formatDegradedError("shippedPromotions", shippedResult.left)
+        : null;
+
     return {
       startIso: args.startIso,
       endIso: args.endIso,
@@ -267,6 +308,7 @@ const loadWeeklyReviewContext = (
       priorWeeklyReviews: priorWeekly,
       outOfScopeEntries,
       openPromotedQueue,
+      shippedPromotions,
       degradedSources: {
         outOfScope:
           outOfScopeResult._tag === "Left"
@@ -276,6 +318,7 @@ const loadWeeklyReviewContext = (
           openQueueResult._tag === "Left"
             ? formatDegradedError("openPromotedQueue", openQueueResult.left)
             : null,
+        shippedPromotions: shippedPromotionsDegraded,
       },
     } satisfies WeeklyReviewContext;
   });
