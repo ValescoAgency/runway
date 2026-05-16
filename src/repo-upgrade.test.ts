@@ -10,10 +10,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TEMPLATES_DIR } from "./scaffolder.js";
 import { writeShim } from "./scaffolder-varlock.js";
-import { parseOpRefs } from "./repo-upgrade.js";
+import {
+  composeAndApplyScaffoldChanges,
+  parseOpRefs,
+} from "./repo-upgrade.js";
 
 // `varlock` invokes 1Password via a `<execName>("op read ...")` DSL.
 // Constructed at runtime so the literal substring doesn't trip
@@ -173,5 +176,150 @@ describe("writeShim (VA-426 — runway upgrade-repo claude-shim deployment)", ()
     writeShim(tmpDir);
     const mode = statSync(shimPath).mode & 0o777;
     expect(mode & 0o100).toBeTruthy();
+  });
+});
+
+// VA-426 composition coverage. The writeShim tests above prove the
+// helper works in isolation, but they don't catch a regression where
+// upgradeRepo's composition forgets the shim — for example dropping
+// `shimChange` from the changes array, accidentally routing through
+// `writeFileSync` (which loses the 0755 mode), or skipping the call
+// on tier 2. These tests drive the real composition seam
+// (`composeAndApplyScaffoldChanges`) against an in-tmpdir tier-2
+// fixture so a future refactor breaks loudly here.
+//
+// The seam intentionally excludes `preflight`, `buildAgentImage`, and
+// `verify` so the test doesn't need a real git repo / docker daemon /
+// `op` / `gh` to run — those phases are exercised by the bedrock
+// smoke-test recorded on the VA-426 PR.
+describe("composeAndApplyScaffoldChanges (VA-426 — tier-2 composition)", () => {
+  let tmpDir: string;
+  let exitSpy: ReturnType<typeof vi.spyOn>;
+
+  // The `varlock` shell-call DSL — split at runtime so the literal
+  // doesn't trip our own secret-pattern grep checks.
+  const E = "exec";
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "runway-upgrade-compose-"));
+    mkdirSync(join(tmpDir, ".sandcastle"), { recursive: true });
+
+    // Stale Dockerfile mimicking what a pre-0.11.0 tier-2 scaffold
+    // would have written: inline `varlock run` shim block, no COPY of
+    // a vendored shim, no shim file alongside.
+    writeFileSync(
+      join(tmpDir, ".sandcastle", "Dockerfile"),
+      [
+        "FROM node:22-bookworm",
+        "WORKDIR /home/agent",
+        "RUN mv /home/agent/.local/bin/claude /home/agent/.local/bin/claude.real \\",
+        "  && printf '%s\\n' \\",
+        "       '#!/usr/bin/env bash' \\",
+        "       \"exec varlock run --env-file /home/agent/workspace/.env.schema -- /home/agent/.local/bin/claude.real \\\"\\$@\\\"\" \\",
+        "       > /home/agent/.local/bin/claude",
+        'ENTRYPOINT ["sleep", "infinity"]',
+      ].join("\n"),
+    );
+
+    // Stale tier-2 .env.schema: API_KEY auth, op:// refs in place,
+    // no RUNWAY_SIGNING_* block yet.
+    writeFileSync(
+      join(tmpDir, ".env.schema"),
+      [
+        "# header comment",
+        "",
+        "# @sensitive @required",
+        `ANTHROPIC_API_KEY=${E}('op read "op://test-vault/anthropic-api-key/credential"')`,
+        "",
+        "# @sensitive @required",
+        `GH_TOKEN=${E}('op read "op://test-vault/gh-token/credential"')`,
+        "",
+      ].join("\n"),
+    );
+
+    // `composeAndApplyScaffoldChanges` calls `process.exit(0|1)` on the
+    // no-op and --check-drift paths. In production this halts the
+    // process; in tests we throw a sentinel so the function returns
+    // control without falling through to the write loop. Returning
+    // undefined here would let execution continue past the early-exit
+    // and silently invalidate the "didn't write anything on --check"
+    // contract.
+    exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`__process_exit__(${code})`);
+    }) as never);
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+    exitSpy.mockRestore();
+  });
+
+  const baseOpts = {
+    check: false,
+    skipBuild: true,
+    allowDirty: true,
+    force: true,
+  } as const;
+
+  it("writes Dockerfile + .env.schema + runway-claude-shim on a pre-0.11.0 tier-2 fixture", async () => {
+    const resolved = await composeAndApplyScaffoldChanges(tmpDir, 2, baseOpts);
+
+    // resolved op refs propagate from the existing .env.schema
+    expect(resolved).not.toBeNull();
+    expect(resolved?.opVault).toBe("test-vault");
+    expect(resolved?.anthropicItem).toBe("anthropic-api-key");
+    expect(resolved?.ghTokenItem).toBe("gh-token");
+    expect(resolved?.authMode).toBe("api-key");
+
+    // Dockerfile rewritten with the post-VA-413 COPY pattern
+    const dockerfile = readFileSync(
+      join(tmpDir, ".sandcastle", "Dockerfile"),
+      "utf8",
+    );
+    expect(dockerfile).toContain("COPY runway-claude-shim");
+    expect(dockerfile).toContain("FROM node:24-bookworm");
+
+    // .env.schema picks up the signing opt-in block
+    const schema = readFileSync(join(tmpDir, ".env.schema"), "utf8");
+    expect(schema).toContain("RUNWAY_SIGNING_SSH_PRIVKEY");
+
+    // Shim file materialised, 0755, byte-for-byte from the template
+    const shimPath = join(tmpDir, ".sandcastle", "runway-claude-shim");
+    expect(existsSync(shimPath)).toBe(true);
+    const shimMode = statSync(shimPath).mode & 0o777;
+    expect(shimMode & 0o100).toBeTruthy();
+    const expectedShim = readFileSync(
+      join(TEMPLATES_DIR, "claude-shim.sh"),
+      "utf8",
+    );
+    expect(readFileSync(shimPath, "utf8")).toBe(expectedShim);
+  });
+
+  it("reports missing-shim drift on --check and exits 1 without writing", async () => {
+    const shimPath = join(tmpDir, ".sandcastle", "runway-claude-shim");
+    expect(existsSync(shimPath)).toBe(false);
+
+    await expect(
+      composeAndApplyScaffoldChanges(tmpDir, 2, { ...baseOpts, check: true }),
+    ).rejects.toThrow(/__process_exit__\(1\)/);
+
+    // --check exits with code 1 and writes nothing.
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(existsSync(shimPath)).toBe(false);
+  });
+
+  it("reports already-up-to-date and exits 0 when every scaffold file matches the template", async () => {
+    // First pass: write everything from templates so the second pass
+    // sees no drift. The first pass itself doesn't trigger
+    // process.exit (changes exist, opts.check is false, write path
+    // runs to completion and returns naturally).
+    await composeAndApplyScaffoldChanges(tmpDir, 2, baseOpts);
+    exitSpy.mockClear();
+
+    await expect(
+      composeAndApplyScaffoldChanges(tmpDir, 2, baseOpts),
+    ).rejects.toThrow(/__process_exit__\(0\)/);
+
+    expect(exitSpy).toHaveBeenCalledWith(0);
   });
 });

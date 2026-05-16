@@ -338,37 +338,23 @@ function diffStat(
 // ---------------------------------------------------------------------------
 
 /**
- * Re-render `.sandcastle/Dockerfile` (and tier-2 `.env.schema`) from
- * the current vendored templates, preserving user-set values like
- * the op:// vault and item names. Composes the scaffolder's
- * preflight/build/verify phases around the template re-render.
+ * The composition core of `upgradeRepo` — render every scaffold file
+ * from the current vendored templates, exit early on `--check` drift,
+ * and write the resulting changes to disk. Excludes `preflight`,
+ * `buildAgentImage`, and `verify` so tests can drive this against a
+ * tmpDir without needing a real git repo / docker daemon / `op` /
+ * `gh` (VA-426 regression coverage). Production callers go through
+ * `upgradeRepo`, which sandwiches this between those phases.
  *
- * Exits the process with code 1 if `--check` is set and drift was
- * detected (so CI can gate on it); exits 0 on a clean no-op.
+ * Returns the resolved op:// refs on tier 2 (consumed by the outer
+ * verify step), or null on tier 1. May call `process.exit(0|1)` —
+ * mirrors the existing CLI behaviour.
  */
-export async function upgradeRepo(
+export async function composeAndApplyScaffoldChanges(
   cwd: string,
+  tier: 1 | 2,
   opts: RepoUpgradeOptions,
-): Promise<void> {
-  const tier = detectTier(cwd);
-  console.log(`[runway upgrade-repo] detected tier ${tier}`);
-
-  // --check shouldn't refuse on a dirty tree — drift detection is read-only.
-  const allowDirty = opts.check ? true : opts.allowDirty;
-
-  // Preflight uses the scaffolder's helper; satisfy its ScaffolderOptions shape.
-  const preflightOpts: ScaffolderOptions = {
-    tier,
-    allowDirty,
-    force: opts.force,
-    skipBuild: opts.skipBuild,
-    opVault: "placeholder",
-    anthropicItem: "placeholder",
-    ghTokenItem: "placeholder",
-    authMode: "api-key",
-  };
-  await preflight(cwd, preflightOpts);
-
+): Promise<ResolvedOpRefs | null> {
   // Render new file contents in memory.
   // In --check we suppress the manual-edit refusal; drift detection is
   // read-only and the user wants the diff signal, not an exception.
@@ -421,6 +407,44 @@ export async function upgradeRepo(
       console.log(`  ✓ wrote ${c.relPath}`);
     }
   }
+
+  return resolved;
+}
+
+/**
+ * Re-render `.sandcastle/Dockerfile` (and tier-2 `.env.schema` +
+ * `.sandcastle/runway-claude-shim`) from the current vendored
+ * templates, preserving user-set values like the op:// vault and
+ * item names. Composes the scaffolder's preflight/build/verify
+ * phases around the template re-render.
+ *
+ * Exits the process with code 1 if `--check` is set and drift was
+ * detected (so CI can gate on it); exits 0 on a clean no-op.
+ */
+export async function upgradeRepo(
+  cwd: string,
+  opts: RepoUpgradeOptions,
+): Promise<void> {
+  const tier = detectTier(cwd);
+  console.log(`[runway upgrade-repo] detected tier ${tier}`);
+
+  // --check shouldn't refuse on a dirty tree — drift detection is read-only.
+  const allowDirty = opts.check ? true : opts.allowDirty;
+
+  // Preflight uses the scaffolder's helper; satisfy its ScaffolderOptions shape.
+  const preflightOpts: ScaffolderOptions = {
+    tier,
+    allowDirty,
+    force: opts.force,
+    skipBuild: opts.skipBuild,
+    opVault: "placeholder",
+    anthropicItem: "placeholder",
+    ghTokenItem: "placeholder",
+    authMode: "api-key",
+  };
+  await preflight(cwd, preflightOpts);
+
+  const resolved = await composeAndApplyScaffoldChanges(cwd, tier, opts);
 
   if (!opts.skipBuild) {
     await buildAgentImage(cwd);
