@@ -201,8 +201,8 @@ export const RUN_REVIEW_FENCE_TAG = "runway-run-review";
  * VA-402: PRD-spec absolute quality axis. STRONG / ADEQUATE / WEAK /
  * FAILED captures the IRA's view of how well runway performed each
  * dimension on this run. Paired with the VA-405 relative axis
- * (BETTER / STEADY / WORSE vs. recent norms) — each grading section
- * carries both.
+ * (BETTER / STEADY / WORSE vs. recent norms), which lives in the
+ * top-level `<dim>_quality_relative` fields on `RunReviewSchema`.
  */
 const QualityAbsoluteSchema = z.enum([
   "STRONG",
@@ -214,17 +214,18 @@ const QualityAbsoluteSchema = z.enum([
 const QualityRelativeSchema = z.enum(["BETTER", "STEADY", "WORSE"]);
 
 /**
- * Each quality dimension has an absolute axis + a relative axis. The
- * relative slot is populated when the IRA had rolling norms to
- * compare against (v1.2.0+ when norms were wired) and `null`
- * otherwise (v1.1.0 callers, or v1.2.0 runs where the category has
- * no rows in the configured window). Justification is one short
- * sentence — the IRA's reason for the absolute grade; ideally also
- * mentions how the relative grade was derived when populated.
+ * Each quality dimension carries an absolute grade plus a one-sentence
+ * justification. The relative axis (BETTER / STEADY / WORSE) lives in
+ * the named top-level `<dim>_quality_relative` fields per the VA-405
+ * AC — flat field names are easier to surface on the dashboard and
+ * group on for the Weekly Review promoter.
+ *
+ * v1.0.0 / v1.1.0 payloads may include a legacy `relative: null` key
+ * inside this object; zod's default `strip` mode silently drops it so
+ * forward-compat still works.
  */
 const QualitySectionSchema = z.object({
   absolute: QualityAbsoluteSchema,
-  relative: QualityRelativeSchema.nullable(),
   justification: z.string(),
 });
 
@@ -319,12 +320,9 @@ const RunReviewSchema = z.object({
   issue_identifier: z.string().min(1),
   drain_trace_id: z.string().min(1),
   final_outcome: z.string().min(1),
-  // Five quality dimensions per PRD. Each is a QualitySection
-  // (absolute + relative + justification). The nested `relative`
-  // slot was added pre-emptively in VA-402 (so v1.0.0 fixtures
-  // could already carry `null`); VA-405 adds the named top-level
-  // mirrors below so consumers that don't drill into the nested
-  // struct can still find the relative axis.
+  // Five quality dimensions per PRD. The absolute grade lives in
+  // each section (STRONG/ADEQUATE/WEAK/FAILED); the relative grade
+  // lives in the top-level fields below.
   issue_quality: QualitySectionSchema,
   prompt_quality: QualitySectionSchema,
   agent_quality: QualitySectionSchema,
@@ -332,10 +330,10 @@ const RunReviewSchema = z.object({
   orchestration_quality: QualitySectionSchema,
   // VA-405 v1.2.0: top-level relative-axis fields per the AC. Each
   // is a `BETTER | STEADY | WORSE` enum, optional so v1.0.0 / v1.1.0
-  // payloads (which don't emit them) still parse. The IRA emits both
-  // these AND the nested `relative` slot when norms were available
-  // (the two should agree); v1.2.0 consumers should prefer the
-  // top-level fields — they're the contract field names the AC pinned.
+  // payloads (which don't emit them — and may carry a legacy nested
+  // `relative` slot that zod strips silently) still parse. The IRA
+  // populates these when norms were available and omits them when
+  // not (category has < 5 runs in the window, or norms gateway error).
   issue_quality_relative: QualityRelativeSchema.optional(),
   prompt_quality_relative: QualityRelativeSchema.optional(),
   agent_quality_relative: QualityRelativeSchema.optional(),

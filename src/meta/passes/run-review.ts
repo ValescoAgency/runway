@@ -426,11 +426,11 @@ const SYSTEM_PROMPT = [
   "    \"issue_identifier\": \"<echo of input>\",",
   "    \"drain_trace_id\": \"<echo of input>\",",
   "    \"final_outcome\": \"<one of: opened | hitl | reverted | errored | unknown>\",",
-  "    \"issue_quality\":        {\"absolute\": <STRONG|ADEQUATE|WEAK|FAILED>, \"relative\": null|<BETTER|STEADY|WORSE>, \"justification\": \"<1 sentence>\"},",
-  "    \"prompt_quality\":       {\"absolute\": <STRONG|ADEQUATE|WEAK|FAILED>, \"relative\": null|<BETTER|STEADY|WORSE>, \"justification\": \"<1 sentence>\"},",
-  "    \"agent_quality\":        {\"absolute\": <STRONG|ADEQUATE|WEAK|FAILED>, \"relative\": null|<BETTER|STEADY|WORSE>, \"justification\": \"<1 sentence>\"},",
-  "    \"reviewer_quality\":     {\"absolute\": <STRONG|ADEQUATE|WEAK|FAILED>, \"relative\": null|<BETTER|STEADY|WORSE>, \"justification\": \"<1 sentence>\"},",
-  "    \"orchestration_quality\":{\"absolute\": <STRONG|ADEQUATE|WEAK|FAILED>, \"relative\": null|<BETTER|STEADY|WORSE>, \"justification\": \"<1 sentence>\"},",
+  "    \"issue_quality\":        {\"absolute\": <STRONG|ADEQUATE|WEAK|FAILED>, \"justification\": \"<1 sentence>\"},",
+  "    \"prompt_quality\":       {\"absolute\": <STRONG|ADEQUATE|WEAK|FAILED>, \"justification\": \"<1 sentence>\"},",
+  "    \"agent_quality\":        {\"absolute\": <STRONG|ADEQUATE|WEAK|FAILED>, \"justification\": \"<1 sentence>\"},",
+  "    \"reviewer_quality\":     {\"absolute\": <STRONG|ADEQUATE|WEAK|FAILED>, \"justification\": \"<1 sentence>\"},",
+  "    \"orchestration_quality\":{\"absolute\": <STRONG|ADEQUATE|WEAK|FAILED>, \"justification\": \"<1 sentence>\"},",
   "    \"issue_quality_relative\":         <BETTER|STEADY|WORSE>,  // omit when norms unavailable",
   "    \"prompt_quality_relative\":        <BETTER|STEADY|WORSE>,",
   "    \"agent_quality_relative\":         <BETTER|STEADY|WORSE>,",
@@ -468,12 +468,9 @@ const SYSTEM_PROMPT = [
   "Relative-axis grading (VA-405):",
   "  - When the user prompt provides a `# Norms` section, populate ALL FIVE",
   "    top-level `*_quality_relative` fields with one of BETTER / STEADY /",
-  "    WORSE, AND set the matching nested `<dim>.relative` slot to the same",
-  "    value (the two should agree — the named top-level field is the v1.2.0",
-  "    contract; the nested slot stays for v1.0/v1.1 back-compat).",
-  "  - Otherwise (no `# Norms` section, or sample_size < 5 and you decline",
-  "    to grade), omit every `*_quality_relative` field entirely AND set",
-  "    every nested `relative` slot to `null`.",
+  "    WORSE — these are the v1.2.0 contract field names. Otherwise (no",
+  "    `# Norms` section, or you decline to grade on a small sample) omit",
+  "    every `*_quality_relative` field entirely.",
   "  - BETTER: this run beat the typical cohort on the dimension's signals",
   "    (fewer iterations than the median, faster wall-time, no HITL/revert/",
   "    infra-error compared to a category that often hits those).",
@@ -486,10 +483,10 @@ const SYSTEM_PROMPT = [
   "    on. e.g. an `agent_quality: ADEQUATE` graded on iteration count must",
   "    use the iteration-count percentiles for its relative axis.",
   "  - When norms exist but `sample_size < 5`, you may still grade relative",
-  "    but call out the small sample in the justification (\"vs 3-run",
-  "    sample, small-sample caveat\"). When sample_size is 0 the gateway",
-  "    omits the `# Norms` section entirely — use `null` for the nested",
-  "    slots and omit the top-level `*_quality_relative` fields.",
+  "    but call out the small sample in the dimension's `justification`",
+  "    (\"vs 3-run sample, small-sample caveat\"). When sample_size is 0 the",
+  "    gateway omits the `# Norms` section entirely — omit the top-level",
+  "    `*_quality_relative` fields.",
   "",
   "Be honest. The IRA's value is in calling out real weaknesses, not in",
   "pretending every run was fine.",
@@ -591,9 +588,13 @@ const renderReviewMarkdown = (
   args: RunReviewPassArgs,
   ip: CapturedIssueProcess,
 ): string => {
-  const grade = (label: string, section: RunReview["agent_quality"]): string =>
+  const grade = (
+    label: string,
+    section: RunReview["agent_quality"],
+    relative: "BETTER" | "STEADY" | "WORSE" | undefined,
+  ): string =>
     `- **${label}**: \`${section.absolute}\`${
-      section.relative ? ` (${section.relative} vs norms)` : ""
+      relative ? ` (${relative} vs norms)` : ""
     } — ${section.justification}`;
 
   return [
@@ -602,11 +603,11 @@ const renderReviewMarkdown = (
     `**Final outcome**: ${review.final_outcome}`,
     "",
     "## Grading",
-    grade("Issue quality", review.issue_quality),
-    grade("Prompt quality", review.prompt_quality),
-    grade("Agent quality", review.agent_quality),
-    grade("Reviewer quality", review.reviewer_quality),
-    grade("Orchestration quality", review.orchestration_quality),
+    grade("Issue quality", review.issue_quality, review.issue_quality_relative),
+    grade("Prompt quality", review.prompt_quality, review.prompt_quality_relative),
+    grade("Agent quality", review.agent_quality, review.agent_quality_relative),
+    grade("Reviewer quality", review.reviewer_quality, review.reviewer_quality_relative),
+    grade("Orchestration quality", review.orchestration_quality, review.orchestration_quality_relative),
     "",
     "## Recommendations",
     review.recommendations.length === 0

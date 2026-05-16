@@ -540,37 +540,13 @@ describe("parseRunReview (VA-402)", () => {
   // can find norm-aware reviews in the meta-project. v1.0.0 / v1.1.0
   // reviews still parse (forward-compat on the minor bump).
 
-  it("accepts a v1.2.0 payload with both nested and top-level relative axes populated", () => {
+  it("accepts a v1.2.0 payload with the five top-level relative-axis fields", () => {
     const v120 = {
       ...VALID_RUN_REVIEW,
       template_version: "1.2.0",
-      issue_quality: {
-        absolute: "STRONG",
-        relative: "BETTER",
-        justification: "Issue was clearer than typical VA issues.",
-      },
-      prompt_quality: {
-        absolute: "ADEQUATE",
-        relative: "STEADY",
-        justification: "Typical prompt scope.",
-      },
-      agent_quality: {
-        absolute: "STRONG",
-        relative: "BETTER",
-        justification: "Iterations 2 vs median 3; under p95.",
-      },
-      reviewer_quality: {
-        absolute: "ADEQUATE",
-        relative: "STEADY",
-        justification: "No rejections this run; matches category norm.",
-      },
-      orchestration_quality: {
-        absolute: "STRONG",
-        relative: "BETTER",
-        justification: "Wall-time well under category median.",
-      },
-      // VA-405 AC: five top-level relative-axis fields. The IRA emits
-      // both these and the nested slots; v1.2.0 consumers read these.
+      // VA-405 AC: the five named relative fields, each
+      // `BETTER | STEADY | WORSE`. The IRA populates these when norms
+      // were available; omits them otherwise.
       issue_quality_relative: "BETTER",
       prompt_quality_relative: "STEADY",
       agent_quality_relative: "BETTER",
@@ -580,10 +556,6 @@ describe("parseRunReview (VA-402)", () => {
     const result = parseRunReview(wrapRunReview(JSON.stringify(v120)));
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    // Nested slots round-trip (back-compat).
-    expect(result.report.agent_quality.relative).toBe("BETTER");
-    expect(result.report.reviewer_quality.relative).toBe("STEADY");
-    // VA-405 AC: named top-level fields are present and typed.
     expect(result.report.issue_quality_relative).toBe("BETTER");
     expect(result.report.prompt_quality_relative).toBe("STEADY");
     expect(result.report.agent_quality_relative).toBe("BETTER");
@@ -593,9 +565,8 @@ describe("parseRunReview (VA-402)", () => {
 
   it("v1.2.0 omitting the top-level *_quality_relative fields parses (norms-unavailable case)", () => {
     // Norms unavailable / sample too small → IRA omits the named
-    // fields entirely AND sets every nested relative slot to null.
-    // The schema must accept this shape so the runtime path doesn't
-    // need to fabricate a sentinel.
+    // fields entirely. The schema must accept this shape so the
+    // runtime path doesn't need to fabricate a sentinel value.
     const v120NoNorms = {
       ...VALID_RUN_REVIEW,
       template_version: "1.2.0",
@@ -619,7 +590,13 @@ describe("parseRunReview (VA-402)", () => {
     expect(result.error.kind).toBe("schema-mismatch");
   });
 
-  it("v1.0.0 payloads (all relative=null) still parse under v1.2.0 (forward-compat)", () => {
+  it("v1.0.0 / v1.1.0 payloads carrying a legacy nested `relative: null` still parse (zod strips it)", () => {
+    // VA-402 added `relative: null` inside each section pre-emptively.
+    // VA-405 moves the axis up to top-level named fields and drops
+    // the nested slot from the schema. Forward-compat lives in zod's
+    // default `strip` mode: the unknown nested key is silently dropped
+    // and the v1.0.0 fixture (which has `relative: null` inside every
+    // section — see VALID_RUN_REVIEW) parses cleanly.
     const v100 = {
       ...VALID_RUN_REVIEW,
       template_version: "1.0.0",
@@ -628,7 +605,9 @@ describe("parseRunReview (VA-402)", () => {
     const result = parseRunReview(wrapRunReview(JSON.stringify(v100)));
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(result.report.agent_quality.relative).toBeNull();
+    expect(result.report.issue_quality.absolute).toBe("STRONG");
+    // v1.0.0 didn't emit the top-level relative fields.
+    expect(result.report.issue_quality_relative).toBeUndefined();
   });
 
   it("v1.1.0 hindsight payloads still parse under v1.2.0 (forward-compat)", () => {
@@ -649,21 +628,6 @@ describe("parseRunReview (VA-402)", () => {
     expect(result.ok).toBe(true);
   });
 
-  it("rejects an unknown relative-axis value outside the BETTER|STEADY|WORSE alphabet", () => {
-    const bad = {
-      ...VALID_RUN_REVIEW,
-      template_version: "1.2.0",
-      agent_quality: {
-        absolute: "STRONG",
-        relative: "MUCH_BETTER",
-        justification: "x",
-      },
-    };
-    const result = parseRunReview(wrapRunReview(JSON.stringify(bad)));
-    expect(result.ok).toBe(false);
-    if (result.ok) return;
-    expect(result.error.kind).toBe("schema-mismatch");
-  });
 
   it("rejects an unknown PR state outside the open|merged|closed alphabet", () => {
     const bad = {
