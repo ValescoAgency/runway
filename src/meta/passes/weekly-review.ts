@@ -200,8 +200,15 @@ export const runWeeklyReviewPass = (
     // 5) Promotions: file each as a runway-repo issue. Best-effort
     //    per promotion — if Linear fails for one, the others still
     //    land. The Weekly Review issue body cross-links to each
-    //    promotion that succeeded.
-    const filings = yield* fileEachPromotion(parsed.report.promotions, deps);
+    //    promotion that succeeded. Source URLs come from the Run
+    //    Review content_json so the promoted body renders as markdown
+    //    links instead of plain identifier strings.
+    const sourceUrlMap = buildSourceUrlMap(ctx.runReviews);
+    const filings = yield* fileEachPromotion(
+      parsed.report.promotions,
+      deps,
+      sourceUrlMap,
+    );
 
     // 6) Weekly Review issue in runway-meta with provenance disclaimer
     //    + cross-links to the filed promotions.
@@ -283,6 +290,7 @@ interface PromotionFiling {
 const fileEachPromotion = (
   promotions: readonly Promotion[],
   deps: WeeklyReviewPassDeps,
+  sourceUrlMap: ReadonlyMap<string, string>,
 ): Effect.Effect<readonly PromotionFiling[], never, never> =>
   Effect.gen(function* () {
     const results: PromotionFiling[] = [];
@@ -292,7 +300,7 @@ const fileEachPromotion = (
     // in seconds for a 5-promotion batch.
     for (const promotion of promotions) {
       const labels = [promotion.category, "runway-meta-promoted"];
-      const body = renderPromotionMarkdown(promotion);
+      const body = renderPromotionMarkdown(promotion, sourceUrlMap);
       const writeResult = yield* deps.metaLinear
         .createRunwayRepoIssue({
           title: promotion.title,
@@ -331,11 +339,19 @@ const fileEachPromotion = (
 
 /**
  * VA-408: parse each `meta-run-review` row's content_json into a
- * `RunReview` and walk its `recommendations` array. Rows that fail
- * to parse (template_version drift, malformed JSON) are silently
- * skipped — the IRA's broader narrative still has the row count as
- * context, and the operator sees the parse-failure stubs through the
- * `meta-failed` kind separately.
+ * `RunReview` and walk its `recommendations` array. Returns one
+ * `RecommendationSource` per recommendation, keyed by the Run
+ * Review's Linear identifier (NOT the SQLite row id) so the
+ * promoter's `source_meta_review_identifiers` output is rendered
+ * as clickable links in the promoted runway-repo issue body.
+ *
+ * Rows that fail to parse (template_version drift, malformed JSON)
+ * are silently skipped — the IRA's broader narrative still has the
+ * row count as context, and the operator sees parse-failure stubs
+ * through the `meta-failed` kind separately. Rows missing the
+ * Linear identifier (very old writes pre-VA-402, defensive) fall
+ * back to the SQLite row id so the chain doesn't break — they
+ * just render as plain text in the promotion body.
  */
 const extractRecommendationSources = (
   rows: readonly WindowedMetaRow[],
@@ -345,13 +361,10 @@ const extractRecommendationSources = (
     if (row.kind !== "meta-run-review") continue;
     const parsed = parseRunReviewContentJson(row.contentJson);
     if (!parsed) continue;
-    // Use the meta-review row id as the source identifier. The Weekly
-    // Review's content_json keeps the SQLite cross-link; the LLM
-    // narrative refers to these via "Run Review <id>" so the
-    // identifier shape matches the dashboard URL.
+    const sourceIdentifier = parsed.linearIssueIdentifier ?? row.id;
     for (const rec of parsed.recommendations) {
       out.push({
-        sourceMetaReviewIdentifier: row.id,
+        sourceMetaReviewIdentifier: sourceIdentifier,
         recommendation: rec,
       });
     }
@@ -359,14 +372,51 @@ const extractRecommendationSources = (
   return out;
 };
 
-const parseRunReviewContentJson = (json: string): { recommendations: readonly Recommendation[] } | null => {
+/**
+ * VA-408: extract a lookup map from Linear identifier → URL by
+ * walking every Run Review row's content_json. Used by
+ * `renderPromotionMarkdown` to render `[VA-1001](url)` markdown
+ * links in the *Source meta-reviews* line per the AC. Missing URLs
+ * (defensive) just render as plain text.
+ */
+const buildSourceUrlMap = (
+  rows: readonly WindowedMetaRow[],
+): ReadonlyMap<string, string> => {
+  const map = new Map<string, string>();
+  for (const row of rows) {
+    if (row.kind !== "meta-run-review") continue;
+    const parsed = parseRunReviewContentJson(row.contentJson);
+    if (!parsed) continue;
+    if (parsed.linearIssueIdentifier && parsed.linearUrl) {
+      map.set(parsed.linearIssueIdentifier, parsed.linearUrl);
+    }
+  }
+  return map;
+};
+
+interface ParsedRunReviewContent {
+  readonly recommendations: readonly Recommendation[];
+  readonly linearIssueIdentifier: string | null;
+  readonly linearUrl: string | null;
+}
+
+const parseRunReviewContentJson = (
+  json: string,
+): ParsedRunReviewContent | null => {
   try {
     // VA-408: the meta_reviews row's content_json wraps the parsed
-    // review under a "review" key when the pass writes it. Fall back
-    // to root-level fields for forward-compat with hypothetical
-    // future writers.
+    // review under a "review" key when the pass writes it. We pull
+    // `recommendations` from `.review.recommendations` (or top-level
+    // for hypothetical future writers) and the Linear cross-link
+    // fields from `linear_issue_identifier` / `linear_url` at the
+    // top level (where `run-review.ts` stamps them).
     const parsed = JSON.parse(json) as
-      | { review?: { recommendations?: unknown }; recommendations?: unknown }
+      | {
+          review?: { recommendations?: unknown };
+          recommendations?: unknown;
+          linear_issue_identifier?: unknown;
+          linear_url?: unknown;
+        }
       | null;
     const recs =
       parsed && typeof parsed === "object"
@@ -399,7 +449,17 @@ const parseRunReviewContentJson = (json: string): { recommendations: readonly Re
         }
       }
     }
-    return { recommendations: out };
+    const linearIssueIdentifier =
+      typeof parsed?.linear_issue_identifier === "string"
+        ? parsed.linear_issue_identifier
+        : null;
+    const linearUrl =
+      typeof parsed?.linear_url === "string" ? parsed.linear_url : null;
+    return {
+      recommendations: out,
+      linearIssueIdentifier,
+      linearUrl,
+    };
   } catch {
     return null;
   }
@@ -697,7 +757,10 @@ const renderRatesTable = (review: WeeklyReview): string => {
   ].join("\n");
 };
 
-const renderPromotionMarkdown = (p: Promotion): string => {
+const renderPromotionMarkdown = (
+  p: Promotion,
+  sourceUrlMap: ReadonlyMap<string, string>,
+): string => {
   const lines: string[] = [];
   // Theme-key marker — machine-readable, invisible in Linear UI.
   // VA-408: the next Weekly Review's queue-defer pass reads this to
@@ -706,7 +769,18 @@ const renderPromotionMarkdown = (p: Promotion): string => {
   lines.push("");
   lines.push(`**Target taxonomy**: \`${p.target}\``);
   lines.push(`**Category**: \`${p.category}\``);
-  lines.push(`**Source meta-reviews**: ${p.source_meta_review_identifiers.join(", ")}`);
+  // VA-408 AC: "source meta-issue links" — render each identifier as
+  // a markdown link `[VA-1001](url)` when a URL is known. Identifiers
+  // without a URL (defensive fallback for very old rows, or rows where
+  // the Run Review pass's Linear write itself failed) render as
+  // plain text so the chain doesn't break.
+  const sourceLinks = p.source_meta_review_identifiers
+    .map((id) => {
+      const url = sourceUrlMap.get(id);
+      return url ? `[${id}](${url})` : id;
+    })
+    .join(", ");
+  lines.push(`**Source meta-reviews**: ${sourceLinks}`);
   lines.push("");
   lines.push("## Change");
   lines.push("");
@@ -749,6 +823,7 @@ const shortWindowLabel = (args: WeeklyReviewPassArgs): string => {
 export const __testing = {
   SYSTEM_PROMPT,
   composeUserPrompt,
+  buildSourceUrlMap,
   extractRecommendationSources,
   parseRunReviewContentJson,
   renderPromotionMarkdown,

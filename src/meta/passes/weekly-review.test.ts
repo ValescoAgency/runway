@@ -75,6 +75,9 @@ const validReview = (overrides: Record<string, unknown> = {}) => ({
         "Reviewer report carries a `rejection_category` field on REJECT.",
         "Prompt enforces one of {scope|quality|test|infra}.",
       ],
+      // Match the fixture's content_json so the body renders
+      // hyperlinks (not plain text). VA-408 AC: source meta-issue
+      // links must be clickable in the promoted issue body.
       source_meta_review_identifiers: ["VA-1001", "VA-1002"],
       predicted_effect: {
         claim: "Reviewer rejection-to-fix iteration count drops 20% vs baseline",
@@ -102,6 +105,11 @@ const buildFixtures = (
           },
         ],
       },
+      // VA-408 AC: Run Review pass writes the Linear cross-link
+      // alongside the parsed review so downstream passes can render
+      // markdown source links. Match the shape `run-review.ts` emits.
+      linear_issue_identifier: "VA-1001",
+      linear_url: "https://linear.app/x/issue/VA-1001",
     },
     {
       review: {
@@ -114,6 +122,8 @@ const buildFixtures = (
           },
         ],
       },
+      linear_issue_identifier: "VA-1002",
+      linear_url: "https://linear.app/x/issue/VA-1002",
     },
   ],
 ) => {
@@ -221,6 +231,53 @@ describe("runWeeklyReviewPass (VA-408)", () => {
     // Theme-key marker is stamped into the body.
     expect(call?.body).toContain("runway-meta-theme-key:");
     expect(call?.body).toContain("prompt:tighten reviewer rejection");
+    // VA-408 AC: source meta-issue links rendered as markdown
+    // hyperlinks (not bare SQLite row ids).
+    expect(call?.body).toContain(
+      "[VA-1001](https://linear.app/x/issue/VA-1001)",
+    );
+    expect(call?.body).toContain(
+      "[VA-1002](https://linear.app/x/issue/VA-1002)",
+    );
+  });
+
+  it("uses Linear identifiers from content_json as promoter source ids (not SQLite row ids)", async () => {
+    // Lock down the contract directly: the promoter input + the
+    // user prompt must reference VA-1001 / VA-1002, not the
+    // meta-run-review-N row UUIDs. The reviewer agent observed this
+    // failure mode on PR #110 — this regression test prevents
+    // recurrence.
+    let capturedUserPrompt = "";
+    callWeeklyReviewMock.mockImplementationOnce((args: { userPrompt: string }) => {
+      capturedUserPrompt = args.userPrompt;
+      return Effect.succeed({ ok: true, report: validReview() });
+    });
+    const f = buildFixtures();
+
+    await Effect.runPromise(
+      runWeeklyReviewPass(
+        {
+          startIso: "2026-05-09T00:00:00.000Z",
+          endIso: "2026-05-16T00:00:00.000Z",
+        },
+        {
+          anthropicApiKey: "test-key",
+          metaWeeklyModel: "claude-opus-4-7",
+          dashboardRead: f.dashboardRead,
+          metaLinear: f.metaLinear,
+          storage: f.storage,
+          cwd: tmpCwd,
+        },
+      ),
+    );
+
+    expect(capturedUserPrompt).toContain("VA-1001");
+    expect(capturedUserPrompt).toContain("VA-1002");
+    // Negative: the SQLite row UUIDs must NOT leak into the prompt
+    // as source identifiers.
+    expect(capturedUserPrompt).not.toMatch(
+      /source_meta_review_identifiers:.*meta-run-review-/,
+    );
   });
 
   it("returns failed-loud on LLM retry exhaustion; NO Linear stub, NO meta-failed row", async () => {
