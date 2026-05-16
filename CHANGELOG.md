@@ -4,6 +4,19 @@ All notable changes to runway are documented here. Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); breaking
 changes bump the major.
 
+## 0.11.1 — 2026-05-16
+
+Patch release. One bugfix closing a regression that surfaced the moment 0.11.0 was used in anger — `runway upgrade-repo` on any tier-2 target repo last scaffolded before VA-413 failed mid-build because the rendered Dockerfile referenced a vendored shim that the upgrade path forgot to write.
+
+### Fixed
+
+- **`runway upgrade-repo` writes `.sandcastle/runway-claude-shim` on tier-2 upgrade** ([PR #117](https://github.com/ValescoAgency/runway/pull/117), VA-426). Surfaced upgrading bedrock from 0.10.x to 0.11.0: `upgrade-repo` re-rendered the Dockerfile with the post-VA-413 `COPY runway-claude-shim …` line but never materialised the shim file alongside it, so the post-render `docker build` verification step failed on the missing source and left the operator stuck. The `init` path already wrote the shim via `applyVarlockLayer`; `upgrade-repo` (written pre-VA-413) only knew about the Dockerfile + `.env.schema` re-render. The fix extracts `writeShim(cwd)` as a shared helper that both paths call, threads a `runway-claude-shim` `FileChange` through `upgrade-repo`'s existing drift/check/write pipeline so `--check` reports missing-shim drift, and routes the shim through the helper (not `writeFileSync`) so the 0755 mode is correct. Also closes a latent footgun in the helper itself: `writeFileSync({mode})` only sets the mode on file creation, not on overwrite, so the helper now does an explicit `chmodSync(path, 0o755)` after the write — a stale 0644 shim from a manual `cp` would otherwise silently survive a re-render and break the docker COPY's execute-bit propagation. Sibling fix to `src/scaffolder-verify.ts`: the post-render verify step previously grepped the Dockerfile for the legacy inline `varlock run --env-file` pattern, which post-VA-413 lives inside the vendored shim — replaced with checks for `COPY runway-claude-shim` on the Dockerfile, shim present on disk, and shim wraps varlock around `claude.real`. Without this fix even a successful re-render would VERIFY FAIL on the new layout.
+
+### Internal — release stats
+
+- **1 PR since 0.11.0** (1 fix).
+- 58 test files, 775 specs pass (+9 new — 6 `writeShim` helper-level tests, 3 `composeAndApplyScaffoldChanges` composition tests covering the pre-0.11.0 → 0.11.1 upgrade path, `--check` drift, and already-up-to-date branches).
+
 ## 0.11.0 — 2026-05-16
 
 Big minor release. Twenty-two PRs since 0.10.1 — the entire IRA chain (VA-400 PRD, slices VA-401 through VA-410) lands together, alongside the remaining operations-dashboard slices (VA-388 / VA-390 / VA-391 / VA-392 / VA-393), SSH-signed agent commits (VA-413), the validation-library consolidation (VA-397), three drain-resilience fixes (VA-424 / VA-425 / VA-385), and the queue-contract switch from status-gated to label-gated (VA-423).

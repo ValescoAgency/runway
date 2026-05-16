@@ -541,7 +541,7 @@ These are tractable, just not v1.
 
 ## Status
 
-0.11.0 — production-shaped and dogfooded against live Linear queues.
+0.11.1 — production-shaped and dogfooded against live Linear queues.
 The end-to-end pipeline (init → run → review → PR) is stable; surface
 may still shift as the orchestrator's policy and iteration mechanics
 mature. See [CHANGELOG.md](./CHANGELOG.md) for per-release detail.
