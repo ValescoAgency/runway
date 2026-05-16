@@ -707,3 +707,119 @@ describe("MetaDashboardRead.loadRecentWeeklyReviews (VA-408)", () => {
     expect(rows).toHaveLength(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// VA-409: post-ship aggregates for the attribution loop. Filters
+// drains by start time rather than count, scoped to one category.
+// ---------------------------------------------------------------------------
+
+describe("MetaDashboardRead.loadPostShipMetrics (VA-409)", () => {
+  it("returns post-ship aggregates for one category over drains started >= sinceIso", async () => {
+    // Two drains: one before the cutoff (excluded), one after (counted).
+    const preTrace = "00000000000000000000000000000001";
+    const postTrace = "00000000000000000000000000000002";
+    // Pre-ship drain at 2026-05-01 00:00 UTC.
+    seedDrain(preTrace, String(Date.parse("2026-05-01T00:00:00Z") * 1_000_000));
+    seedProcess({
+      traceId: preTrace,
+      spanId: "preXXXXXXXXXXXX1",
+      identifier: "VA-1",
+      outcomeKind: "hitl",
+      outcomeDetail: "Sub-agent review rejected: x",
+      wallMs: 1000,
+      iterations: 1,
+    });
+    // Post-ship drain at 2026-05-12 00:00 UTC.
+    seedDrain(
+      postTrace,
+      String(Date.parse("2026-05-12T00:00:00Z") * 1_000_000),
+    );
+    // Two VA-prefixed runs in the post-ship cohort: one opened, one
+    // reviewer-rejection → hitl. reviewer_rejection_rate = 1/2 = 0.5.
+    seedProcess({
+      traceId: postTrace,
+      spanId: "postXXXXXXXXXXX1",
+      identifier: "VA-1001",
+      outcomeKind: "opened",
+      wallMs: 2000,
+      iterations: 3,
+    });
+    seedProcess({
+      traceId: postTrace,
+      spanId: "postXXXXXXXXXXX2",
+      identifier: "VA-1002",
+      outcomeKind: "hitl",
+      outcomeDetail: "Sub-agent review rejected: y",
+      wallMs: 4000,
+      iterations: 5,
+    });
+
+    const sinceIso = "2026-05-08T00:00:00.000Z";
+    const metrics = await Effect.runPromise(
+      gateway.loadPostShipMetrics("VA", sinceIso),
+    );
+    expect(metrics).not.toBeNull();
+    if (metrics === null) return;
+    expect(metrics.category).toBe("VA");
+    expect(metrics.sinceIso).toBe(sinceIso);
+    expect(metrics.sampleSize).toBe(2);
+    expect(metrics.reviewerRejectionRate).toBe(0.5);
+    expect(metrics.hitlEscapeRate).toBe(0.5);
+    expect(metrics.revertRate).toBe(0);
+    expect(metrics.infraErrorRate).toBe(0);
+  });
+
+  it("returns null when no post-ship rows exist for the category", async () => {
+    // Drain exists but with the wrong category prefix.
+    const trace = "00000000000000000000000000000003";
+    seedDrain(trace, String(Date.parse("2026-05-12T00:00:00Z") * 1_000_000));
+    seedProcess({
+      traceId: trace,
+      spanId: "engXXXXXXXXXXXX1",
+      identifier: "ENG-1",
+      outcomeKind: "opened",
+      wallMs: 1000,
+      iterations: 1,
+    });
+    const metrics = await Effect.runPromise(
+      gateway.loadPostShipMetrics("VA", "2026-05-08T00:00:00.000Z"),
+    );
+    expect(metrics).toBeNull();
+  });
+
+  it("excludes drains that started before the cutoff", async () => {
+    // Single drain BEFORE the cutoff. Even with VA rows, the sample
+    // size is 0 and the gateway returns null.
+    const trace = "00000000000000000000000000000004";
+    seedDrain(trace, String(Date.parse("2026-04-01T00:00:00Z") * 1_000_000));
+    seedProcess({
+      traceId: trace,
+      spanId: "preXXXXXXXXXXXX1",
+      identifier: "VA-99",
+      outcomeKind: "opened",
+      wallMs: 1000,
+      iterations: 1,
+    });
+    const metrics = await Effect.runPromise(
+      gateway.loadPostShipMetrics("VA", "2026-05-08T00:00:00.000Z"),
+    );
+    expect(metrics).toBeNull();
+  });
+
+  it("returns null on a malformed ISO timestamp (no rows match a NaN cutoff)", async () => {
+    const trace = "00000000000000000000000000000005";
+    seedDrain(trace, String(Date.parse("2026-05-12T00:00:00Z") * 1_000_000));
+    seedProcess({
+      traceId: trace,
+      spanId: "vavavavavavava01",
+      identifier: "VA-1",
+      outcomeKind: "opened",
+      wallMs: 1000,
+      iterations: 1,
+    });
+    const metrics = await Effect.runPromise(
+      gateway.loadPostShipMetrics("VA", "not-a-date"),
+    );
+    expect(metrics).toBeNull();
+  });
+});

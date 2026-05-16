@@ -334,6 +334,23 @@ export interface MetaDashboardRead {
   loadRecentWeeklyReviews(
     limit: number,
   ): Effect.Effect<readonly WindowedMetaRow[], MetaReadError>;
+  /**
+   * VA-409: compute post-ship aggregates for one issue category over
+   * drains whose start time is at or after `sinceIso`. Mirrors the
+   * structure of `evaluator_aggregates_v1` (VA-399) but parameterized
+   * by time (not drain count) and filtered to a single category.
+   *
+   * The attribution loop calls this once per shipped promotion using
+   * the issue's `completedAt` as the cutoff and the issue's category
+   * (derived from `issue_identifier` per `categoryFromIssueIdentifier`).
+   * Returns null when no `issue_processes` rows match — the loop maps
+   * that to a 0-sample `PostShipMetrics` so the PENDING verdict path
+   * fires cleanly.
+   */
+  loadPostShipMetrics(
+    category: string,
+    sinceIso: string,
+  ): Effect.Effect<PostShipMetrics | null, MetaReadError>;
 }
 
 /**
@@ -365,6 +382,34 @@ export interface WindowedMetaRow {
   readonly contentJson: string;
   readonly templateVersion: string;
   readonly createdAt: string;
+}
+
+/**
+ * VA-409: post-ship metric aggregates for one issue category, computed
+ * over drains that started at or after `sinceIso`. Field shapes mirror
+ * `CapturedNorms` / `EvaluatorAggregate` so the same metric vocabulary
+ * applies — the difference is the cohort filter: norms read the rolling
+ * window; post-ship reads the time-bounded window scoped to "after this
+ * promotion shipped". A null return (sample_size === 0) means no
+ * post-ship runs accrued yet; the attribution loop maps that to a
+ * PENDING verdict.
+ *
+ * Distinct from `CapturedNorms` because `windowDrains` doesn't apply
+ * (the filter is time-based, not drain-count-based); `sinceIso` is
+ * echoed back instead for prompt traceability.
+ */
+export interface PostShipMetrics {
+  readonly category: string;
+  readonly sinceIso: string;
+  readonly sampleSize: number;
+  readonly medianIterationCount: number | null;
+  readonly p95IterationCount: number | null;
+  readonly medianWallTimeMs: number | null;
+  readonly p95WallTimeMs: number | null;
+  readonly reviewerRejectionRate: number;
+  readonly revertRate: number;
+  readonly hitlEscapeRate: number;
+  readonly infraErrorRate: number;
 }
 
 /**
@@ -553,6 +598,105 @@ export function createMetaDashboardRead(path: string): MetaDashboardRead {
     WHERE kind = 'meta-weekly-review'
     ORDER BY created_at DESC, id DESC
     LIMIT ?
+  `);
+
+  // VA-409: post-ship aggregates for one issue category over drains
+  // that started at or after a given nanosecond timestamp. Mirrors the
+  // structure of `evaluator_aggregates_v1` (VA-399's read-model) but
+  // parameterized by time (not drain count) and scoped to a single
+  // category at the outermost SELECT so the IRA can grade one shipped
+  // promotion at a time.
+  //
+  // Two bind parameters, both bound as INTEGER text:
+  //   ?1 — `start_time_unix_nano >= ?` (the post-ship cutoff in nanos)
+  //   ?2 — `category` for the per-category filter
+  const selectPostShipMetrics = db.prepare(`
+    WITH post_ship_drains AS (
+      SELECT trace_id
+      FROM drains
+      WHERE CAST(start_time_unix_nano AS INTEGER) >= ?
+    ),
+    process_rows AS (
+      SELECT
+        ip.trace_id,
+        ip.span_id,
+        ip.outcome_kind,
+        COALESCE(ip.outcome_detail, '') AS outcome_detail,
+        CASE
+          WHEN instr(ip.issue_identifier, '-') > 0
+            THEN substr(ip.issue_identifier, 1, instr(ip.issue_identifier, '-') - 1)
+          ELSE ip.issue_identifier
+        END AS category,
+        (CAST(ip.end_time_unix_nano AS INTEGER) - CAST(ip.start_time_unix_nano AS INTEGER)) / 1000000 AS wall_time_ms,
+        (
+          SELECT COUNT(*) FROM agent_iterations a
+          WHERE a.trace_id = ip.trace_id AND a.issue_process_id = ip.span_id
+        ) AS iteration_count
+      FROM issue_processes ip
+      WHERE ip.trace_id IN (SELECT trace_id FROM post_ship_drains)
+    ),
+    in_category AS (
+      SELECT *
+      FROM process_rows
+      WHERE category = ?
+    ),
+    wt_ranked AS (
+      SELECT
+        wall_time_ms,
+        ROW_NUMBER() OVER (ORDER BY wall_time_ms) AS rn,
+        COUNT(*) OVER () AS cnt
+      FROM in_category
+    ),
+    it_ranked AS (
+      SELECT
+        iteration_count,
+        ROW_NUMBER() OVER (ORDER BY iteration_count) AS rn,
+        COUNT(*) OVER () AS cnt
+      FROM in_category
+    ),
+    wt_median AS (
+      SELECT AVG(wall_time_ms * 1.0) AS value
+      FROM wt_ranked
+      WHERE rn IN ((cnt + 1) / 2, (cnt / 2) + 1)
+    ),
+    wt_p95 AS (
+      SELECT MIN(wall_time_ms) AS value
+      FROM wt_ranked
+      WHERE rn >= (cnt * 95 + 99) / 100
+    ),
+    it_median AS (
+      SELECT AVG(iteration_count * 1.0) AS value
+      FROM it_ranked
+      WHERE rn IN ((cnt + 1) / 2, (cnt / 2) + 1)
+    ),
+    it_p95 AS (
+      SELECT MIN(iteration_count) AS value
+      FROM it_ranked
+      WHERE rn >= (cnt * 95 + 99) / 100
+    )
+    SELECT
+      (SELECT COUNT(*) FROM in_category) AS sample_size,
+      (SELECT value FROM it_median) AS median_iteration_count,
+      (SELECT value FROM it_p95) AS p95_iteration_count,
+      (SELECT value FROM wt_median) AS median_wall_time_ms,
+      (SELECT value FROM wt_p95) AS p95_wall_time_ms,
+      (
+        SELECT AVG(CASE WHEN outcome_kind = 'hitl' AND outcome_detail LIKE 'Sub-agent review rejected%'
+                       THEN 1.0 ELSE 0.0 END)
+        FROM in_category
+      ) AS reviewer_rejection_rate,
+      (
+        SELECT AVG(CASE WHEN outcome_kind = 'reverted' THEN 1.0 ELSE 0.0 END)
+        FROM in_category
+      ) AS revert_rate,
+      (
+        SELECT AVG(CASE WHEN outcome_kind = 'hitl' THEN 1.0 ELSE 0.0 END)
+        FROM in_category
+      ) AS hitl_escape_rate,
+      (
+        SELECT AVG(CASE WHEN outcome_kind = 'errored' THEN 1.0 ELSE 0.0 END)
+        FROM in_category
+      ) AS infra_error_rate
   `);
 
   const wrap = <A>(
@@ -767,6 +911,37 @@ export function createMetaDashboardRead(path: string): MetaDashboardRead {
           Record<string, unknown>
         >;
         return rows.map(projectWindowedMetaRow);
+      });
+    },
+
+    loadPostShipMetrics(category, sinceIso) {
+      return wrap("loadPostShipMetrics", () => {
+        // ISO → unix nanos for the SQL bind. `Date.parse` returns ms;
+        // multiply to nanos so the comparison against the column's
+        // int64-as-text value lines up. A malformed ISO falls through
+        // to NaN; the comparison then returns no rows (sample_size: 0)
+        // which the caller treats as PENDING.
+        const ms = Date.parse(sinceIso);
+        if (!Number.isFinite(ms)) return null;
+        const sinceNanos = String(ms * 1_000_000);
+        const row = selectPostShipMetrics.get(sinceNanos, category) as
+          | Record<string, unknown>
+          | undefined;
+        const sampleSize = Number(row?.sample_size ?? 0);
+        if (sampleSize === 0) return null;
+        return {
+          category,
+          sinceIso,
+          sampleSize,
+          medianIterationCount: nullableNum(row?.median_iteration_count),
+          p95IterationCount: nullableNum(row?.p95_iteration_count),
+          medianWallTimeMs: nullableNum(row?.median_wall_time_ms),
+          p95WallTimeMs: nullableNum(row?.p95_wall_time_ms),
+          reviewerRejectionRate: Number(row?.reviewer_rejection_rate ?? 0),
+          revertRate: Number(row?.revert_rate ?? 0),
+          hitlEscapeRate: Number(row?.hitl_escape_rate ?? 0),
+          infraErrorRate: Number(row?.infra_error_rate ?? 0),
+        } satisfies PostShipMetrics;
       });
     },
   };

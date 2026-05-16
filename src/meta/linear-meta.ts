@@ -99,6 +99,24 @@ export interface OpenPromotedQueueEntry {
   readonly themeKey: string | null;
 }
 
+/**
+ * VA-409: one `runway-meta-promoted` issue that moved to Done since a
+ * given timestamp. The attribution loop walks these entries to grade
+ * each shipped promotion against its predicted effect. Carries the
+ * full issue body so `parsePredictedEffectFromBody` can extract the
+ * stamped attribution block (v1.1.0) or fall back to the markdown
+ * (v1.0.0) without a second Linear round-trip.
+ */
+export interface ShippedPromotedQueueEntry {
+  readonly identifier: string;
+  readonly url: string;
+  readonly title: string;
+  readonly body: string;
+  readonly themeKey: string | null;
+  /** ISO timestamp when the issue transitioned to a completed state. */
+  readonly completedAt: string;
+}
+
 // ---------------------------------------------------------------------------
 // Error ADT — narrower than LinearError but compatible
 // ---------------------------------------------------------------------------
@@ -227,6 +245,27 @@ export interface MetaLinearGateway {
    */
   listOpenPromotedQueue(): Effect.Effect<
     readonly OpenPromotedQueueEntry[],
+    MetaLinearError
+  >;
+  /**
+   * VA-409: read every `runway-meta-promoted` issue that completed
+   * (state type `completed`) at or after `sinceIso`. The Weekly
+   * Review's attribution loop walks these to grade each shipped
+   * promotion against its predicted effect. State type
+   * `completed` is Linear's vocabulary for "Done" — `canceled`
+   * issues are excluded because the change was abandoned, not
+   * shipped.
+   *
+   * `sinceIso` is typically the prior Weekly Review's `created_at`;
+   * an absent prior review collapses to "every shipped promoted
+   * issue in the workspace" via passing the epoch, but the pass
+   * skips the attribution section entirely on the first weekly to
+   * keep the noise floor low.
+   */
+  listShippedPromotionsSince(
+    sinceIso: string,
+  ): Effect.Effect<
+    readonly ShippedPromotedQueueEntry[],
     MetaLinearError
   >;
 }
@@ -559,6 +598,82 @@ export function createMetaLinearGateway(
               }) as unknown as LinearError,
           }),
           { call: "metaLinear.listOpenPromotedQueue" },
+        );
+      });
+    },
+    listShippedPromotionsSince(sinceIso) {
+      return Effect.gen(function* () {
+        const teamId = yield* resolveTeamId();
+        return yield* applyLinearPolicy(
+          Effect.tryPromise({
+            try: async () => {
+              // VA-409: completed `runway-meta-promoted` issues since
+              // `sinceIso`. State type `completed` is Linear's "Done"
+              // bucket; `canceled` is intentionally excluded since the
+              // change was abandoned, not shipped. The `completedAt`
+              // filter mirrors the gateway doc-comment — we use
+              // Linear's IssueFilter `completedAt: { gte }` to push
+              // the time predicate to the server.
+              //
+              // Pagination: drains can produce many promotions and
+              // an unusually long inter-weekly cadence can backlog
+              // shipped issues past a single page. We follow Linear's
+              // cursor-based pagination (`endCursor` +
+              // `hasNextPage`) until the server says there's nothing
+              // more. A hard ceiling of 10 pages × 50 issues = 500
+              // keeps a buggy iterator from spinning forever — well
+              // above any realistic weekly shipping cadence and
+              // a clear sign of operator action if hit.
+              const PAGE_SIZE = 50;
+              const MAX_PAGES = 10;
+              const out: ShippedPromotedQueueEntry[] = [];
+              let cursor: string | undefined = undefined;
+              for (let page = 0; page < MAX_PAGES; page += 1) {
+                const issues = await client.issues({
+                  filter: {
+                    team: { id: { eq: teamId } },
+                    labels: { some: { name: { eq: "runway-meta-promoted" } } },
+                    state: { type: { eq: "completed" } },
+                    completedAt: { gte: new Date(sinceIso) },
+                  },
+                  first: PAGE_SIZE,
+                  ...(cursor !== undefined ? { after: cursor } : {}),
+                });
+                for (const issue of issues.nodes) {
+                  if (!issue.identifier || !issue.url) continue;
+                  const body =
+                    typeof issue.description === "string"
+                      ? issue.description
+                      : "";
+                  const completedAt = issue.completedAt
+                    ? issue.completedAt instanceof Date
+                      ? issue.completedAt.toISOString()
+                      : String(issue.completedAt)
+                    : null;
+                  if (!completedAt) continue;
+                  out.push({
+                    identifier: issue.identifier,
+                    url: issue.url,
+                    title: issue.title ?? "(untitled)",
+                    body,
+                    themeKey: extractThemeKey(body),
+                    completedAt,
+                  });
+                }
+                if (!issues.pageInfo.hasNextPage) break;
+                const next = issues.pageInfo.endCursor;
+                if (typeof next !== "string" || next.length === 0) break;
+                cursor = next;
+              }
+              return out;
+            },
+            catch: (err) =>
+              ({
+                _tag: "LinearNetworkError" as const,
+                message: messageOf(err),
+              }) as unknown as LinearError,
+          }),
+          { call: "metaLinear.listShippedPromotionsSince" },
         );
       });
     },

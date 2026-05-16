@@ -829,7 +829,7 @@ const VALID_WEEKLY_REVIEW = {
 };
 
 describe("parseWeeklyReview (VA-408)", () => {
-  it("parses a well-formed Weekly Review at v1.0.0", () => {
+  it("parses a well-formed Weekly Review at the current version", () => {
     const stdout = wrapWeeklyReview(JSON.stringify(VALID_WEEKLY_REVIEW));
     const result = parseWeeklyReview(stdout);
     expect(result.ok).toBe(true);
@@ -918,5 +918,181 @@ describe("parseWeeklyReview (VA-408)", () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.report.noted_but_not_promoted).toHaveLength(2);
+  });
+
+  // VA-409: v1.1.0 attribution + shipped_promotions section. v1.0.0
+  // payloads (no shipped_promotions field, no predicted_effect.attribution)
+  // must still parse — the AC: "v1.0.0 Weekly Reviews from before this
+  // slice still parse under the v1.1.0 parser".
+
+  it("v1.0.0 payloads (no shipped_promotions, no attribution) still parse under v1.1.0", () => {
+    // VALID_WEEKLY_REVIEW carries template_version=1.1.0 by default
+    // (the constant bumped). Force it back to "1.0.0" and confirm the
+    // schema accepts the legacy shape — promotions array has no
+    // attribution block, shipped_promotions absent entirely.
+    const v100 = {
+      ...VALID_WEEKLY_REVIEW,
+      template_version: "1.0.0",
+    };
+    const result = parseWeeklyReview(wrapWeeklyReview(JSON.stringify(v100)));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.shipped_promotions).toEqual([]);
+    expect(
+      result.report.promotions[0]?.predicted_effect.attribution,
+    ).toBeUndefined();
+  });
+
+  it("v1.1.0 accepts a predicted_effect.attribution block with all four fields", () => {
+    const basePromotion = VALID_WEEKLY_REVIEW.promotions[0];
+    if (!basePromotion) throw new Error("fixture invariant");
+    const v110 = {
+      ...VALID_WEEKLY_REVIEW,
+      promotions: [
+        {
+          ...basePromotion,
+          predicted_effect: {
+            ...basePromotion.predicted_effect,
+            attribution: {
+              metric: "reviewer_rejection_rate",
+              baseline_value: 0.12,
+              direction: "decrease",
+              threshold_value: 0.08,
+            },
+          },
+        },
+      ],
+    };
+    const result = parseWeeklyReview(wrapWeeklyReview(JSON.stringify(v110)));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const attrib = result.report.promotions[0]?.predicted_effect.attribution;
+    expect(attrib?.metric).toBe("reviewer_rejection_rate");
+    expect(attrib?.direction).toBe("decrease");
+    expect(attrib?.threshold_value).toBe(0.08);
+  });
+
+  it("rejects an attribution metric outside VA-399's named-aggregate alphabet", () => {
+    const basePromotion = VALID_WEEKLY_REVIEW.promotions[0];
+    if (!basePromotion) throw new Error("fixture invariant");
+    const bad = {
+      ...VALID_WEEKLY_REVIEW,
+      promotions: [
+        {
+          ...basePromotion,
+          predicted_effect: {
+            ...basePromotion.predicted_effect,
+            attribution: {
+              metric: "vibes_per_drain",
+              baseline_value: 1,
+              direction: "increase",
+              threshold_value: 5,
+            },
+          },
+        },
+      ],
+    };
+    const result = parseWeeklyReview(wrapWeeklyReview(JSON.stringify(bad)));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.kind).toBe("schema-mismatch");
+  });
+
+  it("accepts a shipped_promotions section with HELD verdict (numeric path)", () => {
+    const withShipped = {
+      ...VALID_WEEKLY_REVIEW,
+      shipped_promotions: [
+        {
+          theme_key: "prompt:tighten reviewer:abcd1234",
+          linear_identifier: "VA-3001",
+          linear_url: "https://linear.app/x/issue/VA-3001",
+          linear_title: "Tighten reviewer rejection guidance",
+          source_meta_review_identifiers: ["VA-1001", "VA-1002"],
+          predicted_effect: {
+            claim: "Rejection rate falls below 8%.",
+            min_sample_size: 10,
+            sample_description: "post-ship VA-prefixed runs",
+            attribution: {
+              metric: "reviewer_rejection_rate",
+              baseline_value: 0.12,
+              direction: "decrease",
+              threshold_value: 0.08,
+            },
+          },
+          observed: {
+            metric: "reviewer_rejection_rate",
+            value: 0.06,
+            sample_size: 15,
+          },
+          verdict: "HELD",
+          comment: "Observed 6% across 15 runs — under threshold.",
+        },
+      ],
+    };
+    const result = parseWeeklyReview(
+      wrapWeeklyReview(JSON.stringify(withShipped)),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.shipped_promotions).toHaveLength(1);
+    expect(result.report.shipped_promotions[0]?.verdict).toBe("HELD");
+  });
+
+  it("accepts QUALITATIVE verdict with null observed values (no metric to measure)", () => {
+    const qualitative = {
+      ...VALID_WEEKLY_REVIEW,
+      shipped_promotions: [
+        {
+          theme_key: "issue-body:better acceptance criteria:bbbb2222",
+          linear_identifier: "VA-3010",
+          linear_url: "https://linear.app/x/issue/VA-3010",
+          linear_title: "Acceptance criteria style guide",
+          source_meta_review_identifiers: ["VA-1010"],
+          predicted_effect: {
+            claim: "Future issue bodies cite the new style guide.",
+            min_sample_size: 5,
+            sample_description: "newly-filed issues",
+          },
+          observed: {
+            metric: null,
+            value: null,
+            sample_size: 0,
+          },
+          verdict: "QUALITATIVE",
+          comment: "No measurable metric — operator review needed.",
+        },
+      ],
+    };
+    const result = parseWeeklyReview(
+      wrapWeeklyReview(JSON.stringify(qualitative)),
+    );
+    expect(result.ok).toBe(true);
+  });
+
+  it("rejects an unknown verdict value (out of the HELD|PARTIAL|MISSED|PENDING|QUALITATIVE alphabet)", () => {
+    const bad = {
+      ...VALID_WEEKLY_REVIEW,
+      shipped_promotions: [
+        {
+          theme_key: "prompt:x:yyyy3333",
+          linear_identifier: "VA-3020",
+          linear_url: "https://linear.app/x/issue/VA-3020",
+          linear_title: "X",
+          source_meta_review_identifiers: ["VA-1020"],
+          predicted_effect: {
+            claim: "x",
+            min_sample_size: 1,
+            sample_description: "s",
+          },
+          observed: { metric: null, value: null, sample_size: 0 },
+          verdict: "WIN",
+          comment: "x",
+        },
+      ],
+    };
+    const result = parseWeeklyReview(wrapWeeklyReview(JSON.stringify(bad)));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.kind).toBe("schema-mismatch");
   });
 });
