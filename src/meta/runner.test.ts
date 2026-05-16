@@ -181,4 +181,32 @@ describe("resolveMetaConfig (VA-402)", () => {
     expect(r.metaFilterThresholds.minReviewerRejections).toBe(4);
     expect(r.source.thresholds).toBe("env");
   });
+
+  // VA-406: runwayRepoProjectName follows the env → file → undefined
+  // chain. Unlike model / project / delay, there's no hardcoded default
+  // because the runway-repo project is operator-canonical (e.g. "Runway"
+  // for ValescoAgency) and the IRA shouldn't invent one.
+
+  it("defaults runwayRepoProjectName to undefined when nothing is set", () => {
+    const r = resolveMetaConfig({ config: baseConfig(), cwd });
+    expect(r.runwayRepoProjectName).toBeUndefined();
+    expect(r.source.runwayRepoProject).toBe("default");
+  });
+
+  it("reads runwayRepoProjectName from .runway/config.yml when env is unset", () => {
+    writeFile("runwayRepoProjectName: Runway");
+    const r = resolveMetaConfig({ config: baseConfig(), cwd });
+    expect(r.runwayRepoProjectName).toBe("Runway");
+    expect(r.source.runwayRepoProject).toBe(".runway/config.yml");
+  });
+
+  it("env wins for runwayRepoProjectName", () => {
+    writeFile("runwayRepoProjectName: Runway-from-file");
+    const r = resolveMetaConfig({
+      config: baseConfig({ runwayRepoProjectName: "Runway-from-env" }),
+      cwd,
+    });
+    expect(r.runwayRepoProjectName).toBe("Runway-from-env");
+    expect(r.source.runwayRepoProject).toBe("env");
+  });
 });

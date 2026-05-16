@@ -1,6 +1,7 @@
 import { LinearClient } from "@linear/sdk";
 import { Data, Effect, Redacted } from "effect";
 import { applyLinearPolicy, type LinearError } from "../linear.js";
+import { messageOf } from "./format.js";
 
 /**
  * VA-402: Linear write surface for the IRA's meta-project. Slim by
@@ -31,6 +32,16 @@ export interface MetaLinearConfig {
    * provision the project on first use.
    */
   readonly metaProjectName: string;
+  /**
+   * VA-406: optional runway-repo project name (the project where the
+   * runway repo's own issues live — e.g. "Runway"). Severity-critical
+   * Drain Reviews escalate by filing an issue in this project with
+   * `Bug` + `runway-meta-promoted` labels. When unset, escalations
+   * still create the team-level issue (with the same labels) but
+   * skip project assignment — operators without a dedicated runway
+   * project still get the loud signal.
+   */
+  readonly runwayRepoProjectName?: string;
 }
 
 export interface CreateRunReviewIssueArgs {
@@ -42,6 +53,27 @@ export interface CreateRunReviewIssueArgs {
    * Review body proper.
    */
   readonly body: string;
+}
+
+export type CreateDrainReviewIssueArgs = CreateRunReviewIssueArgs;
+
+/**
+ * VA-406: arg shape for the severity-critical escalation. Lands in
+ * `runwayRepoProjectName` (when set) with the supplied labels.
+ * Labels that don't exist on the team are auto-created idempotently —
+ * mirrors `ensureMetaProject`'s "first run provisions" pattern so
+ * fresh workspaces don't require manual setup.
+ */
+export interface CreateRunwayRepoIssueArgs {
+  readonly title: string;
+  readonly body: string;
+  /**
+   * Labels to apply (by name). The Drain Review pass passes
+   * `["Bug", "runway-meta-promoted"]` per the VA-406 AC. Labels are
+   * resolved-or-created on the team scope; the issue carries the
+   * resolved IDs.
+   */
+  readonly labels: readonly string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -60,10 +92,15 @@ export class MetaLinearIssueCreateFailed extends Data.TaggedError(
   "MetaLinearIssueCreateFailed",
 )<{ readonly title: string; readonly message: string }> {}
 
+export class MetaLinearLabelCreateFailed extends Data.TaggedError(
+  "MetaLinearLabelCreateFailed",
+)<{ readonly labelName: string; readonly message: string }> {}
+
 export type MetaLinearError =
   | MetaLinearTeamNotFound
   | MetaLinearProjectCreateFailed
   | MetaLinearIssueCreateFailed
+  | MetaLinearLabelCreateFailed
   | LinearError;
 
 // ---------------------------------------------------------------------------
@@ -100,6 +137,32 @@ export interface MetaLinearGateway {
   createRunReviewIssue(
     args: CreateRunReviewIssueArgs,
   ): Effect.Effect<{ readonly identifier: string; readonly url: string }, MetaLinearError>;
+  /**
+   * VA-406: create one Drain Review Linear issue inside the
+   * meta-project. Shares the run-review write path — same project,
+   * same provenance disclaimer prefix, same retry policy. Returns the
+   * identifier + URL so the SQLite stub can cross-link and so a
+   * severity-critical escalation can reference the drain-review in
+   * its runway-repo issue body.
+   */
+  createDrainReviewIssue(
+    args: CreateDrainReviewIssueArgs,
+  ): Effect.Effect<{ readonly identifier: string; readonly url: string }, MetaLinearError>;
+  /**
+   * VA-406: create one issue in the runway-repo project (or just the
+   * team when `runwayRepoProjectName` is unset). The Drain Review
+   * pass calls this on severity-critical findings, supplying the
+   * `["Bug", "runway-meta-promoted"]` label pair from the AC. Labels
+   * missing on the team are auto-created so a fresh workspace doesn't
+   * require manual scaffolding before the first escalation lands.
+   *
+   * Body assembly is the caller's job (it cross-links to the
+   * drain-review issue); the provenance disclaimer is prepended here
+   * to keep parity with the meta-project writes.
+   */
+  createRunwayRepoIssue(
+    args: CreateRunwayRepoIssueArgs,
+  ): Effect.Effect<{ readonly identifier: string; readonly url: string }, MetaLinearError>;
 }
 
 export function createMetaLinearGateway(
@@ -109,7 +172,24 @@ export function createMetaLinearGateway(
     apiKey: Redacted.value(config.linearApiKey),
   });
 
+  // VA-406: cache the team id per gateway instance. Once-per-process
+  // resolution — operators don't rename their team mid-drain, and the
+  // critical-escalation path makes 2-3 calls to `resolveTeamId` in
+  // sequence (drain-review issue + escalation labels + escalation
+  // issue), so re-fetching every time is wasteful.
+  let cachedTeamId: string | null = null;
   const resolveTeamId = (): Effect.Effect<string, MetaLinearError> =>
+    cachedTeamId !== null
+      ? Effect.succeed(cachedTeamId)
+      : fetchTeamId().pipe(
+          Effect.tap((id) =>
+            Effect.sync(() => {
+              cachedTeamId = id;
+            }),
+          ),
+        );
+
+  const fetchTeamId = (): Effect.Effect<string, MetaLinearError> =>
     applyLinearPolicy(
       Effect.tryPromise({
         try: async () => {
@@ -138,7 +218,7 @@ export function createMetaLinearGateway(
           }
           return {
             _tag: "LinearNetworkError" as const,
-            message: err instanceof Error ? err.message : String(err),
+            message: messageOf(err),
           } as unknown as LinearError;
         },
       }),
@@ -166,7 +246,7 @@ export function createMetaLinearGateway(
         catch: (err) =>
           ({
             _tag: "LinearNetworkError" as const,
-            message: err instanceof Error ? err.message : String(err),
+            message: messageOf(err),
           }) as unknown as LinearError,
       }),
       { call: "metaLinear.findProjectIdByName" },
@@ -197,7 +277,7 @@ export function createMetaLinearGateway(
           catch: (err) =>
             ({
               _tag: "LinearNetworkError" as const,
-              message: err instanceof Error ? err.message : String(err),
+              message: messageOf(err),
             }) as unknown as LinearError,
         }),
         { call: "metaLinear.createProject" },
@@ -206,7 +286,152 @@ export function createMetaLinearGateway(
           Effect.fail(
             new MetaLinearProjectCreateFailed({
               projectName: config.metaProjectName,
-              message: (err as { message?: string }).message ?? String(err),
+              message: messageOf(err),
+            }),
+          ),
+        ),
+      );
+      return created;
+    });
+
+  // VA-406: shared issue-create path for both Run Review and Drain
+  // Review writes into the meta-project. Returns the identifier + url
+  // straight from the Linear payload. Pulled out as a closure so the
+  // two gateway methods don't drift.
+  const createMetaProjectIssue = (
+    args: CreateRunReviewIssueArgs,
+    call: string,
+  ): Effect.Effect<{ readonly identifier: string; readonly url: string }, MetaLinearError> =>
+    Effect.gen(function* () {
+      const teamId = yield* resolveTeamId();
+      const projectId = yield* ensureMetaProject();
+      const body = [IRA_PROVENANCE_DISCLAIMER, "", args.body].join("\n");
+      return yield* applyLinearPolicy(
+        Effect.tryPromise({
+          try: async () => {
+            const payload = await client.createIssue({
+              teamId,
+              projectId,
+              title: args.title,
+              description: body,
+            });
+            const issue = await payload.issue;
+            if (!issue?.identifier || !issue?.url) {
+              throw new Error("issue create payload had no identifier/url");
+            }
+            return { identifier: issue.identifier, url: issue.url };
+          },
+          catch: (err) =>
+            ({
+              _tag: "LinearNetworkError" as const,
+              message: messageOf(err),
+            }) as unknown as LinearError,
+        }),
+        { call },
+      ).pipe(
+        Effect.catchAll((err) =>
+          Effect.fail(
+            new MetaLinearIssueCreateFailed({
+              title: args.title,
+              message: messageOf(err),
+            }),
+          ),
+        ),
+      );
+    });
+
+  // VA-406: resolve a project id by name on the configured team, or
+  // return null when nothing matches. Used by the runway-repo
+  // escalation path — operators may omit `runwayRepoProjectName` and
+  // we treat that as "team-only, no project assignment" rather than
+  // failing. Distinct from `findProjectIdByName` (used by the
+  // meta-project provisioning path) because escalation does NOT
+  // auto-create the runway-repo project — that's the operator's
+  // canonical project, not something the IRA invents.
+  const findRunwayRepoProjectId = (
+    teamId: string,
+    name: string,
+  ): Effect.Effect<string | null, LinearError> =>
+    applyLinearPolicy(
+      Effect.tryPromise({
+        try: async () => {
+          const projects = await client.projects({
+            filter: {
+              name: { eq: name },
+              accessibleTeams: { some: { id: { eq: teamId } } },
+            },
+          });
+          return projects.nodes[0]?.id ?? null;
+        },
+        catch: (err) =>
+          ({
+            _tag: "LinearNetworkError" as const,
+            message: messageOf(err),
+          }) as unknown as LinearError,
+      }),
+      { call: "metaLinear.findRunwayRepoProjectId" },
+    );
+
+  // VA-406: resolve a label id by name on the team. When the label
+  // doesn't exist on the team, create it idempotently — mirrors the
+  // `ensureMetaProject` pattern so a fresh workspace lands its first
+  // escalation without manual setup. Two concurrent escalations could
+  // race and produce duplicate labels with the same name, but Linear
+  // tolerates duplicate label names on a team (the IDs differ), and
+  // the issue-create still attaches the first match — the only
+  // downside is a cosmetic dupe in the team's label list, fixable in
+  // the Linear UI.
+  const ensureLabel = (
+    teamId: string,
+    labelName: string,
+  ): Effect.Effect<string, MetaLinearError> =>
+    Effect.gen(function* () {
+      const existing = yield* applyLinearPolicy(
+        Effect.tryPromise({
+          try: async () => {
+            const labels = await client.issueLabels({
+              filter: {
+                name: { eq: labelName },
+                team: { id: { eq: teamId } },
+              },
+            });
+            return labels.nodes[0]?.id ?? null;
+          },
+          catch: (err) =>
+            ({
+              _tag: "LinearNetworkError" as const,
+              message: messageOf(err),
+            }) as unknown as LinearError,
+        }),
+        { call: "metaLinear.findLabel" },
+      );
+      if (existing) return existing;
+      const created = yield* applyLinearPolicy(
+        Effect.tryPromise({
+          try: async () => {
+            const payload = await client.createIssueLabel({
+              name: labelName,
+              teamId,
+            });
+            const label = await payload.issueLabel;
+            if (!label?.id) {
+              throw new Error("label create payload had no id");
+            }
+            return label.id;
+          },
+          catch: (err) =>
+            ({
+              _tag: "LinearNetworkError" as const,
+              message: messageOf(err),
+            }) as unknown as LinearError,
+        }),
+        { call: "metaLinear.createLabel" },
+      ).pipe(
+        Effect.catchAll((err) =>
+          Effect.fail(
+            new MetaLinearLabelCreateFailed({
+              labelName,
+              message: messageOf(err),
             }),
           ),
         ),
@@ -217,43 +442,68 @@ export function createMetaLinearGateway(
   return {
     ensureMetaProject,
     createRunReviewIssue(args) {
+      return createMetaProjectIssue(args, "metaLinear.createIssue");
+    },
+    createDrainReviewIssue(args) {
+      return createMetaProjectIssue(args, "metaLinear.createDrainReviewIssue");
+    },
+    createRunwayRepoIssue(args) {
       return Effect.gen(function* () {
         const teamId = yield* resolveTeamId();
-        const projectId = yield* ensureMetaProject();
+        // Resolve labels + project in parallel — both depend only on
+        // teamId, so the critical-escalation path saves one Linear RTT.
+        const [labelIds, projectId] = yield* Effect.all(
+          [
+            Effect.all(
+              args.labels.map((name) => ensureLabel(teamId, name)),
+              { concurrency: "unbounded" },
+            ),
+            config.runwayRepoProjectName
+              ? findRunwayRepoProjectId(teamId, config.runwayRepoProjectName)
+              : Effect.succeed(null),
+          ],
+          { concurrency: "unbounded" },
+        );
         const body = [IRA_PROVENANCE_DISCLAIMER, "", args.body].join("\n");
-        const result = yield* applyLinearPolicy(
+        return yield* applyLinearPolicy(
           Effect.tryPromise({
             try: async () => {
               const payload = await client.createIssue({
                 teamId,
-                projectId,
+                // projectId is intentionally omitted when null —
+                // Linear's API treats the absent key as "no project,"
+                // not "default project", so omitting cleanly is the
+                // right call vs sending `projectId: null`.
+                ...(projectId ? { projectId } : {}),
+                labelIds: labelIds.length === 0 ? undefined : labelIds,
                 title: args.title,
                 description: body,
               });
               const issue = await payload.issue;
               if (!issue?.identifier || !issue?.url) {
-                throw new Error("issue create payload had no identifier/url");
+                throw new Error(
+                  "runway-repo issue create payload had no identifier/url",
+                );
               }
               return { identifier: issue.identifier, url: issue.url };
             },
             catch: (err) =>
               ({
                 _tag: "LinearNetworkError" as const,
-                message: err instanceof Error ? err.message : String(err),
+                message: messageOf(err),
               }) as unknown as LinearError,
           }),
-          { call: "metaLinear.createIssue" },
+          { call: "metaLinear.createRunwayRepoIssue" },
         ).pipe(
           Effect.catchAll((err) =>
             Effect.fail(
               new MetaLinearIssueCreateFailed({
                 title: args.title,
-                message: (err as { message?: string }).message ?? String(err),
+                message: messageOf(err),
               }),
             ),
           ),
         );
-        return result;
       });
     },
   };

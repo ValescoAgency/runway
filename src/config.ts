@@ -154,6 +154,15 @@ export interface RunwayConfig {
    * `meta/runner.ts` alongside the other meta knobs.
    */
   readonly metaFilterThresholds?: { readonly minIterationCount?: number; readonly minReviewerRejections?: number };
+  /**
+   * VA-406: optional Linear project name where the runway repo's own
+   * issues live (e.g. "Runway"). When set, severity-critical Drain
+   * Review escalations file their issue in that project; when unset,
+   * the escalation issue still lands in the team with the right
+   * labels but skips project assignment. Resolution: env →
+   * `.runway/config.yml` → undefined. Source: `RUNWAY_REPO_PROJECT_NAME`.
+   */
+  readonly runwayRepoProjectName?: string;
 }
 
 // Back-compat alias — existing consumers (orchestrator, gateways)
@@ -230,6 +239,9 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
   metaFilterThresholdsJson: EConfig.option(
     EConfig.string("RUNWAY_META_FILTER_THRESHOLDS"),
   ),
+  runwayRepoProjectName: EConfig.option(
+    EConfig.string("RUNWAY_REPO_PROJECT_NAME"),
+  ),
 }).pipe(
   Effect.map(
     (raw): RunwayConfig => ({
@@ -255,6 +267,7 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
       metaFilterThresholds: parseMetaFilterThresholdsJson(
         Option.getOrUndefined(raw.metaFilterThresholdsJson),
       ),
+      runwayRepoProjectName: Option.getOrUndefined(raw.runwayRepoProjectName),
     }),
   ),
 );

@@ -1,11 +1,11 @@
 import { Effect, Redacted } from "effect";
 import { loadConfig } from "../config.js";
-import { dispatchRunReview } from "../meta/runner.js";
+import { dispatchDrainReview, dispatchRunReview } from "../meta/runner.js";
 
 /**
  * VA-402: `runway review` subcommand family. Verbs:
  *
- *   - `runway review run --drain <id> --issue <id>` (this slice)
+ *   - `runway review run --drain <id> --issue <id>` (VA-402)
  *   - `runway review drain --id <drain>` (VA-406)
  *   - `runway review weekly` (VA-408)
  *
@@ -13,9 +13,9 @@ import { dispatchRunReview } from "../meta/runner.js";
  * here just parses argv, loads config, hands off to `meta/runner`,
  * and prints the outcome.
  *
- * Per PRD: Run Review failures stub-and-continue (exit 0). Weekly
- * Review (VA-408) will exit non-zero on retry exhaustion so cron
- * mail surfaces it loudly.
+ * Per PRD: Run Review + Drain Review failures stub-and-continue
+ * (exit 0). Weekly Review (VA-408) will exit non-zero on retry
+ * exhaustion so cron mail surfaces it loudly.
  */
 
 export interface ReviewArgs {
@@ -31,11 +31,15 @@ export function printReviewUsage(): void {
 
 USAGE
   runway review run --drain <trace-id> --issue <identifier> [--force]
+  runway review drain --id <trace-id>
 
-OPTIONS
+OPTIONS — run
   --drain <trace-id>     the drain's OTLP trace id (32 hex chars)
   --issue <identifier>   the Linear issue identifier (e.g. VA-401)
   --force                bypass the drain-age delay gate (VA-403)
+
+OPTIONS — drain
+  --id <trace-id>        the drain's OTLP trace id (32 hex chars)
 
 ENV
   ANTHROPIC_API_KEY            required — Claude API key for the IRA call
@@ -43,6 +47,8 @@ ENV
   RUNWAY_META_REVIEW_MODEL     override the Anthropic model (default: claude-sonnet-4-6)
   RUNWAY_META_PROJECT_NAME     override the Linear meta-project name (default: runway-meta)
   RUNWAY_REVIEW_DELAY_HOURS    minimum drain age before grading (default: 18; 12-24h band per PRD VA-403)
+  RUNWAY_REPO_PROJECT_NAME     optional — Linear project where severity-critical Drain
+                               Review escalations are filed (default: team-only)
   GITHUB_TOKEN                 optional — authenticates GitHub API for hindsight PR fetch
 `);
 }
@@ -54,12 +60,20 @@ export async function reviewCommand(argv: readonly string[]): Promise<void> {
   }
   const verb = argv[0];
   const rest = argv.slice(1);
-  if (verb !== "run") {
-    console.error(`[runway review] unknown verb: ${verb}`);
-    printReviewUsage();
-    process.exit(2);
+  if (verb === "run") {
+    await runVerb(rest);
+    return;
   }
+  if (verb === "drain") {
+    await drainVerb(rest);
+    return;
+  }
+  console.error(`[runway review] unknown verb: ${verb}`);
+  printReviewUsage();
+  process.exit(2);
+}
 
+async function runVerb(rest: readonly string[]): Promise<void> {
   const parsed = parseRunArgs(rest);
   if (parsed.kind === "error") {
     console.error(`[runway review run] ${parsed.message}`);
@@ -122,6 +136,59 @@ export async function reviewCommand(argv: readonly string[]): Promise<void> {
   // regardless of outcome.kind. Weekly Review (VA-408) will diverge.
 }
 
+async function drainVerb(rest: readonly string[]): Promise<void> {
+  const parsed = parseDrainArgs(rest);
+  if (parsed.kind === "error") {
+    console.error(`[runway review drain] ${parsed.message}`);
+    printReviewUsage();
+    process.exit(2);
+  }
+
+  const config = loadConfig();
+  const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+  if (!anthropicApiKey) {
+    console.error(
+      "[runway review drain] ANTHROPIC_API_KEY is required — set it in the environment before running.",
+    );
+    process.exit(2);
+  }
+  const dashboardDbPath =
+    process.env.RUNWAY_DASHBOARD_DB ?? "./runway-dashboard.db";
+
+  const outcome = await Effect.runPromise(
+    dispatchDrainReview(
+      { traceId: parsed.traceId },
+      {
+        config,
+        cwd: process.cwd(),
+        dashboardDbPath,
+        anthropicApiKey,
+        githubToken: process.env.GITHUB_TOKEN,
+      },
+    ),
+  );
+
+  if (outcome.kind === "review") {
+    const escSuffix =
+      outcome.severity === "critical"
+        ? ` severity=critical escalation=${outcome.escalationIdentifier ?? "(failed)"}`
+        : ` severity=routine`;
+    console.log(
+      `[runway review drain] ok — meta_review=${outcome.metaReviewId} linear=${outcome.linearIdentifier} (${outcome.linearUrl})${escSuffix}`,
+    );
+  } else if (outcome.kind === "no-run-reviews") {
+    console.log(
+      `[runway review drain] no Run Reviews for drain — nothing to grade. ${outcome.reason}`,
+    );
+  } else {
+    console.log(
+      `[runway review drain] stub-and-continue — meta_review=${outcome.metaReviewId} reason: ${outcome.reason}`,
+    );
+  }
+  // Drain Review failures stub and continue per PRD — exit code stays
+  // 0 regardless of outcome.kind. Same contract as Run Review.
+}
+
 type ParseResult =
   | {
       kind: "ok";
@@ -130,6 +197,35 @@ type ParseResult =
       force: boolean;
     }
   | { kind: "error"; message: string };
+
+type DrainParseResult =
+  | { kind: "ok"; traceId: string }
+  | { kind: "error"; message: string };
+
+/**
+ * VA-406: argv parser for `runway review drain --id <trace-id>`.
+ * Supports both space-separated (`--id X`) and equals (`--id=X`)
+ * forms. Unknown flags surface a typed error.
+ */
+export function parseDrainArgs(argv: readonly string[]): DrainParseResult {
+  let traceId: string | undefined;
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === undefined) continue;
+    const split = consumeFlag(arg, argv, i);
+    if (!split) continue;
+    if (split.name === "--id") {
+      traceId = split.value;
+      i = split.advance;
+    } else {
+      return { kind: "error", message: `unknown flag: ${split.name}` };
+    }
+  }
+  if (!traceId) {
+    return { kind: "error", message: "missing required --id <trace-id>" };
+  }
+  return { kind: "ok", traceId };
+}
 
 /**
  * Minimal argv parser — supports `--drain <id> --issue <id>` (with

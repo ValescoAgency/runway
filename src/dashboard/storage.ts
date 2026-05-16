@@ -323,6 +323,31 @@ export type MetaReviewKind =
   | "meta-skipped"
   | "meta-failed";
 
+/**
+ * VA-406: named constants for the `meta_reviews.kind` alphabet.
+ * Used by the IRA passes when stamping rows + by gateway queries
+ * that filter by kind, so the literal strings live in one place.
+ * Type narrows automatically via `as const`.
+ */
+export const META_REVIEW_KIND = {
+  RUN: "meta-run-review",
+  DRAIN: "meta-drain-review",
+  WEEKLY: "meta-weekly-review",
+  SKIPPED: "meta-skipped",
+  FAILED: "meta-failed",
+} as const satisfies Record<string, MetaReviewKind>;
+
+/**
+ * VA-406: kinds that count as "Run Review pass produced a terminal
+ * outcome for this issue" — the completion gate for the Drain Review
+ * trigger. `meta-skipped` and `meta-failed` both count, per AC.
+ */
+export const META_RUN_REVIEW_COMPLETION_KINDS = [
+  META_REVIEW_KIND.RUN,
+  META_REVIEW_KIND.SKIPPED,
+  META_REVIEW_KIND.FAILED,
+] as const satisfies readonly MetaReviewKind[];
+
 export interface MetaReviewRow {
   readonly id: string;
   readonly kind: MetaReviewKind;

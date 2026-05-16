@@ -12,6 +12,14 @@ vi.mock("../llm.js", async () => {
   };
 });
 
+// VA-406: mock the Drain Review pass module so the trigger tests can
+// assert call shape without exercising the drain pass's LLM /
+// persistence paths (those have their own test file).
+const runDrainReviewPassMock = vi.fn();
+vi.mock("./drain-review.js", () => ({
+  runDrainReviewPass: runDrainReviewPassMock,
+}));
+
 const { runRunReviewPass } = await import("./run-review.js");
 const { RUN_REVIEW_VERSION } = await import("../templates.js");
 
@@ -95,6 +103,16 @@ const buildFixtures = () => {
     // this category"). The pass only calls through when deps.normsWindow
     // is set + non-zero — most existing tests don't opt in.
     loadNorms: vi.fn(() => Effect.succeed(null)),
+    // VA-406: per-drain gateway methods that feed the Run Review →
+    // Drain Review trigger. Defaults: zero distinct issues (so the
+    // trigger never fires), zero completed Run Reviews, zero existing
+    // drain reviews, empty meta rows. Tests that exercise the trigger
+    // override per-test.
+    loadIssueProcessesForDrain: vi.fn(() => Effect.succeed([])),
+    countDistinctIssuesForDrain: vi.fn(() => Effect.succeed(0)),
+    countCompletedRunReviews: vi.fn(() => Effect.succeed(0)),
+    countDrainReviews: vi.fn(() => Effect.succeed(0)),
+    loadDrainMetaRows: vi.fn(() => Effect.succeed([])),
   } as unknown as import("../dashboard-read.js").MetaDashboardRead;
 
   const metaLinear = {
@@ -103,6 +121,22 @@ const buildFixtures = () => {
       Effect.succeed({
         identifier: "VA-1001",
         url: "https://linear.app/x/issue/VA-1001",
+      }),
+    ),
+    // VA-406: drain-review writes go through the same gateway. Default
+    // mocks succeed so the trigger path (when it fires in a test) lands
+    // cleanly; tests that exercise the drain-review pass build their
+    // own mocks with specific identifiers.
+    createDrainReviewIssue: vi.fn(() =>
+      Effect.succeed({
+        identifier: "VA-2001",
+        url: "https://linear.app/x/issue/VA-2001",
+      }),
+    ),
+    createRunwayRepoIssue: vi.fn(() =>
+      Effect.succeed({
+        identifier: "VA-3001",
+        url: "https://linear.app/x/issue/VA-3001",
       }),
     ),
   } as unknown as import("../linear-meta.js").MetaLinearGateway;
@@ -130,6 +164,21 @@ const validReview = {
 
 beforeEach(() => {
   callRunReviewMock.mockReset();
+  runDrainReviewPassMock.mockReset();
+  // VA-406: default — the drain trigger doesn't fire in most tests.
+  // When a test wants to assert non-firing, the default is already
+  // safe; tests that exercise the trigger override per-test.
+  runDrainReviewPassMock.mockReturnValue(
+    Effect.succeed({
+      kind: "review",
+      metaReviewId: "drain-review-id",
+      linearIdentifier: "VA-2001",
+      linearUrl: "https://linear.app/x/issue/VA-2001",
+      severity: "routine",
+      escalationIdentifier: null,
+      escalationUrl: null,
+    }),
+  );
 });
 
 describe("runRunReviewPass (VA-402)", () => {
@@ -655,5 +704,257 @@ describe("runRunReviewPass (VA-402)", () => {
       | undefined;
     expect(llmCall?.userPrompt).toContain("# Hindsight signals");
     expect(llmCall?.userPrompt).toContain('"state": "merged"');
+  });
+
+  // VA-406: Drain Review trigger. After every Run Review write
+  // (any kind), the pass checks whether all per-issue Run Reviews
+  // for the drain are now complete (count of completion rows ==
+  // distinct issue_processes for the drain). If yes AND no
+  // drain-review already exists, fire `runDrainReviewPass`.
+
+  describe("Drain Review trigger (VA-406)", () => {
+    it("fires the drain pass when this Run Review write completes the drain", async () => {
+      const f = buildFixtures();
+      callRunReviewMock.mockReturnValueOnce(
+        Effect.succeed({ ok: true, report: validReview }),
+      );
+      // Drain has 3 distinct issues; after THIS write completes, 3
+      // completion rows exist. Trigger should fire.
+      f.dashboardRead.countDistinctIssuesForDrain = vi.fn(() =>
+        Effect.succeed(3),
+      ) as unknown as typeof f.dashboardRead.countDistinctIssuesForDrain;
+      f.dashboardRead.countCompletedRunReviews = vi.fn(() =>
+        Effect.succeed(3),
+      ) as unknown as typeof f.dashboardRead.countCompletedRunReviews;
+      f.dashboardRead.countDrainReviews = vi.fn(() =>
+        Effect.succeed(0),
+      ) as unknown as typeof f.dashboardRead.countDrainReviews;
+
+      await Effect.runPromise(
+        runRunReviewPass(
+          { traceId: "trace-abc", issueIdentifier: "VA-1" },
+          {
+            anthropicApiKey: "test-key",
+            metaReviewModel: "claude-sonnet-4-6",
+            dashboardRead: f.dashboardRead,
+            metaLinear: f.metaLinear,
+            storage: f.storage,
+            delayHours: 0,
+          },
+        ),
+      );
+
+      expect(runDrainReviewPassMock).toHaveBeenCalledTimes(1);
+      const call = runDrainReviewPassMock.mock.calls[0];
+      expect(call?.[0]).toEqual({ traceId: "trace-abc" });
+      // Trigger reuses the same gateways + storage handle the run
+      // review pass already had wired — no fresh construction.
+      expect(call?.[1]?.dashboardRead).toBe(f.dashboardRead);
+      expect(call?.[1]?.storage).toBe(f.storage);
+      expect(call?.[1]?.metaLinear).toBe(f.metaLinear);
+    });
+
+    it("does NOT fire prematurely when other Run Reviews are still pending", async () => {
+      const f = buildFixtures();
+      callRunReviewMock.mockReturnValueOnce(
+        Effect.succeed({ ok: true, report: validReview }),
+      );
+      f.dashboardRead.countDistinctIssuesForDrain = vi.fn(() =>
+        Effect.succeed(3),
+      ) as unknown as typeof f.dashboardRead.countDistinctIssuesForDrain;
+      // 1 of 3 Run Reviews done — trigger should NOT fire.
+      f.dashboardRead.countCompletedRunReviews = vi.fn(() =>
+        Effect.succeed(1),
+      ) as unknown as typeof f.dashboardRead.countCompletedRunReviews;
+
+      await Effect.runPromise(
+        runRunReviewPass(
+          { traceId: "trace-abc", issueIdentifier: "VA-1" },
+          {
+            anthropicApiKey: "test-key",
+            metaReviewModel: "claude-sonnet-4-6",
+            dashboardRead: f.dashboardRead,
+            metaLinear: f.metaLinear,
+            storage: f.storage,
+            delayHours: 0,
+          },
+        ),
+      );
+
+      expect(runDrainReviewPassMock).not.toHaveBeenCalled();
+    });
+
+    it("does NOT fire when a drain-review already exists for the drain (idempotency)", async () => {
+      const f = buildFixtures();
+      callRunReviewMock.mockReturnValueOnce(
+        Effect.succeed({ ok: true, report: validReview }),
+      );
+      f.dashboardRead.countDistinctIssuesForDrain = vi.fn(() =>
+        Effect.succeed(1),
+      ) as unknown as typeof f.dashboardRead.countDistinctIssuesForDrain;
+      f.dashboardRead.countCompletedRunReviews = vi.fn(() =>
+        Effect.succeed(1),
+      ) as unknown as typeof f.dashboardRead.countCompletedRunReviews;
+      // A drain-review row already exists — a re-run of the same
+      // Run Review should NOT re-fire the drain pass.
+      f.dashboardRead.countDrainReviews = vi.fn(() =>
+        Effect.succeed(1),
+      ) as unknown as typeof f.dashboardRead.countDrainReviews;
+
+      await Effect.runPromise(
+        runRunReviewPass(
+          { traceId: "trace-abc", issueIdentifier: "VA-1" },
+          {
+            anthropicApiKey: "test-key",
+            metaReviewModel: "claude-sonnet-4-6",
+            dashboardRead: f.dashboardRead,
+            metaLinear: f.metaLinear,
+            storage: f.storage,
+            delayHours: 0,
+          },
+        ),
+      );
+
+      expect(runDrainReviewPassMock).not.toHaveBeenCalled();
+    });
+
+    it("fires after a meta-skipped write that completes the drain (skip counts as complete)", async () => {
+      const f = buildFixtures();
+      // Configure the agent report as a clean one-iter run so the
+      // heuristic filter trips → meta-skipped path.
+      f.dashboardRead.loadCodingAgentReport = vi.fn(() =>
+        Effect.succeed({
+          ok: true as const,
+          iterationIndex: 1,
+          templateVersion: "1.0.0",
+          payload: JSON.stringify({ approach: "fixture" }),
+        }),
+      ) as unknown as typeof f.dashboardRead.loadCodingAgentReport;
+      // Single-issue drain — after this skip, the drain is complete.
+      f.dashboardRead.countDistinctIssuesForDrain = vi.fn(() =>
+        Effect.succeed(1),
+      ) as unknown as typeof f.dashboardRead.countDistinctIssuesForDrain;
+      f.dashboardRead.countCompletedRunReviews = vi.fn(() =>
+        Effect.succeed(1),
+      ) as unknown as typeof f.dashboardRead.countCompletedRunReviews;
+
+      const outcome = await Effect.runPromise(
+        runRunReviewPass(
+          { traceId: "trace-abc", issueIdentifier: "VA-1" },
+          {
+            anthropicApiKey: "test-key",
+            metaReviewModel: "claude-sonnet-4-6",
+            dashboardRead: f.dashboardRead,
+            metaLinear: f.metaLinear,
+            storage: f.storage,
+            delayHours: 0,
+          },
+        ),
+      );
+
+      // Confirm the underlying path was the skip path (not LLM).
+      expect(outcome.kind).toBe("skipped");
+      // Trigger fires from the skip path too.
+      expect(runDrainReviewPassMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("fires after a meta-failed write that completes the drain (failed counts as complete)", async () => {
+      const f = buildFixtures();
+      // Force the LLM call to fail after retries → meta-failed path.
+      callRunReviewMock.mockReturnValueOnce(
+        Effect.fail({
+          _tag: "AnthropicServerError" as const,
+          status: 503,
+          message: "service unavailable",
+        }),
+      );
+      f.dashboardRead.countDistinctIssuesForDrain = vi.fn(() =>
+        Effect.succeed(1),
+      ) as unknown as typeof f.dashboardRead.countDistinctIssuesForDrain;
+      f.dashboardRead.countCompletedRunReviews = vi.fn(() =>
+        Effect.succeed(1),
+      ) as unknown as typeof f.dashboardRead.countCompletedRunReviews;
+
+      const outcome = await Effect.runPromise(
+        runRunReviewPass(
+          { traceId: "trace-abc", issueIdentifier: "VA-1" },
+          {
+            anthropicApiKey: "test-key",
+            metaReviewModel: "claude-sonnet-4-6",
+            dashboardRead: f.dashboardRead,
+            metaLinear: f.metaLinear,
+            storage: f.storage,
+            delayHours: 0,
+          },
+        ),
+      );
+
+      expect(outcome.kind).toBe("failed");
+      expect(runDrainReviewPassMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("does NOT fire when the drain has zero issue_processes (defensive)", async () => {
+      const f = buildFixtures();
+      callRunReviewMock.mockReturnValueOnce(
+        Effect.succeed({ ok: true, report: validReview }),
+      );
+      // Zero distinct issues — should NOT fire (defensive against
+      // a race where the meta_reviews row outraces the
+      // issue_processes flush; never happens in practice).
+      f.dashboardRead.countDistinctIssuesForDrain = vi.fn(() =>
+        Effect.succeed(0),
+      ) as unknown as typeof f.dashboardRead.countDistinctIssuesForDrain;
+      f.dashboardRead.countCompletedRunReviews = vi.fn(() =>
+        Effect.succeed(1),
+      ) as unknown as typeof f.dashboardRead.countCompletedRunReviews;
+
+      await Effect.runPromise(
+        runRunReviewPass(
+          { traceId: "trace-abc", issueIdentifier: "VA-1" },
+          {
+            anthropicApiKey: "test-key",
+            metaReviewModel: "claude-sonnet-4-6",
+            dashboardRead: f.dashboardRead,
+            metaLinear: f.metaLinear,
+            storage: f.storage,
+            delayHours: 0,
+          },
+        ),
+      );
+
+      expect(runDrainReviewPassMock).not.toHaveBeenCalled();
+    });
+
+    it("swallows a trigger-side gateway error — the Run Review outcome still lands cleanly", async () => {
+      const f = buildFixtures();
+      callRunReviewMock.mockReturnValueOnce(
+        Effect.succeed({ ok: true, report: validReview }),
+      );
+      f.dashboardRead.countCompletedRunReviews = vi.fn(() =>
+        Effect.fail({
+          _tag: "MetaReadDatabaseError" as const,
+          call: "countCompletedRunReviews",
+          message: "sqlite unreachable",
+        }),
+      ) as unknown as typeof f.dashboardRead.countCompletedRunReviews;
+
+      const outcome = await Effect.runPromise(
+        runRunReviewPass(
+          { traceId: "trace-abc", issueIdentifier: "VA-1" },
+          {
+            anthropicApiKey: "test-key",
+            metaReviewModel: "claude-sonnet-4-6",
+            dashboardRead: f.dashboardRead,
+            metaLinear: f.metaLinear,
+            storage: f.storage,
+            delayHours: 0,
+          },
+        ),
+      );
+
+      // Primary path still succeeds — the trigger is best-effort.
+      expect(outcome.kind).toBe("review");
+      expect(runDrainReviewPassMock).not.toHaveBeenCalled();
+    });
   });
 });

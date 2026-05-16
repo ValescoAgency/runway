@@ -11,6 +11,10 @@ import {
   type MetaFilterThresholds,
 } from "./heuristic-filter.js";
 import { createMetaLinearGateway } from "./linear-meta.js";
+import {
+  runDrainReviewPass,
+  type DrainReviewPassOutcome,
+} from "./passes/drain-review.js";
 import { runRunReviewPass, type RunReviewPassOutcome } from "./passes/run-review.js";
 
 /**
@@ -91,49 +95,87 @@ export function resolveMetaConfig(env: {
    */
   readonly metaReviewDelayHours: number;
   readonly metaFilterThresholds: MetaFilterThresholds;
+  /**
+   * VA-406: project name for severity-critical Drain Review
+   * escalations. Undefined means "skip project assignment on the
+   * escalation issue; just put it on the team."
+   */
+  readonly runwayRepoProjectName: string | undefined;
   readonly source: {
     readonly model: string;
     readonly project: string;
     readonly delayHours: string;
     readonly thresholds: string;
+    readonly runwayRepoProject: string;
   };
 } {
   const file = loadRunwayConfigFile(env.cwd);
-  const model = env.config.metaReviewModel
-    ? { value: env.config.metaReviewModel, source: "env" }
-    : file.metaReviewModel
-      ? { value: file.metaReviewModel, source: ".runway/config.yml" }
-      : { value: DEFAULT_META_REVIEW_MODEL, source: "default" };
-  const project = env.config.metaProjectName
-    ? { value: env.config.metaProjectName, source: "env" }
-    : file.metaProjectName
-      ? { value: file.metaProjectName, source: ".runway/config.yml" }
-      : { value: DEFAULT_META_PROJECT_NAME, source: "default" };
-  const delay =
-    env.config.metaReviewDelayHours !== undefined
-      ? { value: env.config.metaReviewDelayHours, source: "env" }
-      : file.metaReviewDelayHours !== undefined
-        ? { value: file.metaReviewDelayHours, source: ".runway/config.yml" }
-        : { value: DEFAULT_META_REVIEW_DELAY_HOURS, source: "default" };
+  const model = resolveLayered(
+    env.config.metaReviewModel,
+    file.metaReviewModel,
+    DEFAULT_META_REVIEW_MODEL,
+  );
+  const project = resolveLayered(
+    env.config.metaProjectName,
+    file.metaProjectName,
+    DEFAULT_META_PROJECT_NAME,
+  );
+  const delay = resolveLayered(
+    env.config.metaReviewDelayHours,
+    file.metaReviewDelayHours,
+    DEFAULT_META_REVIEW_DELAY_HOURS,
+  );
   // VA-404: env JSON override → file block → hardcoded defaults.
   // The env knob is one-off only — operators tuning thresholds for
   // real edit `.runway/config.yml`. Each missing field falls through
   // to the default individually, so a partial override (just
   // `minIterationCount`) doesn't reset the other knob.
   const thresholds = resolveThresholds(env.config.metaFilterThresholds, file.metaFilterThresholds);
+  // VA-406: no hardcoded default — absence means "skip project
+  // assignment on critical-severity escalations."
+  const runwayRepoProject = resolveLayered<string | undefined>(
+    env.config.runwayRepoProjectName,
+    file.runwayRepoProjectName,
+    undefined,
+  );
   return {
     metaReviewModel: model.value,
     metaProjectName: project.value,
     metaReviewDelayHours: delay.value,
     metaFilterThresholds: thresholds.value,
+    runwayRepoProjectName: runwayRepoProject.value,
     source: {
       model: model.source,
       project: project.source,
       delayHours: delay.source,
       thresholds: thresholds.source,
+      runwayRepoProject: runwayRepoProject.source,
     },
   };
 }
+
+/**
+ * VA-406: env → file → default resolution for a single knob. Flattens
+ * the otherwise-nested ternary chain `resolveMetaConfig` was repeating
+ * for each knob. Returns the resolved value + which layer provided it
+ * so `source.<name>` stays an honest audit trail.
+ *
+ * `undefined` in `fromEnv` / `fromFile` means "unset at that layer" —
+ * we fall through. Other falsy values (empty string, zero) are
+ * treated as set; operators who explicitly want an empty string have
+ * intentionally typed it.
+ */
+const resolveLayered = <T>(
+  fromEnv: T | undefined,
+  fromFile: T | undefined,
+  defaultValue: T,
+): { readonly value: T; readonly source: string } => {
+  if (fromEnv !== undefined) return { value: fromEnv, source: "env" };
+  if (fromFile !== undefined) {
+    return { value: fromFile, source: ".runway/config.yml" };
+  }
+  return { value: defaultValue, source: "default" };
+};
 
 const resolveThresholds = (
   fromEnv: Partial<MetaFilterThresholds> | undefined,
@@ -176,6 +218,9 @@ export const dispatchRunReview = (
         linearApiKey: env.config.linearApiKey as Redacted.Redacted<string>,
         linearTeam: env.config.linearTeam,
         metaProjectName: resolved.metaProjectName,
+        // VA-406: optional. When unset, escalation issues land in the
+        // team with their labels but skip project assignment.
+        runwayRepoProjectName: resolved.runwayRepoProjectName,
       });
       // VA-403: hindsight gateways. GitHub may run unauthenticated
       // (sufficient for public repos, 60 reqs/hr); Linear uses the
@@ -209,6 +254,51 @@ export const dispatchRunReview = (
           // relative slots) automatically when the category has no rows
           // in the window, so no operator opt-in is needed.
           normsWindow: DEFAULT_META_NORMS_WINDOW_DRAINS,
+        },
+      );
+    } finally {
+      storage.close();
+    }
+  });
+
+export interface DrainReviewArgs {
+  readonly traceId: string;
+}
+
+/**
+ * VA-406: invoke the Drain Review pass end-to-end. Same lifetime
+ * management as `dispatchRunReview` — opens the storage handle, builds
+ * gateways, runs the pass, closes the handle in `finally`. The CLI
+ * verb (`runway review drain --id <drain-id>`) routes through here
+ * for operator / scheduled invocations; the Run Review trigger
+ * (VA-406 AC4) calls `runDrainReviewPass` directly instead of going
+ * through this dispatch — the gateways are already wired in that
+ * context, so we'd just be opening a second SQLite handle for no
+ * reason.
+ */
+export const dispatchDrainReview = (
+  args: DrainReviewArgs,
+  env: RunnerEnv,
+): Effect.Effect<DrainReviewPassOutcome, never, never> =>
+  Effect.gen(function* () {
+    const resolved = resolveMetaConfig(env);
+    const storage = createStorage(env.dashboardDbPath);
+    try {
+      const dashboardRead = createMetaDashboardRead(env.dashboardDbPath);
+      const metaLinear = createMetaLinearGateway({
+        linearApiKey: env.config.linearApiKey as Redacted.Redacted<string>,
+        linearTeam: env.config.linearTeam,
+        metaProjectName: resolved.metaProjectName,
+        runwayRepoProjectName: resolved.runwayRepoProjectName,
+      });
+      return yield* runDrainReviewPass(
+        { traceId: args.traceId },
+        {
+          anthropicApiKey: env.anthropicApiKey,
+          metaReviewModel: resolved.metaReviewModel,
+          dashboardRead,
+          metaLinear,
+          storage,
         },
       );
     } finally {

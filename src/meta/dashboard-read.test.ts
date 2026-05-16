@@ -286,3 +286,295 @@ describe("MetaDashboardRead.loadNorms (VA-405)", () => {
     expect(eng.infraErrorRate).toBe(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// VA-406: per-drain gateway methods feeding the Drain Review pass and
+// the Run Review → Drain Review trigger.
+// ---------------------------------------------------------------------------
+
+describe("MetaDashboardRead.loadIssueProcessesForDrain (VA-406)", () => {
+  it("returns every issue_process for the drain in start-time order", async () => {
+    const trace = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    seedDrain(trace, "1000000000000000000");
+    // Insert two issues out of natural order; the gateway sorts on
+    // start_time_unix_nano ASC. To keep this deterministic, seedProcess
+    // uses the same start nano for every row — fall back to the
+    // span_id tie-breaker, which sorts the inserts deterministically.
+    seedProcess({
+      traceId: trace,
+      spanId: "bbbb000000000002",
+      identifier: "VA-2",
+      outcomeKind: "opened",
+      wallMs: 1000,
+      iterations: 1,
+    });
+    seedProcess({
+      traceId: trace,
+      spanId: "aaaa000000000001",
+      identifier: "VA-1",
+      outcomeKind: "hitl",
+      outcomeDetail: "Max iterations",
+      wallMs: 500,
+      iterations: 5,
+    });
+
+    const rows = await Effect.runPromise(
+      gateway.loadIssueProcessesForDrain(trace),
+    );
+    expect(rows).toHaveLength(2);
+    // Same start time → span_id tie-break ascending.
+    expect(rows.map((r) => r.issueIdentifier)).toEqual(["VA-1", "VA-2"]);
+    expect(rows[0]?.outcomeKind).toBe("hitl");
+    expect(rows[1]?.outcomeKind).toBe("opened");
+  });
+
+  it("returns an empty list when the drain has no issue_processes yet", async () => {
+    const rows = await Effect.runPromise(
+      gateway.loadIssueProcessesForDrain("no-such-trace"),
+    );
+    expect(rows).toEqual([]);
+  });
+});
+
+describe("MetaDashboardRead.countDistinctIssuesForDrain (VA-406)", () => {
+  it("counts each distinct issue_identifier once even when seeded multiple times", async () => {
+    const trace = "11223344556677889900aabbccddeeff";
+    seedDrain(trace, "1000000000000000000");
+    seedProcess({
+      traceId: trace,
+      spanId: "sp-a-1",
+      identifier: "VA-1",
+      outcomeKind: "opened",
+      wallMs: 100,
+      iterations: 1,
+    });
+    seedProcess({
+      traceId: trace,
+      spanId: "sp-a-2",
+      // Same identifier on a second span — duplicate run, dedupe to 1.
+      identifier: "VA-1",
+      outcomeKind: "opened",
+      wallMs: 100,
+      iterations: 1,
+    });
+    seedProcess({
+      traceId: trace,
+      spanId: "sp-b-1",
+      identifier: "VA-2",
+      outcomeKind: "hitl",
+      wallMs: 100,
+      iterations: 1,
+    });
+
+    const n = await Effect.runPromise(
+      gateway.countDistinctIssuesForDrain(trace),
+    );
+    expect(n).toBe(2);
+  });
+
+  it("returns 0 when the drain has no issue_processes", async () => {
+    const n = await Effect.runPromise(
+      gateway.countDistinctIssuesForDrain("no-such-trace"),
+    );
+    expect(n).toBe(0);
+  });
+});
+
+describe("MetaDashboardRead.countCompletedRunReviews (VA-406)", () => {
+  function seedMetaReview(
+    drainId: string,
+    kind: string,
+    issueId: string,
+  ): void {
+    storage.saveMetaReview({
+      id: `${drainId}-${kind}-${issueId}`,
+      kind: kind as never,
+      scope: issueId,
+      drainId,
+      issueId,
+      contentJson: "{}",
+      templateVersion: "1.0.0",
+      createdAt: new Date().toISOString(),
+    });
+  }
+
+  it("counts meta-run-review, meta-skipped, and meta-failed rows", async () => {
+    const trace = "cccccccccccccccccccccccccccccccc";
+    seedDrain(trace, "1000000000000000000");
+    seedMetaReview(trace, "meta-run-review", "VA-1");
+    seedMetaReview(trace, "meta-skipped", "VA-2");
+    seedMetaReview(trace, "meta-failed", "VA-3");
+    // meta-drain-review does NOT count toward the completion gate —
+    // that's the trigger output, not a Run Review pass output.
+    seedMetaReview(trace, "meta-drain-review", "VA-1");
+
+    const n = await Effect.runPromise(
+      gateway.countCompletedRunReviews(trace),
+    );
+    expect(n).toBe(3);
+  });
+
+  it("scopes by drain — rows from other drains don't bleed in", async () => {
+    const traceA = "dddddddddddddddddddddddddddddddd";
+    const traceB = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    seedDrain(traceA, "1000000000000000000");
+    seedDrain(traceB, "1000000000000000000");
+    seedMetaReview(traceA, "meta-run-review", "VA-1");
+    seedMetaReview(traceB, "meta-run-review", "VA-2");
+
+    const a = await Effect.runPromise(
+      gateway.countCompletedRunReviews(traceA),
+    );
+    const b = await Effect.runPromise(
+      gateway.countCompletedRunReviews(traceB),
+    );
+    expect(a).toBe(1);
+    expect(b).toBe(1);
+  });
+
+  it("returns 0 when no rows match", async () => {
+    const n = await Effect.runPromise(
+      gateway.countCompletedRunReviews("no-such-trace"),
+    );
+    expect(n).toBe(0);
+  });
+
+  // Regression: meta_reviews preserves reruns, so the trigger gate must
+  // count *distinct per-issue* completions. Two terminal rows for the
+  // same issue must not falsely satisfy the gate while another issue
+  // has no Run Review yet.
+  it("dedupes by issue_id so reruns don't inflate the completion count", async () => {
+    const trace = "f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0";
+    seedDrain(trace, "1000000000000000000");
+    seedMetaReview(trace, "meta-run-review", "VA-1");
+    storage.saveMetaReview({
+      id: `${trace}-rerun-VA-1`,
+      kind: "meta-run-review",
+      scope: "VA-1",
+      drainId: trace,
+      issueId: "VA-1",
+      contentJson: "{}",
+      templateVersion: "1.0.0",
+      createdAt: new Date().toISOString(),
+    });
+
+    const n = await Effect.runPromise(
+      gateway.countCompletedRunReviews(trace),
+    );
+    expect(n).toBe(1);
+  });
+
+  // Regression: a failed Drain Review writes a `meta-failed` stub at
+  // the drain level (issue_id = null). That row must not contribute to
+  // the Run Review completion count.
+  it("ignores drain-level meta-failed stubs with null issue_id", async () => {
+    const trace = "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f";
+    seedDrain(trace, "1000000000000000000");
+    seedMetaReview(trace, "meta-run-review", "VA-1");
+    storage.saveMetaReview({
+      id: `${trace}-drain-failed-stub`,
+      kind: "meta-failed",
+      scope: trace,
+      drainId: trace,
+      issueId: null,
+      contentJson: "{}",
+      templateVersion: "1.0.0",
+      createdAt: new Date().toISOString(),
+    });
+
+    const n = await Effect.runPromise(
+      gateway.countCompletedRunReviews(trace),
+    );
+    expect(n).toBe(1);
+  });
+});
+
+describe("MetaDashboardRead.countDrainReviews (VA-406)", () => {
+  it("counts meta-drain-review rows only", async () => {
+    const trace = "ffffffffffffffffffffffffffffffff";
+    seedDrain(trace, "1000000000000000000");
+    storage.saveMetaReview({
+      id: `${trace}-drain-1`,
+      kind: "meta-drain-review",
+      scope: trace,
+      drainId: trace,
+      issueId: null,
+      contentJson: "{}",
+      templateVersion: "1.0.0",
+      createdAt: new Date().toISOString(),
+    });
+    storage.saveMetaReview({
+      id: `${trace}-run-1`,
+      kind: "meta-run-review",
+      scope: "VA-1",
+      drainId: trace,
+      issueId: "VA-1",
+      contentJson: "{}",
+      templateVersion: "1.2.0",
+      createdAt: new Date().toISOString(),
+    });
+
+    const n = await Effect.runPromise(gateway.countDrainReviews(trace));
+    expect(n).toBe(1);
+  });
+});
+
+describe("MetaDashboardRead.loadDrainMetaRows (VA-406)", () => {
+  it("returns Run Review + skip + failed rows, ordered by created_at ASC", async () => {
+    const trace = "00112233445566778899aabbccddeeff";
+    seedDrain(trace, "1000000000000000000");
+
+    // Insert with explicit createdAt to lock ordering.
+    storage.saveMetaReview({
+      id: "row-3-newest",
+      kind: "meta-failed",
+      scope: "VA-3",
+      drainId: trace,
+      issueId: "VA-3",
+      contentJson: '{"reason":"LLM timeout"}',
+      templateVersion: "1.0.0",
+      createdAt: "2026-05-16 12:00:03",
+    });
+    storage.saveMetaReview({
+      id: "row-1-oldest",
+      kind: "meta-run-review",
+      scope: "VA-1",
+      drainId: trace,
+      issueId: "VA-1",
+      contentJson: '{"review":{"issue_identifier":"VA-1"}}',
+      templateVersion: "1.2.0",
+      createdAt: "2026-05-16 12:00:01",
+    });
+    storage.saveMetaReview({
+      id: "row-2-middle",
+      kind: "meta-skipped",
+      scope: "VA-2",
+      drainId: trace,
+      issueId: "VA-2",
+      contentJson: '{"reason":"clean run"}',
+      templateVersion: "1.2.0",
+      createdAt: "2026-05-16 12:00:02",
+    });
+    // A drain-review row must NOT appear in the result — only the
+    // Run-Review-pass outputs feed the drain-review context.
+    storage.saveMetaReview({
+      id: "row-drain",
+      kind: "meta-drain-review",
+      scope: trace,
+      drainId: trace,
+      issueId: null,
+      contentJson: "{}",
+      templateVersion: "1.0.0",
+      createdAt: "2026-05-16 12:00:99",
+    });
+
+    const rows = await Effect.runPromise(gateway.loadDrainMetaRows(trace));
+    expect(rows.map((r) => r.id)).toEqual([
+      "row-1-oldest",
+      "row-2-middle",
+      "row-3-newest",
+    ]);
+    expect(rows.every((r) => r.kind !== "meta-drain-review")).toBe(true);
+    expect(rows[0]?.contentJson).toContain("VA-1");
+  });
+});

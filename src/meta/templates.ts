@@ -354,6 +354,77 @@ export function parseRunReview(text: string): ReportParseResult<RunReview> {
 }
 
 // ---------------------------------------------------------------------------
+// Drain Review (v1.0.0) — IRA's per-drain retrospective verdict
+// ---------------------------------------------------------------------------
+
+export const DRAIN_REVIEW_VERSION = "1.0.0";
+export const DRAIN_REVIEW_FENCE_TAG = "runway-drain-review";
+
+/**
+ * VA-406: outcome rollup for the drain. Counts mirror the run-review
+ * outcome alphabet plus the IRA-specific `meta-failed` / `meta-skipped`
+ * kinds so the operator can read drain composition from a single
+ * section. Open shape (`z.record`) so a future outcome variant (e.g.
+ * "skipped-claim-race" from VA-423) lands without a schema bump.
+ */
+const DrainOutcomeSummarySchema = z.record(z.string(), z.number());
+
+/**
+ * VA-406: one notable per-issue event for the drain review body. The
+ * IRA picks events that say something interesting about the drain
+ * (severe HITL escapes, retried-and-recovered runs, outlier
+ * wall-times). `run_review_url` is the cross-link into runway-meta so
+ * the operator can drill from the drain summary into the per-issue
+ * review without searching.
+ */
+const NotableEventSchema = z.object({
+  issue_identifier: z.string().min(1),
+  event: z.string().min(1),
+  run_review_url: z.string().nullable(),
+});
+
+/**
+ * VA-406: severity gate. `critical` triggers the runway-repo
+ * escalation path (a Linear issue in the team's runway-repo project
+ * with `Bug` + `runway-meta-promoted` labels). `routine` (default)
+ * stops at runway-meta. Gate criteria live in the IRA's system
+ * prompt: "only mark critical if this finding makes the next drain
+ * unsafe or loses captured data."
+ */
+const SeveritySchema = z.enum(["critical", "routine"]);
+
+const DrainReviewSchema = z.object({
+  template_version: z.string(),
+  drain_trace_id: z.string().min(1),
+  issue_count: z.number().nonnegative(),
+  outcomes_summary: DrainOutcomeSummarySchema,
+  sequencing_assessment: z.string(),
+  cross_issue_patterns: z.array(z.string()),
+  notable_events: z.array(NotableEventSchema),
+  recommendations: z.array(RecommendationSchema),
+  severity: SeveritySchema,
+  // Required when severity === "critical" — gives the operator the
+  // line of reasoning behind the escalation. The IRA's prompt
+  // instructs the model to write this even for `routine` (one line
+  // explaining why it's not critical) so a future audit can read
+  // the model's confidence either way.
+  severity_justification: z.string(),
+});
+
+export type DrainOutcomeSummary = z.infer<typeof DrainOutcomeSummarySchema>;
+export type NotableEvent = z.infer<typeof NotableEventSchema>;
+export type Severity = z.infer<typeof SeveritySchema>;
+export type DrainReview = z.infer<typeof DrainReviewSchema>;
+
+export function parseDrainReview(text: string): ReportParseResult<DrainReview> {
+  return parseReport(text, {
+    fenceTag: DRAIN_REVIEW_FENCE_TAG,
+    schema: DrainReviewSchema,
+    expectedMajor: parseMajor(DRAIN_REVIEW_VERSION),
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Generic parser — fence extraction → JSON parse → version handshake
 // → schema validation
 // ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseRunArgs } from "./review.js";
+import { parseDrainArgs, parseRunArgs } from "./review.js";
 
 // VA-402: argv parser tests for `runway review run`. Lock the
 // space-separated form, the `=` form, and the error cases — the
@@ -110,5 +110,43 @@ describe("parseRunArgs (VA-402)", () => {
     if (r.kind !== "ok") return;
     expect(r.force).toBe(true);
     expect(r.traceId).toBe("deadbeef");
+  });
+});
+
+// VA-406: parseDrainArgs tests for `runway review drain --id <trace-id>`.
+// Locks the space-separated form, the equals form, and the error
+// branches — operators and schedulers (cron / Actions) both depend on
+// the shape staying stable.
+
+describe("parseDrainArgs (VA-406)", () => {
+  it("parses the space-separated form", () => {
+    const r = parseDrainArgs([
+      "--id",
+      "0123456789abcdef0123456789abcdef",
+    ]);
+    expect(r.kind).toBe("ok");
+    if (r.kind !== "ok") return;
+    expect(r.traceId).toBe("0123456789abcdef0123456789abcdef");
+  });
+
+  it("parses the equals form", () => {
+    const r = parseDrainArgs(["--id=0123456789abcdef0123456789abcdef"]);
+    expect(r.kind).toBe("ok");
+    if (r.kind !== "ok") return;
+    expect(r.traceId).toBe("0123456789abcdef0123456789abcdef");
+  });
+
+  it("errors when --id is missing", () => {
+    const r = parseDrainArgs([]);
+    expect(r.kind).toBe("error");
+    if (r.kind !== "error") return;
+    expect(r.message).toContain("--id");
+  });
+
+  it("errors on an unknown flag", () => {
+    const r = parseDrainArgs(["--id=deadbeef", "--what", "huh"]);
+    expect(r.kind).toBe("error");
+    if (r.kind !== "error") return;
+    expect(r.message).toContain("--what");
   });
 });

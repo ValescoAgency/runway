@@ -2,11 +2,14 @@ import { describe, expect, it } from "vitest";
 import {
   CODING_AGENT_REPORT_FENCE_TAG,
   CODING_AGENT_REPORT_VERSION,
+  DRAIN_REVIEW_FENCE_TAG,
+  DRAIN_REVIEW_VERSION,
   REVIEWER_REPORT_FENCE_TAG,
   REVIEWER_REPORT_VERSION,
   RUN_REVIEW_FENCE_TAG,
   RUN_REVIEW_VERSION,
   parseCodingAgentReport,
+  parseDrainReview,
   parseReviewerReport,
   parseRunReview,
 } from "./templates.js";
@@ -647,5 +650,133 @@ describe("parseRunReview (VA-402)", () => {
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.error.kind).toBe("schema-mismatch");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// VA-406: Drain Review (v1.0.0) — IRA's per-drain retrospective verdict
+// ---------------------------------------------------------------------------
+
+const wrapDrainReview = (json: string): string =>
+  ["```" + DRAIN_REVIEW_FENCE_TAG, json, "```"].join("\n");
+
+const VALID_DRAIN_REVIEW = {
+  template_version: DRAIN_REVIEW_VERSION,
+  drain_trace_id: "0123456789abcdef0123456789abcdef",
+  issue_count: 3,
+  outcomes_summary: {
+    opened: 2,
+    hitl: 1,
+  },
+  sequencing_assessment:
+    "Two unrelated UI fixes ran first, then a schema migration — order was fine.",
+  cross_issue_patterns: [
+    "All three runs touched src/dashboard/; no merge conflicts.",
+  ],
+  notable_events: [
+    {
+      issue_identifier: "VA-401",
+      event: "HITL escape after 2 rejection cycles; reviewer disagreed with itself.",
+      run_review_url: "https://linear.app/x/issue/VA-1001",
+    },
+  ],
+  recommendations: [
+    {
+      target: "prompt",
+      change: "Reviewer prompt should declare verdict consistency rule.",
+      confidence: "MEDIUM",
+    },
+  ],
+  severity: "routine",
+  severity_justification:
+    "HITL escape was a recoverable judgement call, not a data-loss event.",
+};
+
+describe("parseDrainReview (VA-406)", () => {
+  it("parses a well-formed Drain Review at v1.0.0", () => {
+    const stdout = [
+      "Preamble from the IRA's drain pass.",
+      wrapDrainReview(JSON.stringify(VALID_DRAIN_REVIEW)),
+    ].join("\n");
+    const result = parseDrainReview(stdout);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.drain_trace_id).toBe(
+      "0123456789abcdef0123456789abcdef",
+    );
+    expect(result.report.issue_count).toBe(3);
+    expect(result.report.outcomes_summary.opened).toBe(2);
+    expect(result.report.severity).toBe("routine");
+    expect(result.report.recommendations).toHaveLength(1);
+    expect(result.report.notable_events[0]?.run_review_url).toMatch(/linear/);
+  });
+
+  it("accepts severity: critical with justification", () => {
+    const critical = {
+      ...VALID_DRAIN_REVIEW,
+      severity: "critical",
+      severity_justification:
+        "Orchestrator silently dropped two issue_processes — captured data lost.",
+    };
+    const result = parseDrainReview(wrapDrainReview(JSON.stringify(critical)));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.severity).toBe("critical");
+    expect(result.report.severity_justification).toMatch(/data lost/);
+  });
+
+  it("rejects an unknown severity value (out of the critical|routine alphabet)", () => {
+    const bad = {
+      ...VALID_DRAIN_REVIEW,
+      severity: "urgent",
+    };
+    const result = parseDrainReview(wrapDrainReview(JSON.stringify(bad)));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.kind).toBe("schema-mismatch");
+  });
+
+  it("returns missing-block when no runway-drain-review fence is present", () => {
+    const result = parseDrainReview("no fence here");
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.kind).toBe("missing-block");
+  });
+
+  it("rejects a major-bump payload before the schema gate fires", () => {
+    const stdout = wrapDrainReview(
+      JSON.stringify({ template_version: "2.0.0" }),
+    );
+    const result = parseDrainReview(stdout);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.kind).toBe("version-mismatch");
+  });
+
+  it("accepts a forward-compatible minor version inside the current major", () => {
+    const stdout = wrapDrainReview(
+      JSON.stringify({ ...VALID_DRAIN_REVIEW, template_version: "1.5.0" }),
+    );
+    const result = parseDrainReview(stdout);
+    expect(result.ok).toBe(true);
+  });
+
+  it("tolerates an open outcomes_summary shape (future outcome kinds)", () => {
+    // VA-423 introduced a "skipped" outcome variant the schema didn't
+    // know about; the open `Record<string, number>` shape means a
+    // future addition lands without a major bump.
+    const futureOutcomes = {
+      ...VALID_DRAIN_REVIEW,
+      outcomes_summary: {
+        opened: 1,
+        "skipped-claim-race": 2,
+        "totally-new-kind": 1,
+      },
+      issue_count: 4,
+    };
+    const result = parseDrainReview(wrapDrainReview(JSON.stringify(futureOutcomes)));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.outcomes_summary["skipped-claim-race"]).toBe(2);
   });
 });
