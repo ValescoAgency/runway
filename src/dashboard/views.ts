@@ -968,9 +968,10 @@ function renderMetaReviewKindChips(
   state: MetaReviewListFilterState,
 ): string {
   const allActive = state.kind === null;
-  const allHref =
-    metaReviewFilterToQuery({ kind: null, page: 1 }) || "/meta-reviews";
-  const allChip = `<a class="filter-chip${allActive ? " active" : ""}" href="/meta-reviews${allHref}">all</a>`;
+  // The query helper returns "" for the all-defaults state, so the
+  // path concatenation naturally collapses to "/meta-reviews".
+  const allHref = `/meta-reviews${metaReviewFilterToQuery({ kind: null, page: 1 })}`;
+  const allChip = `<a class="filter-chip${allActive ? " active" : ""}" href="${escapeHtml(allHref)}">all</a>`;
   const chips = META_REVIEW_KIND_ORDER.map((kind) => {
     const active = state.kind === kind;
     const next = active ? null : kind;
@@ -1160,9 +1161,17 @@ function renderFailedSection(obj: Record<string, unknown>): string {
   const blocks: string[] = [
     `<div class="meta-failed-banner">FAILED — ${escapeHtml(reason)}</div>`,
   ];
-  if (typeof obj.linear_url === "string" && obj.linear_url.length > 0) {
+  // Render the stub row when either a Linear identifier or URL is
+  // present. `renderExternalAnchor` falls back to plain text when the
+  // URL is rejected by the scheme allowlist so the operator still
+  // sees the identifier even on a poisoned content_json.
+  if (
+    typeof obj.linear_identifier === "string" ||
+    typeof obj.linear_url === "string"
+  ) {
+    const label = String(obj.linear_identifier ?? obj.linear_url ?? "");
     blocks.push(
-      `<div class="meta"><span class="label">linear stub:</span> <a href="${escapeHtml(obj.linear_url)}" rel="noopener noreferrer" target="_blank">${escapeHtml(String(obj.linear_identifier ?? obj.linear_url))}</a></div>`,
+      `<div class="meta"><span class="label">linear stub:</span> ${renderExternalAnchor(obj.linear_url, label)}</div>`,
     );
   }
   if (typeof obj.secondary_linear_error === "string") {
@@ -1186,19 +1195,14 @@ function renderRunReviewSection(
 ): string {
   const review = (obj.review ?? obj) as Record<string, unknown>;
   const blocks: string[] = [];
-  const linearUrl =
-    typeof obj.linear_url === "string"
-      ? obj.linear_url
-      : typeof obj.linear_url === "object"
-        ? null
-        : null;
+  const linearUrl = safeExternalHref(obj.linear_url);
   const linearIdentifier =
     typeof obj.linear_issue_identifier === "string"
       ? obj.linear_issue_identifier
       : null;
   if (linearUrl && linearIdentifier) {
     blocks.push(
-      `<div class="meta"><span class="label">linear:</span> <a href="${escapeHtml(linearUrl)}" rel="noopener noreferrer" target="_blank">${escapeHtml(linearIdentifier)}</a></div>`,
+      `<div class="meta"><span class="label">linear:</span> ${renderExternalAnchor(linearUrl, linearIdentifier)}</div>`,
     );
   }
   if (typeof review.final_outcome === "string") {
@@ -1265,10 +1269,10 @@ function renderRunReviewSection(
   if (hs && typeof hs === "object") {
     const parts: string[] = [];
     if (hs.pr && typeof hs.pr === "object") {
-      const prUrl = typeof hs.pr.url === "string" ? hs.pr.url : null;
+      const prUrl = safeExternalHref(hs.pr.url);
       const prState = typeof hs.pr.state === "string" ? hs.pr.state : "?";
       parts.push(
-        `<div><span class="label">PR:</span> ${prUrl ? `<a href="${escapeHtml(prUrl)}" rel="noopener noreferrer" target="_blank">${escapeHtml(prUrl)}</a>` : "—"} (<code>${escapeHtml(prState)}</code>)</div>`,
+        `<div><span class="label">PR:</span> ${prUrl ? renderExternalAnchor(prUrl, prUrl) : "—"} (<code>${escapeHtml(prState)}</code>)</div>`,
       );
     }
     if (hs.human_verdict && typeof hs.human_verdict === "object") {
@@ -1309,9 +1313,10 @@ function renderDrainReviewSection(
 ): string {
   const review = (obj.review ?? obj) as Record<string, unknown>;
   const blocks: string[] = [];
-  if (typeof obj.linear_url === "string" && typeof obj.linear_identifier === "string") {
+  const drainLinearUrl = safeExternalHref(obj.linear_url);
+  if (drainLinearUrl && typeof obj.linear_identifier === "string") {
     blocks.push(
-      `<div class="meta"><span class="label">linear:</span> <a href="${escapeHtml(obj.linear_url)}" rel="noopener noreferrer" target="_blank">${escapeHtml(obj.linear_identifier)}</a></div>`,
+      `<div class="meta"><span class="label">linear:</span> ${renderExternalAnchor(drainLinearUrl, obj.linear_identifier)}</div>`,
     );
   }
   if (typeof review.severity === "string") {
@@ -1348,10 +1353,7 @@ function renderDrainReviewSection(
         if (!e || typeof e !== "object") return "";
         const ev = e as { issue_identifier?: unknown; event?: unknown; run_review_url?: unknown };
         const idText = String(ev.issue_identifier ?? "?");
-        const link =
-          typeof ev.run_review_url === "string"
-            ? `<a href="${escapeHtml(ev.run_review_url)}" rel="noopener noreferrer" target="_blank">${escapeHtml(idText)}</a>`
-            : escapeHtml(idText);
+        const link = renderExternalAnchor(ev.run_review_url, idText);
         return `<li>${link}: ${escapeHtml(String(ev.event ?? ""))}</li>`;
       })
       .join("");
@@ -1379,9 +1381,10 @@ function renderDrainReviewSection(
 function renderWeeklyReviewSection(obj: Record<string, unknown>): string {
   const review = (obj.review ?? obj) as Record<string, unknown>;
   const blocks: string[] = [];
-  if (typeof obj.linear_url === "string" && typeof obj.linear_identifier === "string") {
+  const weeklyLinearUrl = safeExternalHref(obj.linear_url);
+  if (weeklyLinearUrl && typeof obj.linear_identifier === "string") {
     blocks.push(
-      `<div class="meta"><span class="label">linear:</span> <a href="${escapeHtml(obj.linear_url)}" rel="noopener noreferrer" target="_blank">${escapeHtml(obj.linear_identifier)}</a></div>`,
+      `<div class="meta"><span class="label">linear:</span> ${renderExternalAnchor(weeklyLinearUrl, obj.linear_identifier)}</div>`,
     );
   }
   if (typeof review.narrative === "string" && review.narrative.length > 0) {
@@ -1412,11 +1415,8 @@ function renderWeeklyReviewSection(obj: Record<string, unknown>): string {
           comment?: unknown;
         };
         const id = typeof sp.linear_identifier === "string" ? sp.linear_identifier : "?";
-        const url = typeof sp.linear_url === "string" ? sp.linear_url : null;
         const verdict = typeof sp.verdict === "string" ? sp.verdict : "?";
-        const link = url
-          ? `<a href="${escapeHtml(url)}" rel="noopener noreferrer" target="_blank">${escapeHtml(id)}</a>`
-          : escapeHtml(id);
+        const link = renderExternalAnchor(sp.linear_url, id);
         return `<li><span class="meta-grade meta-verdict-${escapeHtml(verdict)}">${escapeHtml(verdict)}</span> ${link} — ${escapeHtml(String(sp.linear_title ?? ""))} <br /><span class="muted">${escapeHtml(String(sp.comment ?? ""))}</span></li>`;
       })
       .join("");
@@ -1445,12 +1445,12 @@ function renderWeeklyReviewSection(obj: Record<string, unknown>): string {
         const filing = themeKey ? filingByThemeKey.get(themeKey) : undefined;
         const linearId =
           filing && typeof filing.identifier === "string" ? filing.identifier : null;
-        const linearUrl =
-          filing && typeof filing.url === "string" ? filing.url : null;
-        const linkHtml =
-          linearUrl && linearId
-            ? ` → <a href="${escapeHtml(linearUrl)}" rel="noopener noreferrer" target="_blank">${escapeHtml(linearId)}</a>`
-            : "";
+        // Render the identifier whenever it exists — `renderExternalAnchor`
+        // degrades to plain text when the URL is rejected by the scheme
+        // allowlist, so the operator still sees the cross-link target.
+        const linkHtml = linearId
+          ? ` → ${renderExternalAnchor(filing?.url, linearId)}`
+          : "";
         return `<li><strong>${escapeHtml(String(promo.title ?? "(untitled)"))}</strong> <code>${escapeHtml(String(promo.target ?? "?"))}</code>${linkHtml}</li>`;
       })
       .join("");
@@ -1469,4 +1469,40 @@ function safeParseJson(json: string): unknown {
 
 function shortenId(id: string): string {
   return id.length > 12 ? `${id.slice(0, 8)}…` : id;
+}
+
+/**
+ * VA-407: scheme allowlist for URLs sourced from `meta_reviews.content_json`.
+ * `escapeHtml` protects attribute syntax (escapes `"`/`<`/`>`) but does
+ * NOT block `javascript:` / `data:` / `vbscript:` schemes, so a
+ * prompt-injected or malformed review payload could otherwise smuggle
+ * an executable link into the dashboard. We allow only `http(s)://`
+ * URLs and return null otherwise so the renderer can fall back to
+ * plain text.
+ *
+ * The runway IRA passes only ever stamp Linear (`https://linear.app/...`)
+ * and GitHub PR (`https://github.com/...`) URLs into content_json
+ * today; rejecting the rest is defense-in-depth, not a guard against
+ * a known offender.
+ */
+export function safeExternalHref(raw: unknown): string | null {
+  if (typeof raw !== "string" || raw.length === 0) return null;
+  // Tolerate leading whitespace — Linear's API has been known to
+  // return URLs with surrounding spaces.
+  const trimmed = raw.trim();
+  // RFC-3986 scheme: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) followed
+  // by ":". Reject anything that doesn't match `^https?:\/\/`.
+  if (!/^https?:\/\//i.test(trimmed)) return null;
+  return trimmed;
+}
+
+/**
+ * Convenience: render an anchor when the URL passes the allowlist,
+ * else fall back to plain (escaped) text. Both branches HTML-escape
+ * the label.
+ */
+function renderExternalAnchor(rawUrl: unknown, label: string): string {
+  const safe = safeExternalHref(rawUrl);
+  if (safe === null) return escapeHtml(label);
+  return `<a href="${escapeHtml(safe)}" rel="noopener noreferrer" target="_blank">${escapeHtml(label)}</a>`;
 }
