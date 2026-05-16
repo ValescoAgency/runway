@@ -101,17 +101,17 @@ direction + threshold + baseline). Surface ALL of this to the operator
 *before* asking any grilling questions:
 
 > The IRA predicts this change will produce:
-> 
+>
 > > **Claim**: <verbatim claim text>
-> > 
+> >
 > > **Minimum sample size**: n ≥ <N> <sample description>
-> 
+>
 > Structured attribution (when present):
 > - metric: `<metric_name>`
 > - direction: `<decrease|increase>`
 > - baseline: `<baseline_value>`
 > - threshold: `<threshold_value>`
-> 
+>
 > The next Weekly Review will grade this against post-ship metrics.
 > Is this prediction worth committing the workspace to? Push back if
 > the claim is too vague, the sample size too small, or the predicted
