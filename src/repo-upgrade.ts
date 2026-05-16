@@ -8,6 +8,7 @@ import {
 } from "./scaffolder.js";
 import { buildAgentImage } from "./scaffolder-image.js";
 import { preflight } from "./scaffolder-preflight.js";
+import { writeShim } from "./scaffolder-varlock.js";
 import { verify } from "./scaffolder-verify.js";
 
 /**
@@ -229,6 +230,24 @@ function renderDockerfile(
 }
 
 // ---------------------------------------------------------------------------
+// Render: .sandcastle/runway-claude-shim (tier 2, VA-426)
+// ---------------------------------------------------------------------------
+
+// VA-426: the Dockerfile rendered above references
+// `COPY runway-claude-shim …`, so tier-2 upgrades must materialise the
+// shim file alongside the Dockerfile/.env.schema re-render — otherwise
+// the post-render `docker build` verification step fails. `init` writes
+// the shim via `applyVarlockLayer`; `upgrade-repo` historically skipped
+// that step entirely. Reuse the same `writeShim` helper here so the two
+// paths can't drift again.
+function renderShim(cwd: string): FileChange {
+  const shimPath = join(cwd, ".sandcastle", "runway-claude-shim");
+  const before = existsSync(shimPath) ? readFileSync(shimPath, "utf8") : "";
+  const after = readFileSync(join(TEMPLATES_DIR, "claude-shim.sh"), "utf8");
+  return diffStat(shimPath, ".sandcastle/runway-claude-shim", before, after);
+}
+
+// ---------------------------------------------------------------------------
 // Render: .env.schema (tier 2)
 // ---------------------------------------------------------------------------
 
@@ -319,10 +338,85 @@ function diffStat(
 // ---------------------------------------------------------------------------
 
 /**
- * Re-render `.sandcastle/Dockerfile` (and tier-2 `.env.schema`) from
- * the current vendored templates, preserving user-set values like
- * the op:// vault and item names. Composes the scaffolder's
- * preflight/build/verify phases around the template re-render.
+ * The composition core of `upgradeRepo` — render every scaffold file
+ * from the current vendored templates, exit early on `--check` drift,
+ * and write the resulting changes to disk. Excludes `preflight`,
+ * `buildAgentImage`, and `verify` so tests can drive this against a
+ * tmpDir without needing a real git repo / docker daemon / `op` /
+ * `gh` (VA-426 regression coverage). Production callers go through
+ * `upgradeRepo`, which sandwiches this between those phases.
+ *
+ * Returns the resolved op:// refs on tier 2 (consumed by the outer
+ * verify step), or null on tier 1. May call `process.exit(0|1)` —
+ * mirrors the existing CLI behaviour.
+ */
+export async function composeAndApplyScaffoldChanges(
+  cwd: string,
+  tier: 1 | 2,
+  opts: RepoUpgradeOptions,
+): Promise<ResolvedOpRefs | null> {
+  // Render new file contents in memory.
+  // In --check we suppress the manual-edit refusal; drift detection is
+  // read-only and the user wants the diff signal, not an exception.
+  const dockerfileChange = renderDockerfile(cwd, tier, opts, !opts.check);
+
+  let schemaChange: FileChange | null = null;
+  let shimChange: FileChange | null = null;
+  let resolved: ResolvedOpRefs | null = null;
+  if (tier === 2) {
+    resolved = resolveOpRefs(cwd, opts);
+    schemaChange = renderEnvSchema(cwd, resolved);
+    shimChange = renderShim(cwd);
+  }
+
+  // Sandcastle .env warn-once (tier-1 leftover).
+  const sandcastleEnv = join(cwd, ".sandcastle", ".env");
+  if (existsSync(sandcastleEnv)) {
+    console.log(
+      "  ⚠  .sandcastle/.env present — runway upgrade-repo leaves it alone (delete manually if you've moved to tier 2)",
+    );
+  }
+
+  const changes = [dockerfileChange, schemaChange, shimChange].filter(
+    (c): c is FileChange => c !== null && c.before !== c.after,
+  );
+
+  if (changes.length === 0) {
+    console.log("[runway upgrade-repo] already up to date");
+    process.exit(0);
+  }
+
+  // Print diff summary.
+  for (const c of changes) {
+    console.log(`  ~ ${c.relPath} (+${c.added}/-${c.removed} lines)`);
+  }
+
+  if (opts.check) {
+    console.log("[runway upgrade-repo] drift detected (--check); not writing");
+    process.exit(1);
+  }
+
+  // Write files. The shim needs mode 0755 so the docker COPY preserves
+  // the execute bit — route it through `writeShim` (the same helper
+  // `init` uses) instead of the plain `writeFileSync` path.
+  for (const c of changes) {
+    if (c.relPath === ".sandcastle/runway-claude-shim") {
+      writeShim(cwd);
+    } else {
+      writeFileSync(c.path, c.after);
+      console.log(`  ✓ wrote ${c.relPath}`);
+    }
+  }
+
+  return resolved;
+}
+
+/**
+ * Re-render `.sandcastle/Dockerfile` (and tier-2 `.env.schema` +
+ * `.sandcastle/runway-claude-shim`) from the current vendored
+ * templates, preserving user-set values like the op:// vault and
+ * item names. Composes the scaffolder's preflight/build/verify
+ * phases around the template re-render.
  *
  * Exits the process with code 1 if `--check` is set and drift was
  * detected (so CI can gate on it); exits 0 on a clean no-op.
@@ -350,50 +444,7 @@ export async function upgradeRepo(
   };
   await preflight(cwd, preflightOpts);
 
-  // Render new file contents in memory.
-  // In --check we suppress the manual-edit refusal; drift detection is
-  // read-only and the user wants the diff signal, not an exception.
-  const dockerfileChange = renderDockerfile(cwd, tier, opts, !opts.check);
-
-  let schemaChange: FileChange | null = null;
-  let resolved: ResolvedOpRefs | null = null;
-  if (tier === 2) {
-    resolved = resolveOpRefs(cwd, opts);
-    schemaChange = renderEnvSchema(cwd, resolved);
-  }
-
-  // Sandcastle .env warn-once (tier-1 leftover).
-  const sandcastleEnv = join(cwd, ".sandcastle", ".env");
-  if (existsSync(sandcastleEnv)) {
-    console.log(
-      "  ⚠  .sandcastle/.env present — runway upgrade-repo leaves it alone (delete manually if you've moved to tier 2)",
-    );
-  }
-
-  const changes = [dockerfileChange, schemaChange].filter(
-    (c): c is FileChange => c !== null && c.before !== c.after,
-  );
-
-  if (changes.length === 0) {
-    console.log("[runway upgrade-repo] already up to date");
-    process.exit(0);
-  }
-
-  // Print diff summary.
-  for (const c of changes) {
-    console.log(`  ~ ${c.relPath} (+${c.added}/-${c.removed} lines)`);
-  }
-
-  if (opts.check) {
-    console.log("[runway upgrade-repo] drift detected (--check); not writing");
-    process.exit(1);
-  }
-
-  // Write files.
-  for (const c of changes) {
-    writeFileSync(c.path, c.after);
-    console.log(`  ✓ wrote ${c.relPath}`);
-  }
+  const resolved = await composeAndApplyScaffoldChanges(cwd, tier, opts);
 
   if (!opts.skipBuild) {
     await buildAgentImage(cwd);

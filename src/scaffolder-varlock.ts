@@ -1,10 +1,44 @@
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import {
   AUTH_MODE_ENV_VAR,
   type ScaffolderOptions,
   TEMPLATES_DIR,
 } from "./scaffolder.js";
+
+/**
+ * Vendor the claude shim into `.sandcastle/runway-claude-shim`.
+ *
+ * Both `runway init --tier=2` (via `applyVarlockLayer`) and
+ * `runway upgrade-repo` (VA-426) must write this file because the
+ * rendered Dockerfile contains `COPY runway-claude-shim …` and the
+ * `docker build` verification step will otherwise fail to find the
+ * source. The shim wraps every `claude` invocation in `varlock run`,
+ * and — when the four `RUNWAY_SIGNING_*` env vars are populated —
+ * bootstraps SSH-signed agent commits (VA-413).
+ *
+ * Idempotent: same template content, same on-disk content. Always
+ * sets mode 0755 so the docker COPY preserves the execute bit.
+ */
+export function writeShim(cwd: string): void {
+  const shimSrc = readFileSync(join(TEMPLATES_DIR, "claude-shim.sh"), "utf8");
+  const shimDest = join(cwd, ".sandcastle", "runway-claude-shim");
+  writeFileSync(shimDest, shimSrc, { mode: 0o755 });
+  // `writeFileSync({mode})` only applies on file creation; on overwrite
+  // the existing inode keeps its prior mode (so a stale 0644 shim from
+  // a manual `cp` would silently survive). Chmod explicitly to make the
+  // execute bit a post-condition.
+  chmodSync(shimDest, 0o755);
+  console.log(
+    "  ✓ wrote .sandcastle/runway-claude-shim (claude wrapper + signing bootstrap)",
+  );
+}
 
 /**
  * Phase 3 (tier 2 only): layer varlock + 1Password CLI on top of
@@ -70,16 +104,8 @@ export async function applyVarlockLayer(
 
   // 2b. VA-413: vendor the claude shim into .sandcastle/ so the
   // Dockerfile's `COPY .sandcastle/runway-claude-shim …` resolves
-  // during the docker build. The shim wraps each `claude` invocation
-  // in `varlock run`, and — when the four RUNWAY_SIGNING_* env vars
-  // are populated — bootstraps SSH-signed agent commits.
-  const shimSrc = readFileSync(
-    join(TEMPLATES_DIR, "claude-shim.sh"),
-    "utf8",
-  );
-  const shimDest = join(cwd, ".sandcastle", "runway-claude-shim");
-  writeFileSync(shimDest, shimSrc, { mode: 0o755 });
-  console.log(`  ✓ wrote .sandcastle/runway-claude-shim (claude wrapper + signing bootstrap)`);
+  // during the docker build.
+  writeShim(cwd);
 
   // 3. Drop .sandcastle/.env and .env.example.
   for (const f of [".sandcastle/.env", ".sandcastle/.env.example"]) {
