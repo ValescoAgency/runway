@@ -209,4 +209,32 @@ describe("resolveMetaConfig (VA-402)", () => {
     expect(r.runwayRepoProjectName).toBe("Runway-from-env");
     expect(r.source.runwayRepoProject).toBe("env");
   });
+
+  // VA-408: metaWeeklyModel follows the same env → file → default
+  // chain as metaReviewModel, but with a distinct default
+  // (`claude-opus-4-7`) per the PRD's "default Opus for the Weekly
+  // Review" note.
+
+  it("defaults metaWeeklyModel to claude-opus-4-7 when nothing is set", () => {
+    const r = resolveMetaConfig({ config: baseConfig(), cwd });
+    expect(r.metaWeeklyModel).toBe("claude-opus-4-7");
+    expect(r.source.weeklyModel).toBe("default");
+  });
+
+  it("reads metaWeeklyModel from .runway/config.yml when env is unset", () => {
+    writeFile("metaWeeklyModel: claude-sonnet-4-6");
+    const r = resolveMetaConfig({ config: baseConfig(), cwd });
+    expect(r.metaWeeklyModel).toBe("claude-sonnet-4-6");
+    expect(r.source.weeklyModel).toBe(".runway/config.yml");
+  });
+
+  it("env wins for metaWeeklyModel", () => {
+    writeFile("metaWeeklyModel: claude-sonnet-4-6");
+    const r = resolveMetaConfig({
+      config: baseConfig({ metaWeeklyModel: "claude-haiku-4-5" }),
+      cwd,
+    });
+    expect(r.metaWeeklyModel).toBe("claude-haiku-4-5");
+    expect(r.source.weeklyModel).toBe("env");
+  });
 });

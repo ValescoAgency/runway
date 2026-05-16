@@ -4,8 +4,10 @@ import {
   type DrainReview,
   type ReportParseResult,
   type RunReview,
+  type WeeklyReview,
   parseDrainReview,
   parseRunReview,
+  parseWeeklyReview,
 } from "./templates.js";
 
 /**
@@ -89,11 +91,37 @@ export const anthropicRetrySchedule = Schedule.exponential("1 second").pipe(
   Schedule.jittered,
 );
 
+/**
+ * VA-408: Weekly Review's heavier retry budget. PRD: "retry twice with
+ * exponential backoff." Base 5s → ~5s, ~10s jittered before giving
+ * up — total worst-case ~30s before the non-zero exit fires. Run /
+ * Drain Reviews stub on exhaustion; the Weekly Review exits non-zero
+ * so cron MAILTO / GitHub Actions step failure surfaces it loudly,
+ * which is why it gets the larger retry budget.
+ */
+export const weeklyReviewRetrySchedule = Schedule.exponential(
+  "5 seconds",
+).pipe(Schedule.compose(Schedule.recurs(2)), Schedule.jittered);
+
 export const applyAnthropicPolicy = <A>(
   effect: Effect.Effect<A, AnthropicError>,
-  opts: { call: string; timeoutMs?: number },
+  opts: {
+    call: string;
+    timeoutMs?: number;
+    /**
+     * VA-408: opt into the heavier weekly-review retry schedule.
+     * Default is the single-retry schedule that Run / Drain Reviews
+     * use. Passes that need loud-failure semantics (non-zero exit
+     * after exhaustion) get the deeper retry pool before tripping.
+     */
+    schedule?: "default" | "weekly";
+  },
 ): Effect.Effect<A, AnthropicError> => {
   const timeoutMs = opts.timeoutMs ?? 120_000;
+  const schedule =
+    opts.schedule === "weekly"
+      ? weeklyReviewRetrySchedule
+      : anthropicRetrySchedule;
   return effect.pipe(
     Effect.timeoutFail({
       duration: `${timeoutMs} millis`,
@@ -104,7 +132,7 @@ export const applyAnthropicPolicy = <A>(
         }),
     }),
     Effect.retry({
-      schedule: anthropicRetrySchedule,
+      schedule,
       while: isRetryableAnthropicError,
     }),
   );
@@ -186,6 +214,44 @@ export const callDrainReview = (
       { call: "messages.create(drain-review)" },
     );
     return parseDrainReview(text);
+  });
+
+/**
+ * VA-408: one Weekly Review LLM round-trip. Two distinguishing
+ * features vs Run / Drain Review's `callX` siblings:
+ *
+ *   - **Heavier retry**: opts into `weeklyReviewRetrySchedule` (2
+ *     retries, 5s exponential base) instead of the default
+ *     single-retry schedule. The Weekly pass is the LOUD-failure
+ *     pass — we burn the larger budget before giving up because the
+ *     fallback is non-zero exit, not stub-and-continue.
+ *
+ *   - **Wider token ceiling**: default `max_tokens` is 12_288. A
+ *     Weekly Review summarises a week of Run + Drain Reviews + up
+ *     to 5 promotion bodies with predicted-effect blocks — the
+ *     payload is 2–3x a Drain Review.
+ */
+export const callWeeklyReview = (
+  args: RunReviewLlmArgs,
+): Effect.Effect<ReportParseResult<WeeklyReview>, AnthropicError> =>
+  Effect.gen(function* () {
+    const client = new Anthropic({ apiKey: args.apiKey });
+    const text = yield* applyAnthropicPolicy(
+      Effect.tryPromise({
+        try: async () => {
+          const res = await client.messages.create({
+            model: args.model,
+            max_tokens: args.maxTokens ?? 12_288,
+            system: args.systemPrompt,
+            messages: [{ role: "user", content: args.userPrompt }],
+          });
+          return collectText(res.content);
+        },
+        catch: (err) => classifyAnthropicError(err),
+      }),
+      { call: "messages.create(weekly-review)", schedule: "weekly" },
+    );
+    return parseWeeklyReview(text);
   });
 
 // ---------------------------------------------------------------------------

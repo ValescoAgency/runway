@@ -8,10 +8,13 @@ import {
   REVIEWER_REPORT_VERSION,
   RUN_REVIEW_FENCE_TAG,
   RUN_REVIEW_VERSION,
+  WEEKLY_REVIEW_FENCE_TAG,
+  WEEKLY_REVIEW_VERSION,
   parseCodingAgentReport,
   parseDrainReview,
   parseReviewerReport,
   parseRunReview,
+  parseWeeklyReview,
 } from "./templates.js";
 
 // VA-401 / VA-400: schema + version handshake tests for the two
@@ -778,5 +781,142 @@ describe("parseDrainReview (VA-406)", () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.report.outcomes_summary["skipped-claim-race"]).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Weekly Review (VA-408)
+// ---------------------------------------------------------------------------
+
+const wrapWeeklyReview = (json: string): string =>
+  ["```" + WEEKLY_REVIEW_FENCE_TAG, json, "```"].join("\n");
+
+const VALID_WEEKLY_REVIEW = {
+  template_version: WEEKLY_REVIEW_VERSION,
+  time_window: {
+    start_iso: "2026-05-09T00:00:00.000Z",
+    end_iso: "2026-05-16T00:00:00.000Z",
+  },
+  rates: {
+    throughput: 12,
+    success_pct: 75,
+    hitl_pct: 8.3,
+    revert_pct: 0,
+    infra_error_pct: 0,
+  },
+  rates_delta_vs_prior_week: null,
+  narrative: "Steady week.",
+  recurring_themes: [],
+  promotions: [
+    {
+      theme_key: "prompt:tighten reviewer guidance:abcd1234",
+      target: "prompt",
+      category: "Improvement",
+      title: "Tighten reviewer rejection guidance",
+      change_spec: "Reviewer prompt should require an explicit category.",
+      acceptance_criteria: ["Reviewer carries `rejection_category` on REJECT."],
+      source_meta_review_identifiers: ["VA-1001", "VA-1002"],
+      predicted_effect: {
+        claim: "Rejection-to-fix count drops 20% vs baseline",
+        min_sample_size: 10,
+        sample_description: "post-ship runs of refactor-class issues",
+      },
+      corroboration_count: 2,
+      recommendation_confidence: "MEDIUM",
+    },
+  ],
+  noted_but_not_promoted: [],
+};
+
+describe("parseWeeklyReview (VA-408)", () => {
+  it("parses a well-formed Weekly Review at v1.0.0", () => {
+    const stdout = wrapWeeklyReview(JSON.stringify(VALID_WEEKLY_REVIEW));
+    const result = parseWeeklyReview(stdout);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.rates.throughput).toBe(12);
+    expect(result.report.promotions).toHaveLength(1);
+    expect(result.report.promotions[0]?.predicted_effect.min_sample_size).toBe(10);
+  });
+
+  it("rejects > 5 promotions at the schema layer (PRD hard cap)", () => {
+    const six = {
+      ...VALID_WEEKLY_REVIEW,
+      promotions: Array.from({ length: 6 }, (_, i) => ({
+        ...VALID_WEEKLY_REVIEW.promotions[0],
+        theme_key: `prompt:theme-${i}:${"x".repeat(8)}`,
+        title: `Promotion ${i}`,
+      })),
+    };
+    const result = parseWeeklyReview(wrapWeeklyReview(JSON.stringify(six)));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.kind).toBe("schema-mismatch");
+  });
+
+  it("rejects a malformed predicted_effect (non-positive sample size)", () => {
+    const bad = {
+      ...VALID_WEEKLY_REVIEW,
+      promotions: [
+        {
+          ...VALID_WEEKLY_REVIEW.promotions[0],
+          predicted_effect: {
+            claim: "x",
+            min_sample_size: 0,
+            sample_description: "samples",
+          },
+        },
+      ],
+    };
+    const result = parseWeeklyReview(wrapWeeklyReview(JSON.stringify(bad)));
+    expect(result.ok).toBe(false);
+  });
+
+  it("fails loudly on a major-version mismatch (v2.x.x)", () => {
+    const bumped = { ...VALID_WEEKLY_REVIEW, template_version: "2.0.0" };
+    const result = parseWeeklyReview(wrapWeeklyReview(JSON.stringify(bumped)));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.kind).toBe("version-mismatch");
+  });
+
+  it("accepts a forward-compatible minor version inside the current major", () => {
+    const minor = { ...VALID_WEEKLY_REVIEW, template_version: "1.5.0" };
+    const result = parseWeeklyReview(wrapWeeklyReview(JSON.stringify(minor)));
+    expect(result.ok).toBe(true);
+  });
+
+  it("accepts an empty promotions array (a quiet week)", () => {
+    const quiet = { ...VALID_WEEKLY_REVIEW, promotions: [] };
+    const result = parseWeeklyReview(wrapWeeklyReview(JSON.stringify(quiet)));
+    expect(result.ok).toBe(true);
+  });
+
+  it("accepts deferred-open-promotion and budget-cap reasons in noted block", () => {
+    const withNoted = {
+      ...VALID_WEEKLY_REVIEW,
+      noted_but_not_promoted: [
+        {
+          theme_key: "workflow:overflow-theme:deadbeef",
+          target: "workflow",
+          description: "Bumped by budget cap.",
+          corroboration_count: 2,
+          reason: "budget-cap",
+          deferred_behind: null,
+        },
+        {
+          theme_key: "sandcastle:deferred-theme:badc0ffe",
+          target: "sandcastle",
+          description: "Deferred — open promotion VA-700.",
+          corroboration_count: 3,
+          reason: "deferred-open-promotion",
+          deferred_behind: "VA-700",
+        },
+      ],
+    };
+    const result = parseWeeklyReview(wrapWeeklyReview(JSON.stringify(withNoted)));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.noted_but_not_promoted).toHaveLength(2);
   });
 });

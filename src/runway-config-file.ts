@@ -59,6 +59,14 @@ const RunwayConfigFileSchema = z.object({
    * team-only. Overridden by `RUNWAY_REPO_PROJECT_NAME` if set in env.
    */
   runwayRepoProjectName: z.string().optional(),
+  /**
+   * VA-408: Anthropic model for the Weekly Review pass. PRD default is
+   * `claude-opus-4-7` (deeper reasoning across many Reviews benefits
+   * the pattern-detection step) — independent from the Run / Drain
+   * Review model so operators can dial cost vs judgment quality per
+   * pass. Overridden by `RUNWAY_META_WEEKLY_MODEL` if set in env.
+   */
+  metaWeeklyModel: z.string().optional(),
 });
 
 export type RunwayConfigFile = z.infer<typeof RunwayConfigFileSchema>;

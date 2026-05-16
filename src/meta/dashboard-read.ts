@@ -302,6 +302,38 @@ export interface MetaDashboardRead {
   loadDrainMetaRows(
     traceId: string,
   ): Effect.Effect<readonly DrainMetaRow[], MetaReadError>;
+  /**
+   * VA-408: pull every Run Review row (`meta-run-review`) whose
+   * `created_at` falls within the closed-open ISO window
+   * `[startIso, endIso)`. The Weekly Review's promoter parses each
+   * row's `content_json` to extract Recommendations; the LLM reads
+   * the same rows for narrative context. Ordered ascending by
+   * `created_at` so the prompt reads in time order.
+   */
+  loadRunReviewsInWindow(
+    startIso: string,
+    endIso: string,
+  ): Effect.Effect<readonly WindowedMetaRow[], MetaReadError>;
+  /**
+   * VA-408: pull every Drain Review row (`meta-drain-review`) in the
+   * same window. Drain Reviews aren't a promoter input directly (the
+   * cross-issue patterns surface there are already structural), but
+   * the LLM reads them for narrative shape and to spot drains the
+   * Weekly Review should call out.
+   */
+  loadDrainReviewsInWindow(
+    startIso: string,
+    endIso: string,
+  ): Effect.Effect<readonly WindowedMetaRow[], MetaReadError>;
+  /**
+   * VA-408: pull the N most-recent Weekly Review rows. PRD spec is
+   * "prior 4 Weekly Reviews" — the LLM uses these for trend grounding
+   * and to check what was promised vs delivered. Ordered descending
+   * by `created_at` (freshest first).
+   */
+  loadRecentWeeklyReviews(
+    limit: number,
+  ): Effect.Effect<readonly WindowedMetaRow[], MetaReadError>;
 }
 
 /**
@@ -313,6 +345,22 @@ export interface MetaDashboardRead {
 export interface DrainMetaRow {
   readonly id: string;
   readonly kind: string;
+  readonly issueId: string | null;
+  readonly contentJson: string;
+  readonly templateVersion: string;
+  readonly createdAt: string;
+}
+
+/**
+ * VA-408: meta_reviews row projected for the Weekly Review pass's
+ * windowed reads. Adds `drainId` vs `DrainMetaRow` so the LLM prompt
+ * can group cross-drain patterns and so promoter sources reference
+ * the correct drain. Same column set otherwise.
+ */
+export interface WindowedMetaRow {
+  readonly id: string;
+  readonly kind: string;
+  readonly drainId: string | null;
   readonly issueId: string | null;
   readonly contentJson: string;
   readonly templateVersion: string;
@@ -464,6 +512,47 @@ export function createMetaDashboardRead(path: string): MetaDashboardRead {
     WHERE drain_id = ?
       AND kind IN ('meta-run-review', 'meta-skipped', 'meta-failed')
     ORDER BY created_at ASC, id ASC
+  `);
+
+  // VA-408: Run Reviews + skipped/failed Run Review stubs in a time
+  // window. The promoter walks these for Recommendation extraction;
+  // the LLM walks the same set for narrative context. We INCLUDE
+  // skipped + failed stubs so the LLM can call out coverage gaps —
+  // a week with five `meta-failed` rows is a story the Weekly Review
+  // should tell.
+  const selectRunReviewsInWindow = db.prepare(`
+    SELECT id, kind, drain_id, issue_id, content_json, template_version, created_at
+    FROM meta_reviews
+    WHERE kind IN ('meta-run-review', 'meta-skipped', 'meta-failed')
+      AND created_at >= ?
+      AND created_at < ?
+    ORDER BY created_at ASC, id ASC
+  `);
+
+  // VA-408: Drain Reviews in the same window. Kind-only filter; no
+  // skipped/failed stub equivalent at the drain level for VA-408's
+  // first pass (the drain-level meta-failed stubs that VA-406 may
+  // write are tagged `meta-failed`, not `meta-drain-review`, and
+  // they're already covered by `selectRunReviewsInWindow` if you
+  // need them — but the Weekly Review pass uses them for context,
+  // not as Drain Review evidence).
+  const selectDrainReviewsInWindow = db.prepare(`
+    SELECT id, kind, drain_id, issue_id, content_json, template_version, created_at
+    FROM meta_reviews
+    WHERE kind = 'meta-drain-review'
+      AND created_at >= ?
+      AND created_at < ?
+    ORDER BY created_at ASC, id ASC
+  `);
+
+  // VA-408: prior Weekly Reviews for context. Ordered descending so
+  // limit-N returns the freshest N rows.
+  const selectRecentWeeklyReviews = db.prepare(`
+    SELECT id, kind, drain_id, issue_id, content_json, template_version, created_at
+    FROM meta_reviews
+    WHERE kind = 'meta-weekly-review'
+    ORDER BY created_at DESC, id DESC
+    LIMIT ?
   `);
 
   const wrap = <A>(
@@ -650,6 +739,53 @@ export function createMetaDashboardRead(path: string): MetaDashboardRead {
         } satisfies DrainMetaRow));
       });
     },
+
+    loadRunReviewsInWindow(startIso, endIso) {
+      return wrap("loadRunReviewsInWindow", () => {
+        const rows = selectRunReviewsInWindow.all(startIso, endIso) as Array<
+          Record<string, unknown>
+        >;
+        return rows.map(projectWindowedMetaRow);
+      });
+    },
+
+    loadDrainReviewsInWindow(startIso, endIso) {
+      return wrap("loadDrainReviewsInWindow", () => {
+        const rows = selectDrainReviewsInWindow.all(
+          startIso,
+          endIso,
+        ) as Array<Record<string, unknown>>;
+        return rows.map(projectWindowedMetaRow);
+      });
+    },
+
+    loadRecentWeeklyReviews(limit) {
+      return wrap("loadRecentWeeklyReviews", () => {
+        const n = Math.max(0, Math.floor(limit));
+        if (n === 0) return [];
+        const rows = selectRecentWeeklyReviews.all(n) as Array<
+          Record<string, unknown>
+        >;
+        return rows.map(projectWindowedMetaRow);
+      });
+    },
+  };
+}
+
+// VA-408: shared row projection for the windowed meta-review reads.
+// Kept module-private since the projection couples directly to the
+// SQL SELECT column shape.
+function projectWindowedMetaRow(
+  row: Record<string, unknown>,
+): WindowedMetaRow {
+  return {
+    id: String(row.id ?? ""),
+    kind: String(row.kind ?? ""),
+    drainId: nullableStr(row.drain_id),
+    issueId: nullableStr(row.issue_id),
+    contentJson: String(row.content_json ?? ""),
+    templateVersion: String(row.template_version ?? ""),
+    createdAt: String(row.created_at ?? ""),
   };
 }
 
