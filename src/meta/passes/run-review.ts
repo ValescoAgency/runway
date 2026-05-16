@@ -5,6 +5,7 @@ import { loadContextFor, type HindsightWiring, type RunReviewContext } from "../
 import type {
   CapturedCodingAgentReport,
   CapturedIssueProcess,
+  CapturedNorms,
   CapturedReviewerReport,
   MetaDashboardRead,
 } from "../dashboard-read.js";
@@ -79,6 +80,13 @@ export interface RunReviewPassDeps {
   // VA-404: optional override of the heuristic-filter thresholds.
   // Undefined → DEFAULT_META_FILTER_THRESHOLDS.
   readonly metaFilterThresholds?: MetaFilterThresholds;
+  /**
+   * VA-405: rolling-norm window in drains. When set + non-zero, the
+   * context loader queries `loadNorms(category, normsWindow)` from
+   * the VA-399 read-model and the IRA's user prompt grows a `# Norms`
+   * section. When omitted / zero, norms stay null (v1.1.0 back-compat).
+   */
+  readonly normsWindow?: number;
 }
 
 export interface RunReviewPassArgs {
@@ -169,6 +177,7 @@ export const runRunReviewPass = (
         traceId: args.traceId,
         issueIdentifier: args.issueIdentifier,
         hindsight: deps.hindsight,
+        normsWindow: deps.normsWindow,
       },
       deps.dashboardRead,
     ).pipe(Effect.either);
@@ -206,6 +215,7 @@ export const runRunReviewPass = (
         ctx.codingAgentReport,
         ctx.reviewerReport,
         ctx.hindsightSignals,
+        ctx.norms,
       ),
     }).pipe(Effect.either);
 
@@ -410,17 +420,22 @@ const SYSTEM_PROMPT = [
   "line; the body must be valid JSON. You may emit a short preamble before",
   "the fence, but nothing after the closing fence.",
   "",
-  "Schema (template_version 1.1.0):",
+  "Schema (template_version 1.2.0):",
   "  {",
-  "    \"template_version\": \"1.1.0\",",
+  "    \"template_version\": \"1.2.0\",",
   "    \"issue_identifier\": \"<echo of input>\",",
   "    \"drain_trace_id\": \"<echo of input>\",",
   "    \"final_outcome\": \"<one of: opened | hitl | reverted | errored | unknown>\",",
-  "    \"issue_quality\":        {\"absolute\": <STRONG|ADEQUATE|WEAK|FAILED>, \"relative\": null, \"justification\": \"<1 sentence>\"},",
-  "    \"prompt_quality\":       {\"absolute\": <STRONG|ADEQUATE|WEAK|FAILED>, \"relative\": null, \"justification\": \"<1 sentence>\"},",
-  "    \"agent_quality\":        {\"absolute\": <STRONG|ADEQUATE|WEAK|FAILED>, \"relative\": null, \"justification\": \"<1 sentence>\"},",
-  "    \"reviewer_quality\":     {\"absolute\": <STRONG|ADEQUATE|WEAK|FAILED>, \"relative\": null, \"justification\": \"<1 sentence>\"},",
-  "    \"orchestration_quality\":{\"absolute\": <STRONG|ADEQUATE|WEAK|FAILED>, \"relative\": null, \"justification\": \"<1 sentence>\"},",
+  "    \"issue_quality\":        {\"absolute\": <STRONG|ADEQUATE|WEAK|FAILED>, \"justification\": \"<1 sentence>\"},",
+  "    \"prompt_quality\":       {\"absolute\": <STRONG|ADEQUATE|WEAK|FAILED>, \"justification\": \"<1 sentence>\"},",
+  "    \"agent_quality\":        {\"absolute\": <STRONG|ADEQUATE|WEAK|FAILED>, \"justification\": \"<1 sentence>\"},",
+  "    \"reviewer_quality\":     {\"absolute\": <STRONG|ADEQUATE|WEAK|FAILED>, \"justification\": \"<1 sentence>\"},",
+  "    \"orchestration_quality\":{\"absolute\": <STRONG|ADEQUATE|WEAK|FAILED>, \"justification\": \"<1 sentence>\"},",
+  "    \"issue_quality_relative\":         <BETTER|STEADY|WORSE>,  // omit when norms unavailable",
+  "    \"prompt_quality_relative\":        <BETTER|STEADY|WORSE>,",
+  "    \"agent_quality_relative\":         <BETTER|STEADY|WORSE>,",
+  "    \"reviewer_quality_relative\":      <BETTER|STEADY|WORSE>,",
+  "    \"orchestration_quality_relative\": <BETTER|STEADY|WORSE>,",
   "    \"recommendations\": [",
   "      {\"target\": <prompt|workflow|sandcastle|issue-body|tooling>, \"change\": \"<concrete change>\", \"confidence\": <LOW|MEDIUM|HIGH>}",
   "    ],",
@@ -431,17 +446,14 @@ const SYSTEM_PROMPT = [
   "    }",
   "  }",
   "",
-  "Grading guidance:",
+  "Absolute-axis grading:",
   "  - STRONG: dimension was notably good vs typical runway behaviour",
   "  - ADEQUATE: dimension met expectations, nothing notable",
   "  - WEAK: dimension fell short but didn't break the run",
   "  - FAILED: dimension caused the run to fail or required HITL escape",
   "",
-  "All `relative` slots stay `null` at this slice — rolling norms are not",
-  "yet available.",
-  "",
   "Hindsight reading (VA-403):",
-  "  - When the user prompt provides a `## Hindsight signals` section,",
+  "  - When the user prompt provides a `# Hindsight signals` section,",
   "    your `hindsight_signals` MUST be a populated object echoing what",
   "    you observed. Otherwise emit `null`.",
   "  - Reflect hindsight in your grades. A run that LOOKED clean in-band",
@@ -453,6 +465,29 @@ const SYSTEM_PROMPT = [
   "    didn't fully address the problem; weight them in agent_quality",
   "    and prompt_quality.",
   "",
+  "Relative-axis grading (VA-405):",
+  "  - When the user prompt provides a `# Norms` section, populate ALL FIVE",
+  "    top-level `*_quality_relative` fields with one of BETTER / STEADY /",
+  "    WORSE — these are the v1.2.0 contract field names. Otherwise (no",
+  "    `# Norms` section, or you decline to grade on a small sample) omit",
+  "    every `*_quality_relative` field entirely.",
+  "  - BETTER: this run beat the typical cohort on the dimension's signals",
+  "    (fewer iterations than the median, faster wall-time, no HITL/revert/",
+  "    infra-error compared to a category that often hits those).",
+  "  - STEADY: this run was within the typical band — close to median, no",
+  "    notable outcome differences.",
+  "  - WORSE: this run did worse than typical (iterations near/above p95,",
+  "    wall-time near/above p95, hit a rejection/revert/HITL in a category",
+  "    that usually doesn't).",
+  "  - Match the relative grade to the SAME signal the absolute grade rests",
+  "    on. e.g. an `agent_quality: ADEQUATE` graded on iteration count must",
+  "    use the iteration-count percentiles for its relative axis.",
+  "  - When norms exist but `sample_size < 5`, you may still grade relative",
+  "    but call out the small sample in the dimension's `justification`",
+  "    (\"vs 3-run sample, small-sample caveat\"). When sample_size is 0 the",
+  "    gateway omits the `# Norms` section entirely — omit the top-level",
+  "    `*_quality_relative` fields.",
+  "",
   "Be honest. The IRA's value is in calling out real weaknesses, not in",
   "pretending every run was fine.",
 ].join("\n");
@@ -463,6 +498,7 @@ const composeUserPrompt = (
   agentReport: CapturedCodingAgentReport,
   reviewerReport: CapturedReviewerReport,
   hindsight: HindsightSignals | null,
+  norms: CapturedNorms | null,
 ): string => {
   const lines: string[] = [];
   lines.push(`Drain trace id: ${args.traceId}`);
@@ -519,11 +555,30 @@ const composeUserPrompt = (
     lines.push(JSON.stringify(hindsight, null, 2));
     lines.push("```");
   }
+  if (norms !== null) {
+    lines.push("");
+    lines.push("# Norms");
+    lines.push(
+      `(rolling aggregates over the last ${norms.windowDrains} drains for`,
+      ` issue-category \`${norms.category}\`; sample size ${norms.sampleSize}.`,
+      " Use these for the `relative` axis on each grading section.)",
+    );
+    lines.push("");
+    lines.push("```json");
+    lines.push(JSON.stringify(norms, null, 2));
+    lines.push("```");
+  }
   lines.push("");
   lines.push(
-    hindsight !== null
-      ? "Emit a `runway-run-review` JSON block grading this run. Echo the hindsight signals back in your `hindsight_signals` field."
-      : "Emit a `runway-run-review` JSON block grading this run. No hindsight available — set `hindsight_signals` to null.",
+    [
+      "Emit a `runway-run-review` JSON block grading this run.",
+      hindsight !== null
+        ? "Echo the hindsight signals back in your `hindsight_signals` field."
+        : "No hindsight available — set `hindsight_signals` to null.",
+      norms !== null
+        ? "Norms are present — populate every `relative` slot with BETTER/STEADY/WORSE."
+        : "No norms available — leave every `relative` slot as null.",
+    ].join(" "),
   );
   return lines.join("\n");
 };
@@ -533,9 +588,13 @@ const renderReviewMarkdown = (
   args: RunReviewPassArgs,
   ip: CapturedIssueProcess,
 ): string => {
-  const grade = (label: string, section: RunReview["agent_quality"]): string =>
+  const grade = (
+    label: string,
+    section: RunReview["agent_quality"],
+    relative: "BETTER" | "STEADY" | "WORSE" | undefined,
+  ): string =>
     `- **${label}**: \`${section.absolute}\`${
-      section.relative ? ` (${section.relative} vs norms)` : ""
+      relative ? ` (${relative} vs norms)` : ""
     } — ${section.justification}`;
 
   return [
@@ -544,11 +603,11 @@ const renderReviewMarkdown = (
     `**Final outcome**: ${review.final_outcome}`,
     "",
     "## Grading",
-    grade("Issue quality", review.issue_quality),
-    grade("Prompt quality", review.prompt_quality),
-    grade("Agent quality", review.agent_quality),
-    grade("Reviewer quality", review.reviewer_quality),
-    grade("Orchestration quality", review.orchestration_quality),
+    grade("Issue quality", review.issue_quality, review.issue_quality_relative),
+    grade("Prompt quality", review.prompt_quality, review.prompt_quality_relative),
+    grade("Agent quality", review.agent_quality, review.agent_quality_relative),
+    grade("Reviewer quality", review.reviewer_quality, review.reviewer_quality_relative),
+    grade("Orchestration quality", review.orchestration_quality, review.orchestration_quality_relative),
     "",
     "## Recommendations",
     review.recommendations.length === 0

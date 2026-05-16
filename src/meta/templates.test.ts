@@ -533,6 +533,102 @@ describe("parseRunReview (VA-402)", () => {
     expect(result.ok).toBe(true);
   });
 
+  // VA-405: Run Review v1.2.0 populates the relative axis from
+  // rolling norms. The schema doesn't structurally change — `relative`
+  // was already `null | <BETTER|STEADY|WORSE>` from VA-402 — but the
+  // version bump signals "this run was graded with norms" so callers
+  // can find norm-aware reviews in the meta-project. v1.0.0 / v1.1.0
+  // reviews still parse (forward-compat on the minor bump).
+
+  it("accepts a v1.2.0 payload with the five top-level relative-axis fields", () => {
+    const v120 = {
+      ...VALID_RUN_REVIEW,
+      template_version: "1.2.0",
+      // VA-405 AC: the five named relative fields, each
+      // `BETTER | STEADY | WORSE`. The IRA populates these when norms
+      // were available; omits them otherwise.
+      issue_quality_relative: "BETTER",
+      prompt_quality_relative: "STEADY",
+      agent_quality_relative: "BETTER",
+      reviewer_quality_relative: "STEADY",
+      orchestration_quality_relative: "BETTER",
+    };
+    const result = parseRunReview(wrapRunReview(JSON.stringify(v120)));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.issue_quality_relative).toBe("BETTER");
+    expect(result.report.prompt_quality_relative).toBe("STEADY");
+    expect(result.report.agent_quality_relative).toBe("BETTER");
+    expect(result.report.reviewer_quality_relative).toBe("STEADY");
+    expect(result.report.orchestration_quality_relative).toBe("BETTER");
+  });
+
+  it("v1.2.0 omitting the top-level *_quality_relative fields parses (norms-unavailable case)", () => {
+    // Norms unavailable / sample too small → IRA omits the named
+    // fields entirely. The schema must accept this shape so the
+    // runtime path doesn't need to fabricate a sentinel value.
+    const v120NoNorms = {
+      ...VALID_RUN_REVIEW,
+      template_version: "1.2.0",
+    };
+    const result = parseRunReview(wrapRunReview(JSON.stringify(v120NoNorms)));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.issue_quality_relative).toBeUndefined();
+    expect(result.report.agent_quality_relative).toBeUndefined();
+  });
+
+  it("rejects an invalid value in a top-level *_quality_relative field", () => {
+    const bad = {
+      ...VALID_RUN_REVIEW,
+      template_version: "1.2.0",
+      agent_quality_relative: "MUCH_BETTER",
+    };
+    const result = parseRunReview(wrapRunReview(JSON.stringify(bad)));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.kind).toBe("schema-mismatch");
+  });
+
+  it("v1.0.0 / v1.1.0 payloads carrying a legacy nested `relative: null` still parse (zod strips it)", () => {
+    // VA-402 added `relative: null` inside each section pre-emptively.
+    // VA-405 moves the axis up to top-level named fields and drops
+    // the nested slot from the schema. Forward-compat lives in zod's
+    // default `strip` mode: the unknown nested key is silently dropped
+    // and the v1.0.0 fixture (which has `relative: null` inside every
+    // section — see VALID_RUN_REVIEW) parses cleanly.
+    const v100 = {
+      ...VALID_RUN_REVIEW,
+      template_version: "1.0.0",
+      hindsight_signals: null,
+    };
+    const result = parseRunReview(wrapRunReview(JSON.stringify(v100)));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.issue_quality.absolute).toBe("STRONG");
+    // v1.0.0 didn't emit the top-level relative fields.
+    expect(result.report.issue_quality_relative).toBeUndefined();
+  });
+
+  it("v1.1.0 hindsight payloads still parse under v1.2.0 (forward-compat)", () => {
+    const v110 = {
+      ...VALID_RUN_REVIEW,
+      template_version: "1.1.0",
+      hindsight_signals: {
+        pr: {
+          url: "https://github.com/x/y/pull/103",
+          state: "merged",
+          merged_at: "2026-05-15T01:23:45Z",
+        },
+        human_verdict: null,
+        follow_up_issues: [],
+      },
+    };
+    const result = parseRunReview(wrapRunReview(JSON.stringify(v110)));
+    expect(result.ok).toBe(true);
+  });
+
+
   it("rejects an unknown PR state outside the open|merged|closed alphabet", () => {
     const bad = {
       ...VALID_RUN_REVIEW,

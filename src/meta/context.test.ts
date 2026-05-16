@@ -59,6 +59,11 @@ const makeGateway = (
     // the makeGateway helper so existing tests don't have to think
     // about it; tests that care about retry detection override.
     countReviewAttempts: vi.fn(() => Effect.succeed(1)),
+    // VA-405: rolling-norms gateway. Default returns null ("no norms
+    // for this category") so existing tests that don't opt into norms
+    // via `normsWindow` see no behavior change. Tests that care about
+    // the relative axis override.
+    loadNorms: vi.fn(() => Effect.succeed(null)),
     ...over,
   }) as unknown as MetaDashboardRead;
 
@@ -262,6 +267,127 @@ describe("loadContextFor — pass: run-review (VA-402)", () => {
     }).mock.calls[0]?.[0];
     expect(call?.sourceIdentifier).toBe("VA-401");
     expect(typeof call?.sinceIso).toBe("string");
+  });
+
+  // VA-405: rolling norms wiring. `normsWindow` is optional —
+  // omitted / zero keeps norms null (v1.1.0 back-compat). When
+  // supplied, the loader derives the category from the issue
+  // identifier (matching VA-399's SQL prefix rule), calls
+  // loadNorms(category, window), and tolerates gateway error by
+  // collapsing to null.
+
+  it("leaves norms null when no normsWindow is supplied (v1.1.0 back-compat)", async () => {
+    const gateway = makeGateway();
+    const result = await Effect.runPromise(
+      loadContextFor(
+        { pass: "run-review", traceId: "trace-abc", issueIdentifier: "VA-401" },
+        gateway,
+      ),
+    );
+    if (result.pass !== "run-review") return;
+    expect(result.context.norms).toBeNull();
+    expect(gateway.loadNorms).not.toHaveBeenCalled();
+  });
+
+  it("loads norms when normsWindow is supplied — derives category from issue identifier", async () => {
+    const gateway = makeGateway({
+      loadNorms: vi.fn(() =>
+        Effect.succeed({
+          category: "VA",
+          windowDrains: 30,
+          sampleSize: 12,
+          medianIterationCount: 2,
+          p95IterationCount: 4,
+          medianWallTimeMs: 60_000,
+          p95WallTimeMs: 180_000,
+          reviewerRejectionRate: 0.1,
+          revertRate: 0,
+          hitlEscapeRate: 0.15,
+          infraErrorRate: 0,
+        }),
+      ),
+    });
+    const result = await Effect.runPromise(
+      loadContextFor(
+        {
+          pass: "run-review",
+          traceId: "trace-abc",
+          issueIdentifier: "VA-401",
+          normsWindow: 30,
+        },
+        gateway,
+      ),
+    );
+    if (result.pass !== "run-review") return;
+    expect(result.context.norms).not.toBeNull();
+    expect(result.context.norms?.category).toBe("VA");
+    expect(result.context.norms?.sampleSize).toBe(12);
+    expect(gateway.loadNorms).toHaveBeenCalledTimes(1);
+    expect(gateway.loadNorms).toHaveBeenCalledWith("VA", 30);
+  });
+
+  it("degrades a loadNorms gateway error to null (conservative)", async () => {
+    const gateway = makeGateway({
+      loadNorms: vi.fn(() =>
+        Effect.fail({
+          _tag: "MetaReadDatabaseError" as const,
+          call: "loadNorms",
+          message: "i/o error",
+        }),
+      ) as unknown as MetaDashboardRead["loadNorms"],
+    });
+    const result = await Effect.runPromise(
+      loadContextFor(
+        {
+          pass: "run-review",
+          traceId: "trace-abc",
+          issueIdentifier: "VA-401",
+          normsWindow: 30,
+        },
+        gateway,
+      ),
+    );
+    if (result.pass !== "run-review") return;
+    expect(result.context.norms).toBeNull();
+  });
+
+  it("treats normsWindow=0 the same as omitted (gateway not called)", async () => {
+    const gateway = makeGateway();
+    const result = await Effect.runPromise(
+      loadContextFor(
+        {
+          pass: "run-review",
+          traceId: "trace-abc",
+          issueIdentifier: "VA-401",
+          normsWindow: 0,
+        },
+        gateway,
+      ),
+    );
+    if (result.pass !== "run-review") return;
+    expect(result.context.norms).toBeNull();
+    expect(gateway.loadNorms).not.toHaveBeenCalled();
+  });
+
+  it("passes the full identifier as category when no dash separator is present", async () => {
+    const gateway = makeGateway({
+      loadIssueProcess: vi.fn(() =>
+        Effect.succeed({ ...baseIssueProcess, issueIdentifier: "OPS" }),
+      ),
+      loadNorms: vi.fn(() => Effect.succeed(null)),
+    });
+    await Effect.runPromise(
+      loadContextFor(
+        {
+          pass: "run-review",
+          traceId: "trace-abc",
+          issueIdentifier: "OPS",
+          normsWindow: 30,
+        },
+        gateway,
+      ),
+    );
+    expect(gateway.loadNorms).toHaveBeenCalledWith("OPS", 30);
   });
 
   it("respects an operator-supplied followUpWindowHours override", async () => {

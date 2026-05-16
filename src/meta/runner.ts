@@ -64,6 +64,12 @@ export interface RunReviewArgs {
 const DEFAULT_META_REVIEW_MODEL = "claude-sonnet-4-6";
 const DEFAULT_META_PROJECT_NAME = "runway-meta";
 const DEFAULT_META_REVIEW_DELAY_HOURS = 18;
+// VA-405: match the dashboard's default `DASHBOARD_AGGREGATE_WINDOW`
+// so a stock dashboard + a stock IRA see the same denominator. The
+// IRA computes its own aggregates (parameterized on the raw event
+// tables) rather than reading the view, so the windows can diverge
+// later without a coordinated bump.
+const DEFAULT_META_NORMS_WINDOW_DRAINS = 30;
 
 /**
  * VA-402: resolve the meta-review model + project name through
@@ -198,6 +204,11 @@ export const dispatchRunReview = (
           delayHours: resolved.metaReviewDelayHours,
           force: args.force ?? false,
           metaFilterThresholds: resolved.metaFilterThresholds,
+          // VA-405: rolling norms always wired with the default 30-drain
+          // window. The IRA's prompt degrades to v1.1.0 behavior (null
+          // relative slots) automatically when the category has no rows
+          // in the window, so no operator opt-in is needed.
+          normsWindow: DEFAULT_META_NORMS_WINDOW_DRAINS,
         },
       );
     } finally {

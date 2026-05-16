@@ -100,6 +100,51 @@ export type CapturedReviewerReport =
       readonly message: string;
     };
 
+/**
+ * VA-405: rolling norms for one issue category, sourced from the
+ * VA-399 evaluator-facing read-model. Field shapes mirror
+ * `EvaluatorAggregate` (the dashboard's `evaluator_aggregates_v1`
+ * view) so a SQL-side and IRA-side reference both point at the same
+ * named columns — see `src/dashboard/read-model.md` for the contract.
+ *
+ * `windowDrains` is echoed back from the loader's request so a Run
+ * Review's `# Norms` user-prompt section is self-describing — the
+ * IRA's grade can reason about "vs typical of the last N drains"
+ * without an out-of-band lookup.
+ *
+ * `sampleSize < 5` rows are returned verbatim — the IRA's prompt is
+ * instructed to caveat small-sample comparisons rather than the
+ * gateway pretending they don't exist. Operators inspecting the user
+ * prompt should see exactly what the IRA was given.
+ */
+export interface CapturedNorms {
+  readonly category: string;
+  readonly windowDrains: number;
+  readonly sampleSize: number;
+  readonly medianIterationCount: number | null;
+  readonly p95IterationCount: number | null;
+  readonly medianWallTimeMs: number | null;
+  readonly p95WallTimeMs: number | null;
+  readonly reviewerRejectionRate: number;
+  readonly revertRate: number;
+  readonly hitlEscapeRate: number;
+  readonly infraErrorRate: number;
+}
+
+/**
+ * VA-405: derive a comparison cohort from an issue identifier. Mirrors
+ * the SQL `CASE WHEN instr(id, '-') > 0 THEN substr(...) ELSE id END`
+ * in `evaluator_aggregates_v1` so the gateway and the view agree on
+ * what "same kind of issue" means.
+ *
+ *   "VA-401" → "VA"
+ *   "OPS"    → "OPS"
+ */
+export function categoryFromIssueIdentifier(identifier: string): string {
+  const dash = identifier.indexOf("-");
+  return dash > 0 ? identifier.slice(0, dash) : identifier;
+}
+
 // ---------------------------------------------------------------------------
 // Gateway interface
 // ---------------------------------------------------------------------------
@@ -161,6 +206,29 @@ export interface MetaDashboardRead {
     traceId: string,
     issueProcessSpanId: string,
   ): Effect.Effect<number, MetaReadError>;
+  /**
+   * VA-405: rolling norms for one issue category over the last N
+   * drains. Mirrors the SQL of `evaluator_aggregates_v1` (VA-399's
+   * read-model) but is parameterized by `windowDrains` so the IRA can
+   * pick its own comparison window without depending on the dashboard
+   * process's view configuration. Returns `null` when the category
+   * has no rows in the window — first run for a new team prefix, or
+   * the window is too short.
+   *
+   * Queries VA-399's `evaluator_aggregates_v1` view (the read-model
+   * contract per `src/dashboard/read-model.md`). The view's actual
+   * window N is owned by the dashboard process (set at startup via
+   * `DASHBOARD_AGGREGATE_WINDOW`, default 30). `windowDrains` here is
+   * an echo / traceability parameter: the IRA records what window it
+   * requested in `CapturedNorms.windowDrains` for the prompt, but the
+   * underlying numbers reflect whatever the dashboard process is
+   * configured for. A future per-call window would be a versioned
+   * `_v2` read-model addition (per the view's semver policy).
+   */
+  loadNorms(
+    category: string,
+    windowDrains: number,
+  ): Effect.Effect<CapturedNorms | null, MetaReadError>;
 }
 
 /**
@@ -223,6 +291,31 @@ export function createMetaDashboardRead(path: string): MetaDashboardRead {
     WHERE trace_id = ?
       AND name = 'review'
       AND json_extract(payload, '$.parentSpanId') = ?
+  `);
+
+  // VA-405: read rolling norms straight from VA-399's evaluator-
+  // facing view. The view name + column shape is the IRA's stable
+  // contract per `src/dashboard/read-model.md`; changes that rename a
+  // column require a versioned `_v2` view, not an in-place edit.
+  //
+  // The view's window N is the dashboard process's setting (env
+  // `DASHBOARD_AGGREGATE_WINDOW`, default 30). `loadNorms`' window
+  // parameter is echoed back in the projected `CapturedNorms` shape
+  // for the IRA's user prompt but does not affect this query — see
+  // the gateway interface's doc-comment.
+  const selectNorms = db.prepare(`
+    SELECT
+      sample_size,
+      median_iteration_count,
+      p95_iteration_count,
+      median_wall_time_ms,
+      p95_wall_time_ms,
+      reviewer_rejection_rate,
+      revert_rate,
+      hitl_escape_rate,
+      infra_error_rate
+    FROM evaluator_aggregates_v1
+    WHERE category = ?
   `);
 
   const wrap = <A>(
@@ -347,6 +440,40 @@ export function createMetaDashboardRead(path: string): MetaDashboardRead {
         return Number(row?.attempts ?? 0);
       });
     },
+
+    loadNorms(category, windowDrains) {
+      return wrap("loadNorms", () => {
+        // Coerce window to a positive integer for the echo field — the
+        // view itself ignores it, but `CapturedNorms.windowDrains`
+        // feeds the IRA's user prompt and should not advertise `-3` or
+        // `NaN`. Bigger story (per-call window) lives in the gateway
+        // doc-comment.
+        const n = Math.max(1, Math.floor(windowDrains));
+        const row = selectNorms.get(category) as
+          | Record<string, unknown>
+          | undefined;
+        // The aggregator returns a single-row result; sample_size is
+        // the only field that distinguishes "no rows" from "rows with
+        // null medians". A sample of zero is the null case — the IRA
+        // sees no norms for this category and gracefully emits null
+        // relatives.
+        const sampleSize = Number(row?.sample_size ?? 0);
+        if (sampleSize === 0) return null;
+        return {
+          category,
+          windowDrains: n,
+          sampleSize,
+          medianIterationCount: nullableNum(row?.median_iteration_count),
+          p95IterationCount: nullableNum(row?.p95_iteration_count),
+          medianWallTimeMs: nullableNum(row?.median_wall_time_ms),
+          p95WallTimeMs: nullableNum(row?.p95_wall_time_ms),
+          reviewerRejectionRate: Number(row?.reviewer_rejection_rate ?? 0),
+          revertRate: Number(row?.revert_rate ?? 0),
+          hitlEscapeRate: Number(row?.hitl_escape_rate ?? 0),
+          infraErrorRate: Number(row?.infra_error_rate ?? 0),
+        } satisfies CapturedNorms;
+      });
+    },
   };
 }
 
@@ -354,6 +481,12 @@ function nullableStr(v: unknown): string | null {
   if (v === null || v === undefined) return null;
   const s = String(v);
   return s.length === 0 ? null : s;
+}
+
+function nullableNum(v: unknown): number | null {
+  if (v === null || v === undefined) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 
 function extractAttrs(payloadJson: string): Record<string, unknown> {

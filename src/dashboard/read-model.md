@@ -87,7 +87,13 @@ INSERT; there is no refresh delay (the view is live, not materialized).
 
 - **External evaluator** (IRA, ad-hoc scripts): open the SQLite file
   read-only and `SELECT * FROM evaluator_aggregates_v1`. The view name
-  is the contract.
+  is the contract. The IRA's `meta/dashboard-read` gateway (VA-405's
+  `loadNorms(category, windowDrains)`) does exactly this — its
+  `windowDrains` argument echoes back in the projected `CapturedNorms`
+  for the IRA's user prompt, but the underlying numbers reflect the
+  dashboard process's `DASHBOARD_AGGREGATE_WINDOW` setting (the view
+  doesn't take a per-call N). A future per-call window would be a
+  versioned `_v2` view addition.
 - **Dashboard UI / HTTP clients**: `GET /api/aggregates` returns a
   JSON-serialized snapshot:
   ```json
