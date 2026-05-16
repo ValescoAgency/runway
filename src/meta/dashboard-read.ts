@@ -255,11 +255,16 @@ export interface MetaDashboardRead {
     traceId: string,
   ): Effect.Effect<number, MetaReadError>;
   /**
-   * VA-406: count meta_reviews rows for a drain whose kind belongs to
-   * the "Run Review pass completed" set (`meta-run-review`,
-   * `meta-skipped`, `meta-failed`). Used by the Run Review pass to
-   * decide whether its write was the LAST one that the drain was
-   * waiting on — if yes, fire Drain Review in-process.
+   * VA-406: count of distinct issues with a terminal Run Review row for
+   * a drain (kind in `meta-run-review`, `meta-skipped`, `meta-failed`).
+   * Used by the Run Review pass to decide whether its write was the
+   * LAST one that the drain was waiting on — if yes, fire Drain Review
+   * in-process.
+   *
+   * Counted as DISTINCT non-null `issue_id` so:
+   *   - reruns producing two terminal rows for the same issue don't
+   *     inflate the count
+   *   - drain-level `meta-failed` stubs (issue_id = null) are ignored
    *
    * Skipped + failed both count as "complete" per the VA-406 AC:
    * "accounting for `meta-skipped` and `meta-failed` rows as
@@ -422,14 +427,20 @@ export function createMetaDashboardRead(path: string): MetaDashboardRead {
     WHERE trace_id = ?
   `);
 
-  // VA-406: count meta_reviews rows for a drain whose kind belongs to
-  // the "Run Review pass completed" set. Skipped + failed both count
-  // as "complete" per the AC — they're terminal Run Review outcomes,
-  // not retries.
+  // VA-406: count distinct per-issue terminal Run Review rows for a
+  // drain. Skipped + failed both count as "complete" per the AC —
+  // they're terminal Run Review outcomes, not retries. We count
+  // DISTINCT issue_id (and exclude null) so that:
+  //   - reruns producing two terminal rows for the same issue don't
+  //     falsely satisfy the trigger gate while another issue is still
+  //     missing
+  //   - drain-level `meta-failed` stubs (issue_id = null, written by a
+  //     failed Drain Review) don't contribute to the completion count
   const selectCompletedRunReviewCount = db.prepare(`
-    SELECT COUNT(*) AS n
+    SELECT COUNT(DISTINCT issue_id) AS n
     FROM meta_reviews
     WHERE drain_id = ?
+      AND issue_id IS NOT NULL
       AND kind IN ('meta-run-review', 'meta-skipped', 'meta-failed')
   `);
 

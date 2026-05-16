@@ -438,6 +438,55 @@ describe("MetaDashboardRead.countCompletedRunReviews (VA-406)", () => {
     );
     expect(n).toBe(0);
   });
+
+  // Regression: meta_reviews preserves reruns, so the trigger gate must
+  // count *distinct per-issue* completions. Two terminal rows for the
+  // same issue must not falsely satisfy the gate while another issue
+  // has no Run Review yet.
+  it("dedupes by issue_id so reruns don't inflate the completion count", async () => {
+    const trace = "f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0";
+    seedDrain(trace, "1000000000000000000");
+    seedMetaReview(trace, "meta-run-review", "VA-1");
+    storage.saveMetaReview({
+      id: `${trace}-rerun-VA-1`,
+      kind: "meta-run-review",
+      scope: "VA-1",
+      drainId: trace,
+      issueId: "VA-1",
+      contentJson: "{}",
+      templateVersion: "1.0.0",
+      createdAt: new Date().toISOString(),
+    });
+
+    const n = await Effect.runPromise(
+      gateway.countCompletedRunReviews(trace),
+    );
+    expect(n).toBe(1);
+  });
+
+  // Regression: a failed Drain Review writes a `meta-failed` stub at
+  // the drain level (issue_id = null). That row must not contribute to
+  // the Run Review completion count.
+  it("ignores drain-level meta-failed stubs with null issue_id", async () => {
+    const trace = "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f";
+    seedDrain(trace, "1000000000000000000");
+    seedMetaReview(trace, "meta-run-review", "VA-1");
+    storage.saveMetaReview({
+      id: `${trace}-drain-failed-stub`,
+      kind: "meta-failed",
+      scope: trace,
+      drainId: trace,
+      issueId: null,
+      contentJson: "{}",
+      templateVersion: "1.0.0",
+      createdAt: new Date().toISOString(),
+    });
+
+    const n = await Effect.runPromise(
+      gateway.countCompletedRunReviews(trace),
+    );
+    expect(n).toBe(1);
+  });
 });
 
 describe("MetaDashboardRead.countDrainReviews (VA-406)", () => {
