@@ -76,9 +76,8 @@ export function resolveMetaConfig(env: {
   /**
    * VA-403: minimum drain age before the IRA grades the run. Default
    * 18h gives hindsight (PR merge state, human comments, follow-up
-   * issues) time to land. Operators can tighten / widen via
-   * env or `.runway/config.yml`; `0` disables (alias for `--force`
-   * on every invocation).
+   * issues) time to land. PRD constrains operator overrides to the
+   * 12–24h band; for one-off bypass use `--force` on the CLI.
    */
   readonly metaReviewDelayHours: number;
   readonly source: {

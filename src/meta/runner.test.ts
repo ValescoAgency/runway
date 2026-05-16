@@ -123,12 +123,12 @@ describe("resolveMetaConfig (VA-402)", () => {
     expect(r.source.delayHours).toBe("env");
   });
 
-  it("accepts 0 as a valid metaReviewDelayHours (alias for --force always)", () => {
+  it("accepts metaReviewDelayHours at the lower band edge (12h)", () => {
     const r = resolveMetaConfig({
-      config: baseConfig({ metaReviewDelayHours: 0 }),
+      config: baseConfig({ metaReviewDelayHours: 12 }),
       cwd,
     });
-    expect(r.metaReviewDelayHours).toBe(0);
+    expect(r.metaReviewDelayHours).toBe(12);
     expect(r.source.delayHours).toBe("env");
   });
 });

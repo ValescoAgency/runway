@@ -42,7 +42,7 @@ ENV
   RUNWAY_DASHBOARD_DB          dashboard SQLite path (default: ./runway-dashboard.db)
   RUNWAY_META_REVIEW_MODEL     override the Anthropic model (default: claude-sonnet-4-6)
   RUNWAY_META_PROJECT_NAME     override the Linear meta-project name (default: runway-meta)
-  RUNWAY_REVIEW_DELAY_HOURS    minimum drain age before grading (default: 18; 0 disables)
+  RUNWAY_REVIEW_DELAY_HOURS    minimum drain age before grading (default: 18; 12-24h band per PRD VA-403)
   GITHUB_TOKEN                 optional — authenticates GitHub API for hindsight PR fetch
 `);
 }

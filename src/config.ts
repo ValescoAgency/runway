@@ -124,8 +124,9 @@ export interface RunwayConfig {
    * VA-403: minimum drain age (in hours) before `runway review run`
    * grades it. The IRA's hindsight signals (PR merge / human
    * comments / follow-up issues) need real time to land — judging
-   * too early scores against absent signals. Default 18h. `0`
-   * disables the gate (alias for `--force` on every invocation).
+   * too early scores against absent signals. PRD constrains the
+   * value to 12–24h; default 18. Use `--force` on the CLI for a
+   * one-off bypass; persistent disable isn't a supported mode.
    * Source: `RUNWAY_REVIEW_DELAY_HOURS`. Resolution: env →
    * `.runway/config.yml` → 18-hour hardcoded default.
    */
@@ -195,11 +196,17 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
   ),
   metaReviewModel: EConfig.option(EConfig.string("RUNWAY_META_REVIEW_MODEL")),
   metaProjectName: EConfig.option(EConfig.string("RUNWAY_META_PROJECT_NAME")),
+  // VA-403: PRD constrains the configurable delay to the 12–24h
+  // band — too short and the IRA judges before hindsight lands; too
+  // long and operators lose the freshness operators expect from a
+  // ~daily retrospective. The explicit `--force` CLI flag (or
+  // `force: true` to dispatchRunReview) is the supported bypass
+  // for one-off operator overrides; persistent disable isn't.
   metaReviewDelayHours: EConfig.option(
     EConfig.number("RUNWAY_REVIEW_DELAY_HOURS").pipe(
       EConfig.validate({
-        message: "RUNWAY_REVIEW_DELAY_HOURS must be >= 0",
-        validation: (n): n is number => n >= 0,
+        message: "RUNWAY_REVIEW_DELAY_HOURS must be in the 12-24 hour band (PRD VA-403); use --force on the CLI for one-off bypass",
+        validation: (n): n is number => n >= 12 && n <= 24,
       }),
     ),
   ),
