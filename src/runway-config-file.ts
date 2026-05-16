@@ -1,7 +1,7 @@
+import { Schema } from "effect";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
-import { z } from "zod";
 
 /**
  * VA-402: persistent operator-level config file at `.runway/config.yml`.
@@ -21,17 +21,17 @@ import { z } from "zod";
  * That mirrors how unix tools generally compose CLI > env > file.
  */
 
-const RunwayConfigFileSchema = z.object({
+const RunwayConfigFileSchema = Schema.Struct({
   /**
    * VA-402: Anthropic model name for the IRA's Run / Drain Review
    * passes. Overridden by `RUNWAY_META_REVIEW_MODEL` if set in env.
    */
-  metaReviewModel: z.string().optional(),
+  metaReviewModel: Schema.optional(Schema.String),
   /**
    * VA-402: Linear project name the IRA writes its Reviews into.
    * Overridden by `RUNWAY_META_PROJECT_NAME` if set in env.
    */
-  metaProjectName: z.string().optional(),
+  metaProjectName: Schema.optional(Schema.String),
   /**
    * VA-403: minimum drain age before the IRA grades it. PRD
    * constrains the value to the 12–24h band (default 18) — too
@@ -40,25 +40,31 @@ const RunwayConfigFileSchema = z.object({
    * set in env. The `--force` CLI flag is the supported one-off
    * bypass; persistent disable isn't a supported mode.
    */
-  metaReviewDelayHours: z.number().min(12).max(24).optional(),
+  metaReviewDelayHours: Schema.optional(
+    Schema.Number.pipe(Schema.between(12, 24)),
+  ),
   /**
    * VA-404: thresholds for the IRA heuristic pre-filter. Either or
    * both fields may be set; missing fields fall through to the
    * hardcoded defaults (3 iterations, 2 reviewer rejections).
    */
-  metaFilterThresholds: z
-    .object({
-      minIterationCount: z.number().int().min(1).optional(),
-      minReviewerRejections: z.number().int().min(1).optional(),
-    })
-    .optional(),
+  metaFilterThresholds: Schema.optional(
+    Schema.Struct({
+      minIterationCount: Schema.optional(
+        Schema.Int.pipe(Schema.greaterThanOrEqualTo(1)),
+      ),
+      minReviewerRejections: Schema.optional(
+        Schema.Int.pipe(Schema.greaterThanOrEqualTo(1)),
+      ),
+    }),
+  ),
   /**
    * VA-406: optional Linear project name where the runway repo's own
    * issues live (e.g. "Runway"). When set, severity-critical Drain
    * Review escalations file in that project; when unset, they land
    * team-only. Overridden by `RUNWAY_REPO_PROJECT_NAME` if set in env.
    */
-  runwayRepoProjectName: z.string().optional(),
+  runwayRepoProjectName: Schema.optional(Schema.String),
   /**
    * VA-408: Anthropic model for the Weekly Review pass. PRD default is
    * `claude-opus-4-7` (deeper reasoning across many Reviews benefits
@@ -66,10 +72,12 @@ const RunwayConfigFileSchema = z.object({
    * Review model so operators can dial cost vs judgment quality per
    * pass. Overridden by `RUNWAY_META_WEEKLY_MODEL` if set in env.
    */
-  metaWeeklyModel: z.string().optional(),
+  metaWeeklyModel: Schema.optional(Schema.String),
 });
 
-export type RunwayConfigFile = z.infer<typeof RunwayConfigFileSchema>;
+export type RunwayConfigFile = typeof RunwayConfigFileSchema.Type;
+
+const decodeRunwayConfigFile = Schema.decodeUnknownSync(RunwayConfigFileSchema);
 
 const CONFIG_RELATIVE_PATH = join(".runway", "config.yml");
 
@@ -77,12 +85,12 @@ const CONFIG_RELATIVE_PATH = join(".runway", "config.yml");
  * Read `.runway/config.yml` relative to `cwd` if it exists. Returns
  * an empty object when the file is absent so callers can spread the
  * result over defaults without null-guarding. A malformed file throws
- * a typed Zod error — the runner surfaces that as a `meta-failed`
- * stub rather than silently ignoring operator intent.
+ * a typed Effect `ParseError` — the runner surfaces that as a
+ * `meta-failed` stub rather than silently ignoring operator intent.
  */
 export function loadRunwayConfigFile(cwd: string): RunwayConfigFile {
   const path = join(cwd, CONFIG_RELATIVE_PATH);
   if (!existsSync(path)) return {};
   const raw = readFileSync(path, "utf8");
-  return RunwayConfigFileSchema.parse(parseYaml(raw) ?? {});
+  return decodeRunwayConfigFile(parseYaml(raw) ?? {});
 }

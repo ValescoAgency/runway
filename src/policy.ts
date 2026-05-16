@@ -1,7 +1,7 @@
+import { Schema } from "effect";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
-import { z } from "zod";
 
 /**
  * VA-352: per-repo + per-run write-path policy for the impl agent.
@@ -29,12 +29,14 @@ export const DEFAULT_FORBIDDEN_PATHS = [
   ".sandcastle/**",
 ] as const;
 
-const PolicyFileSchema = z.object({
-  allowedPaths: z.array(z.string()).optional(),
-  forbiddenPaths: z.array(z.string()).optional(),
+const PolicyFileSchema = Schema.Struct({
+  allowedPaths: Schema.optional(Schema.Array(Schema.String)),
+  forbiddenPaths: Schema.optional(Schema.Array(Schema.String)),
 });
 
-export type PolicyFile = z.infer<typeof PolicyFileSchema>;
+export type PolicyFile = typeof PolicyFileSchema.Type;
+
+const decodePolicyFile = Schema.decodeUnknownSync(PolicyFileSchema);
 
 export interface Policy {
   /** Globs the agent must not write to. */
@@ -74,7 +76,7 @@ export function loadPolicy(
   if (existsSync(policyPath)) {
     sources.push(POLICY_RELATIVE_PATH);
     const raw = readFileSync(policyPath, "utf8");
-    const parsed = PolicyFileSchema.parse(parseYaml(raw) ?? {});
+    const parsed = decodePolicyFile(parseYaml(raw) ?? {});
     if (parsed.forbiddenPaths) {
       forbidden = new Set(parsed.forbiddenPaths);
     }
