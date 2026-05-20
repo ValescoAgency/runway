@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   AUTH_MODE_ENV_VAR,
@@ -163,7 +163,34 @@ export function parseOpRefs(
 // Render: Dockerfile
 // ---------------------------------------------------------------------------
 
-function renderDockerfile(
+/**
+ * VA-466: read every historical snapshot under `templates/history/`
+ * that matches the base Dockerfile naming pattern, flatten them to
+ * the set of lines that have ever shipped as canonical content.
+ *
+ * Files are named `Dockerfile.claude-code.base.v<n>` (where `<n>` is
+ * the runway version that owned that exact content). The detector
+ * doesn't care about version ordering — it just needs the union of
+ * lines so a target Dockerfile rendered at any prior version doesn't
+ * trigger false-positive "manual edit" reports.
+ *
+ * Missing or empty `history/` directory returns an empty list — both
+ * are valid states (a fresh checkout that hasn't accumulated history
+ * yet, or a tier-1 repo whose template never changed).
+ */
+function historicalBaseTemplateLines(): readonly string[] {
+  const historyDir = join(TEMPLATES_DIR, "history");
+  if (!existsSync(historyDir)) return [];
+  const out: string[] = [];
+  for (const name of readdirSync(historyDir)) {
+    if (!name.startsWith("Dockerfile.claude-code.base")) continue;
+    const contents = readFileSync(join(historyDir, name), "utf8");
+    for (const line of contents.split("\n")) out.push(line);
+  }
+  return out;
+}
+
+export function renderDockerfile(
   cwd: string,
   tier: 1 | 2,
   opts: RepoUpgradeOptions,
@@ -199,8 +226,22 @@ function renderDockerfile(
 
   // Detect manual user edits: any line in `before` that isn't in the
   // expected re-rendered output is foreign. Warn loudly unless --force.
+  //
+  // VA-466: expectedLines unions the current template with every
+  // historical canonical template snapshot under `templates/history/`.
+  // Without this, a target repo's Dockerfile rendered by an older
+  // runway version flags every cross-version line delta as a "manual
+  // edit" — false-positive that forces operators to pass `--force`
+  // and lose the detector's real signal. Each release that mutates
+  // `Dockerfile.claude-code.base` snapshots the prior version into
+  // `templates/history/Dockerfile.claude-code.base.v<n>` BEFORE the
+  // edit lands; the detector unions all of them so any line that
+  // ever shipped as canonical stays trusted.
   if (before !== after && !opts.force && enforceManualEditGuard) {
     const expectedLines = new Set(after.split("\n"));
+    for (const line of historicalBaseTemplateLines()) {
+      expectedLines.add(line);
+    }
     const foreign = before
       .split("\n")
       .filter((l) => l.trim().length && !expectedLines.has(l));
