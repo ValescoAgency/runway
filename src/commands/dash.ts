@@ -6,15 +6,22 @@ import { execa, type ExecaError } from "execa";
  * runway-using project without cloning the runway repo or maintaining
  * a docker-compose file.
  *
- * Three verbs:
- *   up     pull the published image and run it as a detached
- *          container (`runway-dashboard`) with loopback ports and a
- *          named volume for the SQLite db.
- *   logs   stream `docker logs` for the container (`--follow` toggles
- *          `-f`; default tails recent output without following).
- *   stop   stop and `rm` the container. The named volume stays so
- *          history survives across restarts; explicit `--purge` drops
- *          the volume too.
+ * Four verbs:
+ *   up      pull the published image and run it as a detached
+ *           container (`runway-dashboard`) with loopback ports and a
+ *           named volume for the SQLite db.
+ *   logs    stream `docker logs` for the container (`--follow` toggles
+ *           `-f`; default tails recent output without following).
+ *   stop    stop and `rm` the container. The named volume stays so
+ *           history survives across restarts; explicit `--purge` drops
+ *           the volume too.
+ *   upgrade VA-451: pull a fresh image, then stop + `rm` the existing
+ *           container and start a new one against the same named
+ *           volume. The pull happens first so a failed pull leaves the
+ *           existing dashboard running. Schema migrations on the
+ *           SQLite db are idempotent (ALTER TABLE ADD COLUMN swallowed
+ *           on duplicate), so column-add releases like VA-450 carry
+ *           forward without operator intervention.
  *
  * Defaults to the `:latest` tag published by `.github/workflows/dashboard-image.yml`.
  * Override via `--image` or the `RUNWAY_DASHBOARD_IMAGE` env var.
@@ -45,7 +52,7 @@ const FORWARDED_ENV_KEYS = [
 ] as const;
 
 export interface DashOptions {
-  readonly verb: "up" | "logs" | "stop";
+  readonly verb: "up" | "logs" | "stop" | "upgrade";
   readonly image: string;
   readonly containerName: string;
   readonly volumeName: string;
@@ -63,19 +70,25 @@ project without cloning the runway repo. The published image is
 ${DEFAULT_IMAGE}; override via --image or RUNWAY_DASHBOARD_IMAGE.
 
 USAGE
-  runway dash up   [--image=…] [--otlp-port=N] [--dashboard-port=N]
-  runway dash logs [--follow]
-  runway dash stop [--purge]
+  runway dash up      [--image=…] [--otlp-port=N] [--dashboard-port=N]
+  runway dash upgrade [--image=…] [--otlp-port=N] [--dashboard-port=N]
+  runway dash logs    [--follow]
+  runway dash stop    [--purge]
 
 VERBS
-  up     Pull and start the dashboard as a detached container
-         (\`${DEFAULT_CONTAINER_NAME}\`). Ports publish to 127.0.0.1
-         only; a named volume (\`${DEFAULT_VOLUME_NAME}\`) persists
-         the SQLite db across runs.
-  logs   Stream container logs (\`docker logs ${DEFAULT_CONTAINER_NAME}\`).
-         Pass --follow to tail with -f.
-  stop   Stop and remove the container. The named volume stays unless
-         --purge is passed.
+  up       Pull and start the dashboard as a detached container
+           (\`${DEFAULT_CONTAINER_NAME}\`). Ports publish to 127.0.0.1
+           only; a named volume (\`${DEFAULT_VOLUME_NAME}\`) persists
+           the SQLite db across runs.
+  upgrade  Pull a fresh image and replace the running container with
+           one based on it. The pull runs first, so if it fails the
+           existing container is left untouched. The named volume
+           (\`${DEFAULT_VOLUME_NAME}\`) is preserved across the
+           replacement — SQLite history + schema migrate forward.
+  logs     Stream container logs (\`docker logs ${DEFAULT_CONTAINER_NAME}\`).
+           Pass --follow to tail with -f.
+  stop     Stop and remove the container. The named volume stays unless
+           --purge is passed.
 
 OPTIONS
   --image=REF         Override the dashboard image reference.
@@ -100,7 +113,7 @@ OTEL EXPORTER
 }
 
 export interface ParsedDashArgs {
-  readonly verb: "up" | "logs" | "stop";
+  readonly verb: "up" | "logs" | "stop" | "upgrade";
   readonly image?: string;
   readonly otlpPort?: string;
   readonly dashboardPort?: string;
@@ -111,7 +124,7 @@ export interface ParsedDashArgs {
 export function parseDashArgs(argv: readonly string[]): ParsedDashArgs {
   if (argv.length === 0) {
     throw new Error(
-      "missing verb — expected one of: up, logs, stop. Run `runway dash --help`.",
+      "missing verb — expected one of: up, upgrade, logs, stop. Run `runway dash --help`.",
     );
   }
   const [verbRaw, ...rest] = argv;
@@ -119,9 +132,14 @@ export function parseDashArgs(argv: readonly string[]): ParsedDashArgs {
     printDashUsage();
     process.exit(0);
   }
-  if (verbRaw !== "up" && verbRaw !== "logs" && verbRaw !== "stop") {
+  if (
+    verbRaw !== "up" &&
+    verbRaw !== "logs" &&
+    verbRaw !== "stop" &&
+    verbRaw !== "upgrade"
+  ) {
     throw new Error(
-      `unknown verb "${verbRaw}" — expected one of: up, logs, stop.`,
+      `unknown verb "${verbRaw}" — expected one of: up, upgrade, logs, stop.`,
     );
   }
   const verb = verbRaw;
@@ -234,6 +252,9 @@ export async function dashCommand(argv: readonly string[]): Promise<void> {
     case "up":
       await dashUp(opts);
       return;
+    case "upgrade":
+      await dashUpgrade(opts);
+      return;
     case "logs":
       await dashLogs(opts);
       return;
@@ -295,6 +316,48 @@ async function dashUp(opts: DashOptions): Promise<void> {
       `failed to pull ${opts.image}. ` +
         "If the image is private, run `docker login ghcr.io` first.",
     );
+  }
+
+  const args = buildDockerRunArgs(opts);
+  console.log(`[runway dash] starting container ${opts.containerName}`);
+  await execa("docker", args, { stdio: "inherit" });
+  await printAccessHints(opts);
+}
+
+/**
+ * VA-451: pull-then-replace. The pull runs BEFORE the stop so a
+ * failed pull (network, auth, manifest mismatch) leaves the existing
+ * container running — we never take the dashboard down on a failed
+ * upgrade attempt. The named volume is preserved across the
+ * replacement; the dashboard's idempotent ALTER TABLE migrations
+ * handle any column adds on the new container's next boot.
+ */
+async function dashUpgrade(opts: DashOptions): Promise<void> {
+  console.log(`[runway dash] upgrade: pulling ${opts.image}`);
+  try {
+    await execa("docker", ["pull", opts.image], { stdio: "inherit" });
+  } catch {
+    throw new Error(
+      `failed to pull ${opts.image}. ` +
+        "The existing container is unchanged. " +
+        "If the image is private, run `docker login ghcr.io` first.",
+    );
+  }
+
+  const existing = await containerState(opts.containerName);
+  if (existing === "running") {
+    console.log(
+      `[runway dash] upgrade: stopping ${opts.containerName}`,
+    );
+    await execa("docker", ["stop", opts.containerName], {
+      stdio: "inherit",
+    });
+  }
+  if (existing !== "absent") {
+    console.log(
+      `[runway dash] upgrade: removing ${opts.containerName} (volume ${opts.volumeName} kept)`,
+    );
+    await execa("docker", ["rm", opts.containerName], { stdio: "inherit" });
   }
 
   const args = buildDockerRunArgs(opts);

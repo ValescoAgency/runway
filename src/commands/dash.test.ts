@@ -15,10 +15,26 @@ describe("parseDashArgs (VA-393)", () => {
     expect(() => parseDashArgs(["foo"])).toThrow(/unknown verb/);
   });
 
-  it("accepts the three canonical verbs", () => {
+  it("accepts the four canonical verbs", () => {
     expect(parseDashArgs(["up"]).verb).toBe("up");
     expect(parseDashArgs(["logs"]).verb).toBe("logs");
     expect(parseDashArgs(["stop"]).verb).toBe("stop");
+    // VA-451
+    expect(parseDashArgs(["upgrade"]).verb).toBe("upgrade");
+  });
+
+  // VA-451
+  it("accepts --image / --otlp-port / --dashboard-port on upgrade", () => {
+    const parsed = parseDashArgs([
+      "upgrade",
+      "--image=ghcr.io/x/y:0.12.0",
+      "--otlp-port=4318",
+      "--dashboard-port=3001",
+    ]);
+    expect(parsed.verb).toBe("upgrade");
+    expect(parsed.image).toBe("ghcr.io/x/y:0.12.0");
+    expect(parsed.otlpPort).toBe("4318");
+    expect(parsed.dashboardPort).toBe("3001");
   });
 
   it("parses --image, --otlp-port, --dashboard-port", () => {
@@ -171,7 +187,7 @@ describe("buildDockerRunArgs (VA-393)", () => {
 });
 
 describe("printDashUsage (VA-393)", () => {
-  it("documents the three verbs", () => {
+  it("documents the four verbs", () => {
     const lines: string[] = [];
     const orig = console.log;
     console.log = (s: string) => lines.push(s);
@@ -182,6 +198,7 @@ describe("printDashUsage (VA-393)", () => {
     }
     const out = lines.join("\n");
     expect(out).toContain("runway dash up");
+    expect(out).toContain("runway dash upgrade");
     expect(out).toContain("runway dash logs");
     expect(out).toContain("runway dash stop");
   });
