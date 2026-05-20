@@ -236,6 +236,68 @@ describe("renderListView — Linear sync surfaces (VA-390)", () => {
     expect(html).toContain("—");
   });
 
+  // VA-452
+  it("renders an `↗ Linear` affordance on Todo queue rows when linearWorkspace is set", () => {
+    const html = renderListView({
+      rows: [row()],
+      linearEnabled: true,
+      linearWorkspace: "valescoagency",
+      todoQueue: [
+        snapshot({
+          issueIdentifier: "VA-77",
+          title: "linkable",
+          labels: [],
+          queuePosition: 0,
+        }),
+      ],
+      snapshotsByIdentifier: new Map(),
+    });
+    expect(html).toContain(
+      "https://linear.app/valescoagency/issue/VA-77",
+    );
+    expect(html).toContain("↗");
+    expect(html).toContain('target="_blank"');
+    expect(html).toContain('rel="noopener noreferrer"');
+  });
+
+  // VA-452
+  it("omits the `↗ Linear` affordance when linearWorkspace is null", () => {
+    const html = renderListView({
+      rows: [row()],
+      linearEnabled: true,
+      linearWorkspace: null,
+      todoQueue: [
+        snapshot({
+          issueIdentifier: "VA-77",
+          title: "not-linkable",
+          labels: [],
+          queuePosition: 0,
+        }),
+      ],
+      snapshotsByIdentifier: new Map(),
+    });
+    expect(html).not.toContain("https://linear.app/");
+    expect(html).not.toContain("↗");
+  });
+
+  // VA-452
+  it("renders the `↗ Linear` affordance on issue-process list rows alongside the local detail link", () => {
+    const r = row({ issueIdentifier: "VA-101" });
+    const html = renderListView({
+      rows: [r],
+      linearEnabled: true,
+      linearWorkspace: "valescoagency",
+      todoQueue: [],
+      snapshotsByIdentifier: new Map(),
+    });
+    // Local detail link preserved
+    expect(html).toContain(`/issue-processes/${encodeURIComponent(r.spanId)}`);
+    // Linear link added
+    expect(html).toContain(
+      "https://linear.app/valescoagency/issue/VA-101",
+    );
+  });
+
   it("renders an empty-state row inside the queue section when the queue is empty", () => {
     const html = renderListView({
       rows: [row()],
@@ -409,6 +471,25 @@ describe("renderDetailView (VA-389)", () => {
   it("renders an empty-state message when no iterations and no phase spans exist", () => {
     const html = renderDetailView(detailVm());
     expect(html).toContain("No phase spans recorded yet.");
+  });
+
+  // VA-452
+  it("renders the `↗ Linear` affordance in the detail header when linearWorkspace is set", () => {
+    const base = detailVm();
+    const html = renderDetailView({
+      ...base,
+      issueProcess: { ...base.issueProcess, issueIdentifier: "VA-200" },
+      linearWorkspace: "valescoagency",
+    });
+    expect(html).toContain(
+      "https://linear.app/valescoagency/issue/VA-200",
+    );
+  });
+
+  // VA-452
+  it("omits the `↗ Linear` affordance from the detail header when linearWorkspace is null", () => {
+    const html = renderDetailView(detailVm());
+    expect(html).not.toContain("https://linear.app/");
   });
 
   it("renders the issue title, branch, and a clickable PR link for opened runs (VA-387)", () => {

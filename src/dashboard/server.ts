@@ -95,6 +95,13 @@ export interface ServerOptions {
    */
   readonly linearEnabled?: boolean;
   /**
+   * VA-452: Linear workspace slug (e.g. "valescoagency"). When set,
+   * the views render a `↗ open in Linear` affordance next to each
+   * issue identifier. When omitted/null, the dashboard renders
+   * identifiers as before.
+   */
+  readonly linearWorkspace?: string | null;
+  /**
    * VA-391: in-process event bus the OTLP ingest paths publish to.
    * Optional — defaults to a fresh per-server bus, which is what
    * production wants. Tests inject one to assert publish/subscribe
@@ -118,9 +125,14 @@ const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MiB — generous; a runway drain 
  */
 export function buildServer(
   storage: Storage,
-  opts: { readonly linearEnabled?: boolean; readonly events?: EventBus } = {},
+  opts: {
+    readonly linearEnabled?: boolean;
+    readonly linearWorkspace?: string | null;
+    readonly events?: EventBus;
+  } = {},
 ): Server {
   const linearEnabled = opts.linearEnabled ?? false;
+  const linearWorkspace = opts.linearWorkspace ?? null;
   // VA-391: an in-process event bus is plumbed through every request
   // handler so the OTLP ingest paths can publish change events that
   // the SSE detail-pane stream re-emits to the browser. Callers can
@@ -128,9 +140,11 @@ export function buildServer(
   // production gets a fresh per-server bus.
   const events = opts.events ?? createEventBus();
   return createServer((req, res) => {
-    handle(req, res, storage, linearEnabled, events).catch((err) => {
-      writeError(res, 500, "internal_error", asMessage(err));
-    });
+    handle(req, res, storage, linearEnabled, linearWorkspace, events).catch(
+      (err) => {
+        writeError(res, 500, "internal_error", asMessage(err));
+      },
+    );
   });
 }
 
@@ -141,6 +155,7 @@ export function buildServer(
 export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   const server = buildServer(opts.storage, {
     linearEnabled: opts.linearEnabled,
+    linearWorkspace: opts.linearWorkspace,
     events: opts.events,
   });
   const port = opts.port ?? 4318;
@@ -173,6 +188,7 @@ async function handle(
   res: ServerResponse,
   storage: Storage,
   linearEnabled: boolean,
+  linearWorkspace: string | null,
   events: EventBus,
 ): Promise<void> {
   // Route on method + path. Nothing fancy — slice 1 only has two
@@ -191,7 +207,7 @@ async function handle(
   }
 
   if (method === "GET" && (url === "/" || url.startsWith("/?"))) {
-    handleListView(req, res, storage, linearEnabled);
+    handleListView(req, res, storage, linearEnabled, linearWorkspace);
     return;
   }
 
@@ -201,7 +217,13 @@ async function handle(
     method === "GET" &&
     (url === "/issue-processes" || url.startsWith("/issue-processes?"))
   ) {
-    handleIssueProcessRowsFragment(req, res, storage, linearEnabled);
+    handleIssueProcessRowsFragment(
+      req,
+      res,
+      storage,
+      linearEnabled,
+      linearWorkspace,
+    );
     return;
   }
 
@@ -218,7 +240,7 @@ async function handle(
     const issueProcessMatch = ISSUE_PROCESS_DETAIL_RE.exec(pathOnly);
     if (issueProcessMatch) {
       const spanId = decodeURIComponent(issueProcessMatch[1] ?? "");
-      handleIssueProcessDetailView(res, storage, spanId);
+      handleIssueProcessDetailView(res, storage, spanId, linearWorkspace);
       return;
     }
     // VA-407: meta-review list + detail. List matches the bare path or
@@ -240,7 +262,7 @@ async function handle(
     if (detailMatch) {
       const traceId = decodeURIComponent(detailMatch[1] ?? "");
       const spanId = decodeURIComponent(detailMatch[2] ?? "");
-      handleDetailView(res, storage, traceId, spanId);
+      handleDetailView(res, storage, traceId, spanId, linearWorkspace);
       return;
     }
   }
@@ -472,6 +494,7 @@ function handleIssueProcessRowsFragment(
   res: ServerResponse,
   storage: Storage,
   linearEnabled: boolean,
+  linearWorkspace: string | null,
 ): void {
   // VA-392: the fragment endpoint applies the same filter state as the
   // full list view so a polled refresh doesn't reset the user's chips.
@@ -492,6 +515,7 @@ function handleIssueProcessRowsFragment(
     linearEnabled,
     snapshotsByIdentifier,
     isFiltered: isFilteredState(filterState),
+    linearWorkspace,
   });
   res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
   res.end(html);
@@ -513,6 +537,7 @@ function handleListView(
   res: ServerResponse,
   storage: Storage,
   linearEnabled: boolean,
+  linearWorkspace: string | null,
 ): void {
   // VA-392: filter chips state is encoded in the URL query string so
   // the view is shareable. Parse once and reuse both for the storage
@@ -547,6 +572,7 @@ function handleListView(
     filterState,
     recentDrains,
     isFiltered: isFilteredState(filterState),
+    linearWorkspace,
   });
   res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
   res.end(html);
@@ -672,6 +698,7 @@ function handleDetailView(
   storage: Storage,
   traceId: string,
   spanId: string,
+  linearWorkspace: string | null,
 ): void {
   const ip = storage.getIssueProcess(traceId, spanId);
   if (!ip) {
@@ -683,7 +710,7 @@ function handleDetailView(
     );
     return;
   }
-  renderDetailFor(res, storage, ip);
+  renderDetailFor(res, storage, ip, linearWorkspace);
 }
 
 /**
@@ -695,19 +722,21 @@ function handleIssueProcessDetailView(
   res: ServerResponse,
   storage: Storage,
   spanId: string,
+  linearWorkspace: string | null,
 ): void {
   const ip = storage.getIssueProcessBySpanId(spanId);
   if (!ip) {
     writeError(res, 404, "not_found", `no issue process for span=${spanId}`);
     return;
   }
-  renderDetailFor(res, storage, ip);
+  renderDetailFor(res, storage, ip, linearWorkspace);
 }
 
 function renderDetailFor(
   res: ServerResponse,
   storage: Storage,
   ip: StoredIssueProcess,
+  linearWorkspace: string | null,
 ): void {
   const iterations = storage.listAgentIterations(ip.traceId, ip.spanId);
   const phaseSpans = storage.listPhaseSpans(ip.traceId, ip.spanId, [
@@ -723,6 +752,7 @@ function renderDetailFor(
     iterations,
     phaseSpans,
     logs,
+    linearWorkspace,
   });
   res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
   res.end(html);
@@ -899,6 +929,14 @@ export async function main(): Promise<void> {
   // and start polling at LINEAR_POLL_INTERVAL_SECONDS (default 300).
   const linearApiKey = process.env.LINEAR_API_KEY;
   const linearEnabled = Boolean(linearApiKey);
+  // VA-452: workspace slug for the `↗ open in Linear` affordance.
+  // Trim + collapse empty to null so a stray empty env var doesn't
+  // produce broken `linear.app//issue/...` URLs.
+  const linearWorkspaceRaw = process.env.RUNWAY_LINEAR_WORKSPACE?.trim();
+  const linearWorkspace =
+    linearWorkspaceRaw && linearWorkspaceRaw.length > 0
+      ? linearWorkspaceRaw
+      : null;
   let linearSync: LinearSyncHandle | null = null;
   if (linearApiKey) {
     const adapter = createLinearAdapter({
@@ -927,6 +965,7 @@ export async function main(): Promise<void> {
     port: otlpPort,
     host: otlpHost,
     linearEnabled,
+    linearWorkspace,
   });
   // The two listeners can share a server only when both port AND host
   // match — different bind addresses need different listeners.
@@ -938,6 +977,7 @@ export async function main(): Promise<void> {
           port: dashboardPort,
           host: dashboardHost,
           linearEnabled,
+          linearWorkspace,
         });
 
   console.log(
