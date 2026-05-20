@@ -433,6 +433,8 @@ describe("createStorage — linear_snapshots (VA-390)", () => {
       title: "first",
       labels: ["bug"],
       queuePosition: 0,
+      projectId: null,
+      projectName: null,
     });
     storage.saveLinearSnapshot({
       issueIdentifier: "VA-1",
@@ -441,6 +443,8 @@ describe("createStorage — linear_snapshots (VA-390)", () => {
       title: "first (renamed)",
       labels: ["bug", "wip"],
       queuePosition: null,
+      projectId: null,
+      projectName: null,
     });
     const all = storage.listLinearSnapshots();
     expect(all).toHaveLength(1);
@@ -449,6 +453,8 @@ describe("createStorage — linear_snapshots (VA-390)", () => {
       title: "first (renamed)",
       labels: ["bug", "wip"],
       queuePosition: null,
+      projectId: null,
+      projectName: null,
     });
   });
 
@@ -460,6 +466,8 @@ describe("createStorage — linear_snapshots (VA-390)", () => {
       title: "second",
       labels: [],
       queuePosition: 1,
+      projectId: null,
+      projectName: null,
     });
     storage.saveLinearSnapshot({
       issueIdentifier: "VA-1",
@@ -468,6 +476,8 @@ describe("createStorage — linear_snapshots (VA-390)", () => {
       title: "first",
       labels: [],
       queuePosition: 0,
+      projectId: null,
+      projectName: null,
     });
     storage.saveLinearSnapshot({
       issueIdentifier: "VA-99",
@@ -476,6 +486,8 @@ describe("createStorage — linear_snapshots (VA-390)", () => {
       title: "history",
       labels: [],
       queuePosition: null,
+      projectId: null,
+      projectName: null,
     });
     expect(storage.listLinearTodoQueue().map((q) => q.issueIdentifier)).toEqual([
       "VA-1",
@@ -491,6 +503,8 @@ describe("createStorage — linear_snapshots (VA-390)", () => {
       title: "x",
       labels: [],
       queuePosition: 0,
+      projectId: null,
+      projectName: null,
     });
     storage.saveLinearSnapshot({
       issueIdentifier: "VA-2",
@@ -499,6 +513,8 @@ describe("createStorage — linear_snapshots (VA-390)", () => {
       title: "y",
       labels: [],
       queuePosition: 1,
+      projectId: null,
+      projectName: null,
     });
     storage.clearLinearQueuePositions();
     expect(storage.listLinearTodoQueue()).toEqual([]);
@@ -518,9 +534,44 @@ describe("createStorage — linear_snapshots (VA-390)", () => {
       title: "x",
       labels: [],
       queuePosition: null,
+      projectId: null,
+      projectName: null,
     });
     const out = storage.listLinearSnapshots();
     expect(out[0]?.labels).toEqual([]);
+  });
+
+  // VA-450
+  it("round-trips projectId + projectName, and persists null for unprojected issues", () => {
+    storage.saveLinearSnapshot({
+      issueIdentifier: "VA-projected",
+      snapshotAt: "t",
+      status: "Todo",
+      title: "with project",
+      labels: [],
+      queuePosition: 0,
+      projectId: "e36f2b82-ed64-421c-91cb-955ef95a28ff",
+      projectName: "Runway",
+    });
+    storage.saveLinearSnapshot({
+      issueIdentifier: "VA-bare",
+      snapshotAt: "t",
+      status: "Todo",
+      title: "no project",
+      labels: [],
+      queuePosition: 1,
+      projectId: null,
+      projectName: null,
+    });
+    const queue = storage.listLinearTodoQueue();
+    expect(queue.find((q) => q.issueIdentifier === "VA-projected")).toMatchObject({
+      projectId: "e36f2b82-ed64-421c-91cb-955ef95a28ff",
+      projectName: "Runway",
+    });
+    expect(queue.find((q) => q.issueIdentifier === "VA-bare")).toMatchObject({
+      projectId: null,
+      projectName: null,
+    });
   });
 });
 

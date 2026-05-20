@@ -60,6 +60,7 @@ const SHARED_STYLE = `
     .id { color: #93c5fd; }
     .detail { color: #d4d4d8; }
     .muted { color: #9ca3af; }
+    .project-uuid { color: #9ca3af; font-size: 11px; display: block; }
     code { background: #1f2937; padding: 1px 6px; border-radius: 3px; }
     .status-badge { display: inline-block; margin-left: 8px;
                     padding: 1px 6px; border-radius: 3px; font-size: 11px;
@@ -430,7 +431,7 @@ export function filterStateToQueryString(state: ListFilterState): string {
 function renderTodoQueue(queue: readonly LinearSnapshotRow[]): string {
   const body =
     queue.length === 0
-      ? `<tr><td colspan="3" class="empty">Linear Todo queue is empty.</td></tr>`
+      ? `<tr><td colspan="4" class="empty">Linear Todo queue is empty.</td></tr>`
       : queue.map(renderQueueRow).join("");
   return `<h2>Todo queue (next up)</h2>
   <table>
@@ -439,6 +440,7 @@ function renderTodoQueue(queue: readonly LinearSnapshotRow[]): string {
         <th>Issue</th>
         <th>Title</th>
         <th>Labels</th>
+        <th>Project</th>
       </tr>
     </thead>
     <tbody>${body}</tbody>
@@ -447,10 +449,21 @@ function renderTodoQueue(queue: readonly LinearSnapshotRow[]): string {
 
 function renderQueueRow(s: LinearSnapshotRow): string {
   const labels = s.labels.length === 0 ? "" : s.labels.join(", ");
+  // VA-450: project cell shows the name on top with the UUID muted
+  // underneath in the same column. Unprojected issues degrade to an
+  // em-dash so the row still renders (the drain WILL pick them up).
+  const project =
+    s.projectName == null && s.projectId == null
+      ? `<span class="muted">—</span>`
+      : `<span>${escapeHtml(s.projectName ?? "")}</span>` +
+        (s.projectId == null
+          ? ""
+          : `<span class="project-uuid">${escapeHtml(s.projectId)}</span>`);
   return `<tr>
     <td class="id">${escapeHtml(s.issueIdentifier)}</td>
     <td class="detail">${escapeHtml(s.title)}</td>
     <td class="muted">${escapeHtml(labels)}</td>
+    <td class="detail">${project}</td>
   </tr>`;
 }
 

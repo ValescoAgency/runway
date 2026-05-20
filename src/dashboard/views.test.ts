@@ -166,6 +166,8 @@ describe("renderListView — Linear sync surfaces (VA-390)", () => {
       title: "Snapshot title",
       labels: [],
       queuePosition: null,
+      projectId: null,
+      projectName: null,
       ...over,
     };
   }
@@ -189,6 +191,49 @@ describe("renderListView — Linear sync surfaces (VA-390)", () => {
     expect(html).toContain("VA-77");
     expect(html).toContain("Set up the thing");
     expect(html).toContain("bug, p1");
+  });
+
+  // VA-450
+  it("renders the project name and UUID in the Project column for projected issues", () => {
+    const html = renderListView({
+      rows: [row()],
+      linearEnabled: true,
+      todoQueue: [
+        snapshot({
+          issueIdentifier: "VA-77",
+          title: "Set up the thing",
+          labels: [],
+          queuePosition: 0,
+          projectId: "e36f2b82-ed64-421c-91cb-955ef95a28ff",
+          projectName: "Runway",
+        }),
+      ],
+      snapshotsByIdentifier: new Map(),
+    });
+    expect(html).toContain("<th>Project</th>");
+    expect(html).toContain("Runway");
+    expect(html).toContain("e36f2b82-ed64-421c-91cb-955ef95a28ff");
+  });
+
+  // VA-450
+  it("renders an em-dash in the Project column for unprojected issues", () => {
+    const html = renderListView({
+      rows: [row()],
+      linearEnabled: true,
+      todoQueue: [
+        snapshot({
+          issueIdentifier: "VA-78",
+          title: "no project",
+          labels: [],
+          queuePosition: 0,
+          projectId: null,
+          projectName: null,
+        }),
+      ],
+      snapshotsByIdentifier: new Map(),
+    });
+    expect(html).toContain("<th>Project</th>");
+    expect(html).toContain("—");
   });
 
   it("renders an empty-state row inside the queue section when the queue is empty", () => {

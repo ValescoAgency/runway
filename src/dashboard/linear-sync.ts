@@ -31,12 +31,18 @@ import type { LinearSnapshotRow, Storage } from "./storage.js";
  * Trimmed-down view of a Linear issue, just the fields the dashboard
  * needs. Title + status + labels are surfaced in the UI; identifier
  * is the join key against `issue_processes.issue_identifier`.
+ *
+ * VA-450: `projectId` / `projectName` are nullable — Linear issues can
+ * exist without a project, and we surface those rows with an em-dash
+ * rather than hiding them (the drain still picks them up).
  */
 export interface LinearSnapshot {
   readonly identifier: string;
   readonly title: string;
   readonly status: string;
   readonly labels: readonly string[];
+  readonly projectId: string | null;
+  readonly projectName: string | null;
 }
 
 /**
@@ -94,13 +100,24 @@ export function createLinearAdapter(opts: LinearAdapterOptions): LinearAdapter {
     title: string;
     state?: Promise<{ name: string } | undefined>;
     labels: () => Promise<{ nodes: ReadonlyArray<{ name: string }> }>;
+    // VA-450: Linear SDK exposes `project` as a lazy Promise on Issue.
+    // It resolves to `undefined` for unprojected issues; we normalise
+    // to `null` in the snapshot so downstream code only ever branches
+    // on one shape.
+    project?: Promise<{ id: string; name: string } | undefined>;
   }): Promise<LinearSnapshot> {
-    const [state, labels] = await Promise.all([raw.state, raw.labels()]);
+    const [state, labels, project] = await Promise.all([
+      raw.state,
+      raw.labels(),
+      raw.project,
+    ]);
     return {
       identifier: raw.identifier,
       title: raw.title,
       status: state?.name ?? "",
       labels: labels.nodes.map((l) => l.name),
+      projectId: project?.id ?? null,
+      projectName: project?.name ?? null,
     };
   }
 
@@ -236,6 +253,8 @@ export function startLinearSync(opts: LinearSyncOptions): LinearSyncHandle {
           title: q.title,
           labels: q.labels,
           queuePosition: i,
+          projectId: q.projectId,
+          projectName: q.projectName,
         });
       });
       log(
@@ -265,6 +284,8 @@ export function startLinearSync(opts: LinearSyncOptions): LinearSyncHandle {
             title: r.title,
             labels: r.labels,
             queuePosition: null,
+            projectId: r.projectId,
+            projectName: r.projectName,
           });
         }
         log(
