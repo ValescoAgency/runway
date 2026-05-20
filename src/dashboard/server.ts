@@ -5,7 +5,11 @@ import {
   type LinearSyncHandle,
 } from "./linear-sync.js";
 import { createEventBus, type EventBus } from "./events.js";
-import { projectLogs, projectPayload } from "./projector.js";
+import {
+  extractActiveDrainMarkers,
+  projectLogs,
+  projectPayload,
+} from "./projector.js";
 import {
   createStorage,
   type IssueProcessFilter,
@@ -392,6 +396,15 @@ async function handleOtlpLogs(
   } catch (err) {
     writeError(res, 400, "invalid_json", asMessage(err));
     return;
+  }
+
+  // VA-455: surface in-flight drains the moment the runway process
+  // emits its `drain.started` log marker — well before the first
+  // processIssue span ends. `markDrainActive` is no-op when the
+  // drain has already closed, so reordering across OTLP retries is
+  // safe.
+  for (const m of extractActiveDrainMarkers(payload)) {
+    storage.markDrainActive(m);
   }
 
   for (const r of projectLogs(payload)) {

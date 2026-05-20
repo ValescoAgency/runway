@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { Effect } from "effect";
+import { Duration, Effect, Schedule } from "effect";
 import type { Config } from "./config.js";
 import { detectBaseBranch, pruneStaleAgentBranch } from "./git.js";
 import type { GithubError, GithubGateway } from "./github.js";
@@ -147,6 +147,25 @@ export const drainQueue = (
   Effect.gen(function* () {
     const { config, linear } = deps;
     const max = opts.max ?? Number.POSITIVE_INFINITY;
+
+    // VA-455: announce the drain to the dashboard before any other
+    // work. The log carries the drainQueue span's trace_id/span_id
+    // (we're already inside `Effect.withSpan("drainQueue")`), and the
+    // dashboard's projector matches on the literal body string —
+    // keep it in lock-step with `DRAIN_STARTED_LOG` in projector.ts.
+    yield* Effect.logInfo("drain.started");
+
+    // VA-455: keep the dashboard's "still alive" signal warm during
+    // long impl/review phases. `Effect.fork` ties the heartbeat fiber
+    // to this gen's lifetime, so it's interrupted automatically when
+    // drainQueue completes (success, failure, or interrupt). The 30s
+    // cadence matches `ACTIVE_DRAIN_STALENESS_NANOS / 3` on the
+    // dashboard so a single dropped flush doesn't toggle the card.
+    yield* Effect.fork(
+      Effect.logInfo("drain.heartbeat").pipe(
+        Effect.repeat(Schedule.spaced(Duration.seconds(30))),
+      ),
+    );
 
     // Resolve the base branch once at startup so every issue in the
     // drain sees the same answer (and so a misconfigured repo fails

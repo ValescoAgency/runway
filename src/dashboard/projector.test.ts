@@ -5,7 +5,12 @@ import type {
   OtlpSpan,
   OtlpTracesPayload,
 } from "./otlp.js";
-import { projectLogs, projectPayload } from "./projector.js";
+import {
+  DRAIN_STARTED_LOG,
+  extractActiveDrainMarkers,
+  projectLogs,
+  projectPayload,
+} from "./projector.js";
 
 // VA-386: projector is the pure boundary between OTLP wire format and
 // the typed runway rows the dashboard renders. Hand-built fixtures
@@ -641,5 +646,112 @@ describe("projectLogs — VA-388", () => {
       ],
     });
     expect(rows.map((r) => r.message)).toEqual(["first", "second", "third"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// VA-455 — extractActiveDrainMarkers
+// ---------------------------------------------------------------------------
+
+describe("extractActiveDrainMarkers — VA-455", () => {
+  it("recognises a drain.started body and projects the marker fields", () => {
+    const markers = extractActiveDrainMarkers(
+      logsPayload([
+        logRecord({
+          body: { stringValue: DRAIN_STARTED_LOG },
+          traceId: "trace-abc",
+          spanId: "drain-span-1",
+          timeUnixNano: "1715000000100000000",
+        }),
+      ]),
+    );
+    expect(markers).toEqual([
+      {
+        traceId: "trace-abc",
+        spanId: "drain-span-1",
+        startTimeUnixNano: "1715000000100000000",
+        lastSeenUnixNano: "1715000000100000000",
+      },
+    ]);
+  });
+
+  it("ignores log records whose body isn't drain.started", () => {
+    const markers = extractActiveDrainMarkers(
+      logsPayload([
+        logRecord({ body: { stringValue: "drain.heartbeat" } }),
+        logRecord({ body: { stringValue: "base branch resolved" } }),
+        logRecord({ body: { stringValue: "agent picked up issue" } }),
+      ]),
+    );
+    expect(markers).toHaveLength(0);
+  });
+
+  it("falls back to observedTimeUnixNano when timeUnixNano is absent", () => {
+    const markers = extractActiveDrainMarkers(
+      logsPayload([
+        logRecord({
+          body: { stringValue: DRAIN_STARTED_LOG },
+          timeUnixNano: undefined,
+          observedTimeUnixNano: "1715000000200000000",
+        }),
+      ]),
+    );
+    expect(markers[0]?.startTimeUnixNano).toBe("1715000000200000000");
+    expect(markers[0]?.lastSeenUnixNano).toBe("1715000000200000000");
+  });
+
+  it("drops markers missing trace_id, span_id, or timestamp", () => {
+    const markers = extractActiveDrainMarkers(
+      logsPayload([
+        logRecord({
+          body: { stringValue: DRAIN_STARTED_LOG },
+          traceId: undefined,
+        }),
+        logRecord({
+          body: { stringValue: DRAIN_STARTED_LOG },
+          spanId: undefined,
+        }),
+        logRecord({
+          body: { stringValue: DRAIN_STARTED_LOG },
+          timeUnixNano: undefined,
+          observedTimeUnixNano: undefined,
+        }),
+      ]),
+    );
+    expect(markers).toHaveLength(0);
+  });
+
+  it("collects markers across multiple resource / scope groups", () => {
+    const markers = extractActiveDrainMarkers({
+      resourceLogs: [
+        {
+          scopeLogs: [
+            {
+              logRecords: [
+                logRecord({
+                  body: { stringValue: DRAIN_STARTED_LOG },
+                  traceId: "trace-1",
+                  spanId: "drain-span-1",
+                }),
+              ],
+            },
+          ],
+        },
+        {
+          scopeLogs: [
+            {
+              logRecords: [
+                logRecord({
+                  body: { stringValue: DRAIN_STARTED_LOG },
+                  traceId: "trace-2",
+                  spanId: "drain-span-2",
+                }),
+              ],
+            },
+          ],
+        },
+      ],
+    });
+    expect(markers.map((m) => m.traceId)).toEqual(["trace-1", "trace-2"]);
   });
 });

@@ -18,6 +18,9 @@ function makeDrain(over: Partial<DrainRow> = {}): DrainRow {
     spanId: "1111111111111111",
     startTimeUnixNano: "1715000000000000000",
     endTimeUnixNano: "1715000001000000000",
+    // VA-455: default last_seen to the end time so ended-drain
+    // fixtures behave as if the trace exporter set both fields.
+    lastSeenUnixNano: "1715000001000000000",
     attempts: 3,
     opened: 1,
     hitl: 1,
@@ -605,6 +608,7 @@ describe("createStorage — evaluator aggregates view (VA-399)", () => {
       spanId: traceId.slice(0, 16),
       startTimeUnixNano: startNano,
       endTimeUnixNano: startNano,
+      lastSeenUnixNano: startNano,
       attempts: 1,
       opened: 0,
       hitl: 0,
@@ -1362,5 +1366,187 @@ describe("createStorage — meta_reviews (VA-402)", () => {
     expect(
       storage.findIssueProcessByIdentifier("trace-x", "VA-999"),
     ).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// VA-455 — log-driven active drain (drain.started marker + heartbeat TTL)
+// ---------------------------------------------------------------------------
+
+describe("createStorage — VA-455 markDrainActive + getActiveDrain", () => {
+  // Fresh nanos = "now-ish", expressed in unix-nano TEXT. The
+  // staleness floor is `Date.now() - 90s`, so a timestamp within
+  // the last few seconds always counts as fresh. Each test that
+  // wants a stale value subtracts an explicit offset from this.
+  function freshNanos(): string {
+    return String(BigInt(Date.now()) * 1_000_000n);
+  }
+  function staleNanos(secondsAgo: number): string {
+    const offsetNs = BigInt(secondsAgo) * 1_000_000_000n;
+    return String(BigInt(Date.now()) * 1_000_000n - offsetNs);
+  }
+
+  it("surfaces an active drain immediately after the drain.started marker, with zero issue counts", () => {
+    const t = freshNanos();
+    storage.markDrainActive({
+      traceId: "trace-live",
+      spanId: "drain-span-live",
+      startTimeUnixNano: t,
+      lastSeenUnixNano: t,
+    });
+
+    expect(storage.getActiveDrain()).toEqual({
+      traceId: "trace-live",
+      startedAtUnixNano: t,
+      issueCount: 0,
+      openedCount: 0,
+      hitlCount: 0,
+      erroredCount: 0,
+    });
+  });
+
+  it("rolls up counters from issue_processes that have landed since the marker", () => {
+    const t = freshNanos();
+    storage.markDrainActive({
+      traceId: "trace-mid",
+      spanId: "drain-span-mid",
+      startTimeUnixNano: t,
+      lastSeenUnixNano: t,
+    });
+    storage.saveIssueProcess(
+      makeIssueProcess({
+        traceId: "trace-mid",
+        spanId: "ip-1",
+        outcomeKind: "opened",
+      }),
+    );
+    storage.saveIssueProcess(
+      makeIssueProcess({
+        traceId: "trace-mid",
+        spanId: "ip-2",
+        outcomeKind: "hitl",
+      }),
+    );
+
+    expect(storage.getActiveDrain()).toMatchObject({
+      traceId: "trace-mid",
+      issueCount: 2,
+      openedCount: 1,
+      hitlCount: 1,
+      erroredCount: 0,
+    });
+  });
+
+  it("hides drains whose last_seen has aged out past the staleness floor", () => {
+    storage.markDrainActive({
+      traceId: "trace-zombie",
+      spanId: "drain-span-zombie",
+      startTimeUnixNano: staleNanos(200),
+      // 200s ago, well past the 90s floor.
+      lastSeenUnixNano: staleNanos(200),
+    });
+
+    expect(storage.getActiveDrain()).toBeNull();
+  });
+
+  it("stops surfacing the drain once saveDrain lands the end-of-drain row", () => {
+    const t = freshNanos();
+    storage.markDrainActive({
+      traceId: "trace-finishes",
+      spanId: "drain-span-fin",
+      startTimeUnixNano: t,
+      lastSeenUnixNano: t,
+    });
+    expect(storage.getActiveDrain()?.traceId).toBe("trace-finishes");
+
+    storage.saveDrain(
+      makeDrain({
+        traceId: "trace-finishes",
+        spanId: "drain-span-fin",
+        startTimeUnixNano: t,
+        endTimeUnixNano: t,
+        lastSeenUnixNano: t,
+      }),
+    );
+    expect(storage.getActiveDrain()).toBeNull();
+  });
+
+  it("appendLogRecord bumps last_seen so a quiet phase doesn't age out", () => {
+    // Mark with a last_seen that's a couple of seconds old, then push
+    // an appendLogRecord with a fresh timestamp and assert the row
+    // stays visible. The "stays visible" assertion is the proof
+    // that last_seen advanced — without the bump the row would
+    // disappear once the freshness floor passes the original mark.
+    storage.markDrainActive({
+      traceId: "trace-quiet",
+      spanId: "drain-span-quiet",
+      startTimeUnixNano: staleNanos(60),
+      lastSeenUnixNano: staleNanos(60),
+    });
+    storage.appendLogRecord({
+      traceId: "trace-quiet",
+      spanId: "child-span",
+      timestampUnixNano: freshNanos(),
+      level: "INFO",
+      message: "phase impl complete",
+      attributes: {},
+    });
+
+    expect(storage.getActiveDrain()?.traceId).toBe("trace-quiet");
+  });
+
+  it("appendLogRecord does NOT fabricate a drain for a trace with no marker", () => {
+    storage.appendLogRecord({
+      traceId: "trace-orphan",
+      spanId: "child-span",
+      timestampUnixNano: freshNanos(),
+      level: "INFO",
+      message: "stray library log",
+      attributes: {},
+    });
+
+    expect(storage.getActiveDrain()).toBeNull();
+  });
+
+  it("a late-arriving drain.started marker can't reanimate an already-ended drain", () => {
+    const t = freshNanos();
+    // The drain has already ended via the trace exporter.
+    storage.saveDrain(
+      makeDrain({
+        traceId: "trace-late",
+        spanId: "drain-span-late",
+        startTimeUnixNano: t,
+        endTimeUnixNano: t,
+        lastSeenUnixNano: t,
+      }),
+    );
+    expect(storage.getActiveDrain()).toBeNull();
+
+    // Now the log marker arrives out of order. The ON CONFLICT
+    // clause must reject the reanimation.
+    storage.markDrainActive({
+      traceId: "trace-late",
+      spanId: "drain-span-late",
+      startTimeUnixNano: t,
+      lastSeenUnixNano: t,
+    });
+    expect(storage.getActiveDrain()).toBeNull();
+  });
+
+  it("legacy fallback: still surfaces a drain inferred from issue_processes when no marker exists", () => {
+    // Pre-VA-455 runway emits no drain.started log, so the dashboard
+    // relies on the absence of a `drains` row as the in-flight
+    // signal. Keep that working until everyone's on a new enough
+    // runway.
+    storage.saveIssueProcess(
+      makeIssueProcess({
+        traceId: "trace-legacy",
+        spanId: "ip-legacy",
+        outcomeKind: "opened",
+        startTimeUnixNano: freshNanos(),
+      }),
+    );
+
+    expect(storage.getActiveDrain()?.traceId).toBe("trace-legacy");
   });
 });
