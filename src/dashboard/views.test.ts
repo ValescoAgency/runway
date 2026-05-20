@@ -1223,3 +1223,174 @@ describe("safeExternalHref (VA-407)", () => {
     expect(safeExternalHref({})).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// VA-465 — shepherd sub-strip rendering
+// ---------------------------------------------------------------------------
+
+describe("renderListView — VA-465 shepherd sub-strip", () => {
+  const issueRows = [
+    {
+      traceId: "trace-x",
+      spanId: "span-x",
+      parentSpanId: null,
+      issueIdentifier: "VA-1",
+      issueId: "issue-1",
+      issueTitle: "x",
+      issueLabels: [] as readonly string[],
+      branch: "agent/va-1",
+      outcomeKind: "opened",
+      outcomeDetail: "https://github.com/x/y/pull/1",
+      startTimeUnixNano: "1715000000000000000",
+      endTimeUnixNano: "1715000010000000000",
+      statusCode: null,
+      statusMessage: null,
+      insertedAt: "2026-05-20T15:00:00",
+      prUrl: "https://github.com/x/y/pull/1",
+      hitlReason: null,
+    },
+  ];
+
+  const activeDrain = {
+    traceId: "trace-x",
+    startedAtUnixNano: "1715000000000000000",
+    issueCount: 1,
+    openedCount: 1,
+    hitlCount: 0,
+    erroredCount: 0,
+  };
+
+  it("renders a Shepherding row for each active PR with state-acting class + iteration counter", () => {
+    const html = renderListView({
+      rows: issueRows,
+      linearEnabled: false,
+      todoQueue: [],
+      snapshotsByIdentifier: new Map<string, LinearSnapshotRow>(),
+      activeDrain,
+      activeShepherding: [
+        {
+          traceId: "trace-x",
+          prNumber: 142,
+          subscription: "subscription[0]",
+          iteration: 2,
+          maxIterations: 3,
+          state: "acting" as const,
+          description: "Rebase agent/x onto origin/main",
+          startedUnixNano: "1715000010000000000",
+          lastSeenUnixNano: "1715000020000000000",
+          endedUnixNano: null,
+        },
+      ],
+    });
+    expect(html).toContain('class="shepherd-strip"');
+    expect(html).toContain("shepherd-state-acting");
+    expect(html).toContain("PR #142");
+    expect(html).toContain("iter 2/3");
+    expect(html).toContain("Rebase agent/x onto origin/main");
+  });
+
+  it("renders the 'ready, awaiting human merge' label for state=ready", () => {
+    const html = renderListView({
+      rows: issueRows,
+      linearEnabled: false,
+      todoQueue: [],
+      snapshotsByIdentifier: new Map<string, LinearSnapshotRow>(),
+      activeDrain,
+      activeShepherding: [
+        {
+          traceId: "trace-x",
+          prNumber: 7,
+          subscription: null,
+          iteration: null,
+          maxIterations: null,
+          state: "ready" as const,
+          description: null,
+          startedUnixNano: "1715000010000000000",
+          lastSeenUnixNano: "1715000020000000000",
+          endedUnixNano: null,
+        },
+      ],
+    });
+    expect(html).toContain("shepherd-state-ready");
+    expect(html).toContain("ready, awaiting human merge");
+  });
+
+  it("renders nothing when activeShepherding is empty (no flicker)", () => {
+    const html = renderListView({
+      rows: issueRows,
+      linearEnabled: false,
+      todoQueue: [],
+      snapshotsByIdentifier: new Map<string, LinearSnapshotRow>(),
+      activeDrain,
+      activeShepherding: [],
+    });
+    expect(html).not.toContain(`class="shepherd-strip"`);
+    expect(html).not.toContain(`class="shepherd-row`);
+  });
+
+  it("renders nothing when the drain is idle, even if shepherding rows arrive (the strip is gated on activeDrain)", () => {
+    const html = renderListView({
+      rows: issueRows,
+      linearEnabled: false,
+      todoQueue: [],
+      snapshotsByIdentifier: new Map<string, LinearSnapshotRow>(),
+      activeDrain: null,
+      activeShepherding: [
+        {
+          traceId: "trace-x",
+          prNumber: 1,
+          subscription: null,
+          iteration: null,
+          maxIterations: null,
+          state: "acting" as const,
+          description: null,
+          startedUnixNano: "1715000010000000000",
+          lastSeenUnixNano: "1715000020000000000",
+          endedUnixNano: null,
+        },
+      ],
+    });
+    expect(html).not.toContain(`class="shepherd-strip"`);
+  });
+
+  it("renders one sub-strip row per active PR (multiple PRs)", () => {
+    const html = renderListView({
+      rows: issueRows,
+      linearEnabled: false,
+      todoQueue: [],
+      snapshotsByIdentifier: new Map<string, LinearSnapshotRow>(),
+      activeDrain,
+      activeShepherding: [
+        {
+          traceId: "trace-x",
+          prNumber: 142,
+          subscription: null,
+          iteration: 1,
+          maxIterations: 3,
+          state: "acting" as const,
+          description: null,
+          startedUnixNano: "1715000010000000000",
+          lastSeenUnixNano: "1715000020000000000",
+          endedUnixNano: null,
+        },
+        {
+          traceId: "trace-x",
+          prNumber: 200,
+          subscription: null,
+          iteration: null,
+          maxIterations: null,
+          state: "hitl" as const,
+          description: null,
+          startedUnixNano: "1715000020000000000",
+          lastSeenUnixNano: "1715000030000000000",
+          endedUnixNano: null,
+        },
+      ],
+    });
+    expect(html).toContain("PR #142");
+    expect(html).toContain("PR #200");
+    expect(html).toContain("shepherd-state-acting");
+    expect(html).toContain("shepherd-state-hitl");
+    expect(html).toContain("HITL — needs human attention");
+  });
+});

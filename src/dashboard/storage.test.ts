@@ -1625,3 +1625,224 @@ describe("createStorage — VA-455 markDrainActive + getActiveDrain", () => {
     expect(storage.getActiveDrain()?.traceId).toBe("trace-legacy");
   });
 });
+
+// ---------------------------------------------------------------------------
+// VA-465 — shepherding_prs lifecycle
+// ---------------------------------------------------------------------------
+
+describe("createStorage — VA-465 shepherding lifecycle", () => {
+  function nanos(secondsSinceEpoch: number): string {
+    return String(BigInt(secondsSinceEpoch) * 1_000_000_000n);
+  }
+
+  it("markShepherdIterationStart inserts a row with state=acting + iteration/subscription/description set", () => {
+    storage.markShepherdIterationStart({
+      traceId: "trace-shepherd-1",
+      prNumber: 42,
+      subscription: "subscription[0]",
+      iteration: 1,
+      maxIterations: 3,
+      description: "Rebase agent/x onto origin/main",
+      timestampUnixNano: nanos(1715000010),
+    });
+    const rows = storage.getActiveShepherding("trace-shepherd-1");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      traceId: "trace-shepherd-1",
+      prNumber: 42,
+      subscription: "subscription[0]",
+      iteration: 1,
+      maxIterations: 3,
+      state: "acting",
+      description: "Rebase agent/x onto origin/main",
+      endedUnixNano: null,
+    });
+  });
+
+  it("markShepherdIterationStart on the same (trace, pr) bumps iteration + description + last_seen", () => {
+    storage.markShepherdIterationStart({
+      traceId: "trace-bump",
+      prNumber: 7,
+      subscription: "subscription[0]",
+      iteration: 1,
+      maxIterations: 3,
+      description: "first action",
+      timestampUnixNano: nanos(1715000010),
+    });
+    storage.markShepherdIterationStart({
+      traceId: "trace-bump",
+      prNumber: 7,
+      subscription: "subscription[1]",
+      iteration: 2,
+      maxIterations: 3,
+      description: "second action",
+      timestampUnixNano: nanos(1715000020),
+    });
+    const rows = storage.getActiveShepherding("trace-bump");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      iteration: 2,
+      subscription: "subscription[1]",
+      description: "second action",
+      lastSeenUnixNano: nanos(1715000020),
+    });
+  });
+
+  it("markShepherdIterationStart with an OLDER timestamp doesn't clobber newer state (out-of-order safety)", () => {
+    storage.markShepherdIterationStart({
+      traceId: "trace-reorder",
+      prNumber: 3,
+      subscription: "subscription[0]",
+      iteration: 2,
+      maxIterations: 3,
+      description: "newer",
+      timestampUnixNano: nanos(1715000020),
+    });
+    storage.markShepherdIterationStart({
+      traceId: "trace-reorder",
+      prNumber: 3,
+      subscription: "subscription[0]",
+      iteration: 1,
+      maxIterations: 3,
+      description: "older marker arrives late",
+      timestampUnixNano: nanos(1715000010),
+    });
+    const rows = storage.getActiveShepherding("trace-reorder");
+    expect(rows).toHaveLength(1);
+    // Newer state wins.
+    expect(rows[0]?.iteration).toBe(2);
+    expect(rows[0]?.description).toBe("newer");
+  });
+
+  it("markShepherdIterationEnd updates description + last_seen on an existing row without terminating it", () => {
+    storage.markShepherdIterationStart({
+      traceId: "trace-end",
+      prNumber: 5,
+      subscription: "subscription[0]",
+      iteration: 1,
+      maxIterations: 3,
+      description: "running",
+      timestampUnixNano: nanos(1715000010),
+    });
+    storage.markShepherdIterationEnd({
+      traceId: "trace-end",
+      prNumber: 5,
+      outcome: "fixed",
+      detail: "Rebase complete",
+      timestampUnixNano: nanos(1715000015),
+    });
+    const rows = storage.getActiveShepherding("trace-end");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      state: "acting", // Iteration-end alone doesn't terminate.
+      description: "Rebase complete",
+      lastSeenUnixNano: nanos(1715000015),
+      endedUnixNano: null,
+    });
+  });
+
+  it("markShepherdEnded terminates the row; getActiveShepherding excludes it afterward", () => {
+    storage.markShepherdIterationStart({
+      traceId: "trace-terminal",
+      prNumber: 1,
+      subscription: "subscription[0]",
+      iteration: 1,
+      maxIterations: 3,
+      description: "running",
+      timestampUnixNano: nanos(1715000010),
+    });
+    storage.markShepherdEnded({
+      traceId: "trace-terminal",
+      prNumber: 1,
+      outcome: "merged",
+      timestampUnixNano: nanos(1715000050),
+    });
+    expect(storage.getActiveShepherding("trace-terminal")).toEqual([]);
+  });
+
+  it("getActiveShepherding returns rows sorted by started_unix_nano ascending", () => {
+    storage.markShepherdIterationStart({
+      traceId: "trace-multi",
+      prNumber: 200,
+      subscription: "subscription[0]",
+      iteration: 1,
+      maxIterations: 3,
+      description: "PR 200",
+      timestampUnixNano: nanos(1715000050),
+    });
+    storage.markShepherdIterationStart({
+      traceId: "trace-multi",
+      prNumber: 100,
+      subscription: "subscription[0]",
+      iteration: 1,
+      maxIterations: 3,
+      description: "PR 100",
+      timestampUnixNano: nanos(1715000010),
+    });
+    const rows = storage.getActiveShepherding("trace-multi");
+    expect(rows.map((r) => r.prNumber)).toEqual([100, 200]);
+  });
+
+  it("markShepherdEnded with outcome=hitl is reflected in state before exclusion", () => {
+    // Same as the merged case but the terminal state value differs;
+    // the row is still excluded from getActiveShepherding.
+    storage.markShepherdEnded({
+      traceId: "trace-hitl-only",
+      prNumber: 88,
+      outcome: "hitl",
+      timestampUnixNano: nanos(1715000050),
+    });
+    expect(storage.getActiveShepherding("trace-hitl-only")).toEqual([]);
+  });
+
+  it("legacy boots without shepherding_prs in the file create it via SCHEMA on next createStorage call", async () => {
+    // The CREATE TABLE IF NOT EXISTS in SCHEMA handles this — no
+    // separate ALTER needed (it is a new table, not a column add).
+    // This test seeds a legacy DB without the table and then opens
+    // it via createStorage, asserting markShepherdIterationStart
+    // succeeds on first use.
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { DatabaseSync } = await import("node:sqlite");
+
+    const dir = mkdtempSync(join(tmpdir(), "runway-va465-"));
+    const path = join(dir, "legacy.sqlite");
+    try {
+      // Seed a minimal pre-VA-465 DB: just a stub of drains so
+      // createStorage's other migrations don't fail.
+      const seed = new DatabaseSync(path);
+      seed
+        .prepare(
+          `CREATE TABLE drains (
+             trace_id TEXT NOT NULL,
+             span_id TEXT NOT NULL,
+             start_time_unix_nano TEXT NOT NULL,
+             end_time_unix_nano TEXT,
+             last_seen_unix_nano TEXT,
+             attempts INTEGER, opened INTEGER, hitl INTEGER, errored INTEGER,
+             status_code INTEGER, status_message TEXT,
+             inserted_at TEXT NOT NULL DEFAULT (datetime('now')),
+             PRIMARY KEY (trace_id, span_id)
+           )`,
+        )
+        .run();
+      seed.close();
+      const legacy = createStorage(path);
+      legacy.markShepherdIterationStart({
+        traceId: "legacy-trace",
+        prNumber: 1,
+        subscription: "subscription[0]",
+        iteration: 1,
+        maxIterations: 3,
+        description: "first run on legacy DB",
+        timestampUnixNano: nanos(1715000010),
+      });
+      const rows = legacy.getActiveShepherding("legacy-trace");
+      expect(rows).toHaveLength(1);
+      legacy.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

@@ -944,10 +944,17 @@ export const runShepherdPass = (
     let lastAction = "(none)";
     let pollIndex = 0;
 
-    yield* Effect.logInfo(
-      `${issue.identifier}: shepherd.start pr=${prUrl} branch=${branch} ` +
-        `maxFixAttempts=${maxFixAttempts} maxWallSeconds=${maxWallSeconds} ` +
-        `maxQuietPolls=${maxQuietPolls} pollSeconds=${pollSeconds}`,
+    // VA-465: emit the start marker with structured attributes the
+    // dashboard's `extractShepherdMarkers` reads. The body is the
+    // routing key; attributes carry context.
+    yield* Effect.logInfo("shepherd.start").pipe(
+      Effect.annotateLogs({
+        pr: String(prNumber),
+        branch,
+        issue: issue.identifier,
+        maxFixAttempts: String(maxFixAttempts),
+        maxWallSeconds: String(maxWallSeconds),
+      }),
     );
 
     while (true) {
@@ -961,8 +968,12 @@ export const runShepherdPass = (
       if (elapsedMs >= maxWallSeconds * 1000) {
         const reason =
           `Shepherd wall-clock budget exhausted (${maxWallSeconds}s) — last action: ${lastAction}`;
-        yield* Effect.logInfo(
-          `${issue.identifier}: shepherd.hitl.wall-clock poll=${pollIndex} ${reason}`,
+        yield* Effect.logInfo("shepherd.ended").pipe(
+          Effect.annotateLogs({
+            pr: String(prNumber),
+            outcome: "hitl",
+            reason,
+          }),
         );
         return { kind: "hitl", reason } as const;
       }
@@ -981,8 +992,14 @@ export const runShepherdPass = (
 
       const merged = yield* isMerged(ctx);
       if (merged) {
-        yield* Effect.logInfo(
-          `${issue.identifier}: shepherd.merged pr=${prUrl} poll=${pollIndex}`,
+        // VA-465: merged is the success terminal. Use the canonical
+        // `shepherd.ended` body so the projector dispatches via
+        // `markShepherdEnded` (outcome=merged).
+        yield* Effect.logInfo("shepherd.ended").pipe(
+          Effect.annotateLogs({
+            pr: String(prNumber),
+            outcome: "merged",
+          }),
         );
         return { kind: "merged" } as const;
       }
@@ -995,8 +1012,13 @@ export const runShepherdPass = (
         const sub = subscriptions[i]!;
         const signal = yield* sub(ctx);
         if (signal.kind === "hitl") {
-          yield* Effect.logInfo(
-            `${issue.identifier}: shepherd.hitl poll=${pollIndex} sub=${i} reason=${signal.reason}`,
+          yield* Effect.logInfo("shepherd.ended").pipe(
+            Effect.annotateLogs({
+              pr: String(prNumber),
+              outcome: "hitl",
+              reason: signal.reason,
+              subscription: `subscription[${i}]`,
+            }),
           );
           return { kind: "hitl", reason: signal.reason } as const;
         }
@@ -1010,25 +1032,55 @@ export const runShepherdPass = (
           if (fixCount >= maxFixAttempts) {
             const reason =
               `Shepherd iteration budget exhausted (${maxFixAttempts}) — last action: ${lastAction}`;
-            yield* Effect.logInfo(
-              `${issue.identifier}: shepherd.hitl.budget poll=${pollIndex} ${reason}`,
+            yield* Effect.logInfo("shepherd.ended").pipe(
+              Effect.annotateLogs({
+                pr: String(prNumber),
+                outcome: "hitl",
+                reason,
+              }),
             );
             return { kind: "hitl", reason } as const;
           }
           fixCount++;
           lastAction = `${subscriptionName} on "${signal.description}"`;
-          yield* Effect.logInfo(
-            `${issue.identifier}: shepherd.fix.start poll=${pollIndex} attempt=${fixCount}/${maxFixAttempts} description=${signal.description}`,
+          // VA-465: iteration.start marker — drives the sub-card's
+          // "acting" state on the dashboard.
+          yield* Effect.logInfo("shepherd.iteration.start").pipe(
+            Effect.annotateLogs({
+              pr: String(prNumber),
+              subscription: subscriptionName,
+              iteration: String(fixCount),
+              maxIterations: String(maxFixAttempts),
+              description: signal.description,
+            }),
           );
           const out = yield* signal.action;
           if (out.kind === "hitl") {
-            yield* Effect.logInfo(
-              `${issue.identifier}: shepherd.fix.hitl poll=${pollIndex} reason=${out.reason}`,
+            // Iteration-end (hitl) AND ended (hitl) both fire — the
+            // first refreshes the row's last_seen + description;
+            // the second terminates it.
+            yield* Effect.logInfo("shepherd.iteration.end").pipe(
+              Effect.annotateLogs({
+                pr: String(prNumber),
+                outcome: "hitl",
+                detail: out.reason,
+              }),
+            );
+            yield* Effect.logInfo("shepherd.ended").pipe(
+              Effect.annotateLogs({
+                pr: String(prNumber),
+                outcome: "hitl",
+                reason: out.reason,
+              }),
             );
             return { kind: "hitl", reason: out.reason } as const;
           }
-          yield* Effect.logInfo(
-            `${issue.identifier}: shepherd.fix.done poll=${pollIndex} detail=${out.detail}`,
+          yield* Effect.logInfo("shepherd.iteration.end").pipe(
+            Effect.annotateLogs({
+              pr: String(prNumber),
+              outcome: "fixed",
+              detail: out.detail,
+            }),
           );
           firedFix = true;
           break;
@@ -1045,8 +1097,12 @@ export const runShepherdPass = (
           const reason =
             `shepherd quiet for ${maxQuietPolls} consecutive poll${maxQuietPolls === 1 ? "" : "s"} ` +
             `with no merge and no actionable signals — PR ready for human merge`;
-          yield* Effect.logInfo(
-            `${issue.identifier}: shepherd.ready ${reason}`,
+          yield* Effect.logInfo("shepherd.ended").pipe(
+            Effect.annotateLogs({
+              pr: String(prNumber),
+              outcome: "ready",
+              reason,
+            }),
           );
           return { kind: "ready", reason } as const;
         }
