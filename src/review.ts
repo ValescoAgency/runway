@@ -138,7 +138,14 @@ export const runReviewPass = (
         sandbox: docker({ env: dockerEnv(config) }),
         cwd,
         prompt: reviewPrompt,
-        branchStrategy: { type: "head" },
+        // VA-456: review must check out the impl agent's branch
+        // explicitly. The previous `{ type: "head" }` inherited
+        // whatever branch the operator happened to be on in the
+        // main checkout — when that wasn't `branch`, the reviewer
+        // saw a working tree that didn't reconcile with the diff in
+        // its prompt and stalled silently until sandcastle's idle
+        // timeout fired (10 min of dead air, then INFRA_ERROR).
+        branchStrategy: { type: "branch", branch },
         maxIterations: 1,
         name: `review-${issue.identifier}`,
       });
