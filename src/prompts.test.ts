@@ -6,6 +6,8 @@ import {
   renderReviewPrompt,
   renderShepherdCiFixPrompt,
   renderShepherdRebasePrompt,
+  renderShepherdReviewFixPrompt,
+  renderShepherdReviewRespondPrompt,
 } from "./prompts.js";
 import type { Policy } from "./policy.js";
 import type { RunwayComment, RunwayIssue } from "./linear.js";
@@ -509,5 +511,84 @@ describe("renderShepherdCiFixPrompt (VA-462)", () => {
     });
     expect(out).toContain("IMPL: DONE");
     expect(out).toContain("IMPL: BLOCKED");
+  });
+});
+
+describe("renderShepherdReviewFixPrompt (VA-463)", () => {
+  const issue: RunwayIssue = {
+    id: "issue-uuid",
+    identifier: "VA-463",
+    title: "Reviewer responder",
+    description: "Wire subscription C.",
+    labels: [],
+  };
+
+  it("substitutes the fix-request line into the prompt body", async () => {
+    const out = await renderShepherdReviewFixPrompt({
+      issue,
+      branch: "agent/va-463",
+      fixRequest: "add a URL scheme guard before rendering the href",
+    });
+    expect(out).toContain("VA-463 — Reviewer responder");
+    expect(out).toContain("add a URL scheme guard before rendering the href");
+    expect(out).toContain("agent/va-463");
+  });
+
+  it("instructs a normal push, NOT --force or --force-with-lease", async () => {
+    const out = await renderShepherdReviewFixPrompt({
+      issue,
+      branch: "agent/va-463",
+      fixRequest: "fix the regex",
+    });
+    expect(out).toMatch(/git push origin agent\/va-463/);
+    expect(out).toMatch(/NOT\s+`?--force`?\s+or\s+`?--force-with-lease`?/);
+  });
+
+  it("emits IMPL: DONE / IMPL: BLOCKED markers for the parser", async () => {
+    const out = await renderShepherdReviewFixPrompt({
+      issue,
+      branch: "agent/va-463",
+      fixRequest: "x",
+    });
+    expect(out).toContain("IMPL: DONE");
+    expect(out).toContain("IMPL: BLOCKED");
+  });
+});
+
+describe("renderShepherdReviewRespondPrompt (VA-463)", () => {
+  const issue: RunwayIssue = {
+    id: "issue-uuid",
+    identifier: "VA-463",
+    title: "Reviewer responder",
+    description: "Wire subscription C.",
+    labels: [],
+  };
+
+  it("passes the comment author, source, and body verbatim", async () => {
+    const out = await renderShepherdReviewRespondPrompt({
+      issue,
+      branch: "agent/va-463",
+      commentAuthor: "human-jane",
+      commentSource: "review",
+      commentBody:
+        "Could you also rename `foo` to `bar` everywhere? The current name is confusing.",
+    });
+    expect(out).toContain("human-jane");
+    expect(out).toContain("review");
+    expect(out).toContain("rename `foo` to `bar`");
+  });
+
+  it("includes the non-actionable branch of the decision tree", async () => {
+    const out = await renderShepherdReviewRespondPrompt({
+      issue,
+      branch: "agent/va-463",
+      commentAuthor: "human",
+      commentSource: "issue",
+      commentBody: "LGTM",
+    });
+    // The agent must explicitly recognise non-actionable comments
+    // and IMPL: DONE without committing — pin the language.
+    expect(out).toMatch(/non-actionable/i);
+    expect(out).toMatch(/do not fabricate|IMPL: DONE with no commit/i);
   });
 });

@@ -187,6 +187,16 @@ export interface RunwayConfig {
    * `RUNWAY_SHEPHERD_POLL_INTERVAL_SECONDS`.
    */
   readonly shepherdPollIntervalSeconds: number;
+  /**
+   * VA-463: GitHub login of the adversarial PR-reviewer bot that
+   * posts `REVIEW: APPROVED / CHANGES-REQUESTED / NEEDS-DISCUSSION`
+   * verdicts. The shepherd's reviewer watcher parses comments from
+   * THIS login as `REVIEW:` markers; comments from any other author
+   * are treated as verbatim human feedback. Unset (default) means no
+   * comment is treated as bot-authored — all comments route to the
+   * human-feedback path. Source: `RUNWAY_PR_REVIEWER_BOT_LOGIN`.
+   */
+  readonly prReviewerBotLogin?: string;
 }
 
 // Back-compat alias — existing consumers (orchestrator, gateways)
@@ -283,6 +293,9 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
       validation: (n): n is number => n > 0,
     }),
   ),
+  prReviewerBotLogin: EConfig.option(
+    EConfig.string("RUNWAY_PR_REVIEWER_BOT_LOGIN"),
+  ),
 }).pipe(
   Effect.map(
     (raw): RunwayConfig => ({
@@ -312,6 +325,7 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
       metaWeeklyModel: Option.getOrUndefined(raw.metaWeeklyModel),
       shepherdEnabled: raw.shepherdEnabled,
       shepherdPollIntervalSeconds: raw.shepherdPollIntervalSeconds,
+      prReviewerBotLogin: Option.getOrUndefined(raw.prReviewerBotLogin),
     }),
   ),
 );

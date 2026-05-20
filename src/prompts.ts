@@ -107,6 +107,36 @@ export async function renderShepherdCiFixPrompt(args: {
   return renderPrompt(template, shepherdCiFixVars(args));
 }
 
+/**
+ * VA-463: render the prompt for a `REVIEW: CHANGES-REQUESTED — <fix>`
+ * verdict from the adversarial PR-reviewer agent. The fix line is
+ * inserted verbatim; the agent applies the change and pushes.
+ */
+export async function renderShepherdReviewFixPrompt(args: {
+  issue: RunwayIssue;
+  branch: string;
+  fixRequest: string;
+}): Promise<string> {
+  const template = await loadShepherdReviewFixPrompt();
+  return renderPrompt(template, shepherdReviewFixVars(args));
+}
+
+/**
+ * VA-463: render the prompt for a verbatim human comment on the PR.
+ * The agent decides whether the comment is actionable; non-actionable
+ * comments resolve to IMPL: DONE with no commit.
+ */
+export async function renderShepherdReviewRespondPrompt(args: {
+  issue: RunwayIssue;
+  branch: string;
+  commentAuthor: string;
+  commentSource: string;
+  commentBody: string;
+}): Promise<string> {
+  const template = await loadShepherdReviewRespondPrompt();
+  return renderPrompt(template, shepherdReviewRespondVars(args));
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -125,6 +155,14 @@ async function loadShepherdRebasePrompt(): Promise<string> {
 
 async function loadShepherdCiFixPrompt(): Promise<string> {
   return readFile(join(PROMPT_DIR, "shepherd-ci-fix.md"), "utf8");
+}
+
+async function loadShepherdReviewFixPrompt(): Promise<string> {
+  return readFile(join(PROMPT_DIR, "shepherd-review-fix.md"), "utf8");
+}
+
+async function loadShepherdReviewRespondPrompt(): Promise<string> {
+  return readFile(join(PROMPT_DIR, "shepherd-review-respond.md"), "utf8");
 }
 
 /**
@@ -196,6 +234,38 @@ function shepherdCiFixVars(args: {
     BRANCH: args.branch,
     CHECK_NAME: args.checkName,
     LOG_TAIL: args.logTail.trim() || "(log unavailable)",
+  };
+}
+
+function shepherdReviewFixVars(args: {
+  issue: RunwayIssue;
+  branch: string;
+  fixRequest: string;
+}): Record<string, string> {
+  return {
+    ISSUE_IDENTIFIER: args.issue.identifier,
+    ISSUE_TITLE: args.issue.title,
+    ISSUE_DESCRIPTION: args.issue.description || "(no description)",
+    BRANCH: args.branch,
+    FIX_REQUEST: args.fixRequest.trim() || "(empty fix request)",
+  };
+}
+
+function shepherdReviewRespondVars(args: {
+  issue: RunwayIssue;
+  branch: string;
+  commentAuthor: string;
+  commentSource: string;
+  commentBody: string;
+}): Record<string, string> {
+  return {
+    ISSUE_IDENTIFIER: args.issue.identifier,
+    ISSUE_TITLE: args.issue.title,
+    ISSUE_DESCRIPTION: args.issue.description || "(no description)",
+    BRANCH: args.branch,
+    COMMENT_AUTHOR: args.commentAuthor || "(unknown author)",
+    COMMENT_SOURCE: args.commentSource,
+    COMMENT_BODY: args.commentBody.trim() || "(empty body)",
   };
 }
 
