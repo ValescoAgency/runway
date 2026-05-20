@@ -13,7 +13,13 @@ import {
   formatPriorFeedback,
 } from "./prompts.js";
 import { runReviewPass } from "./review.js";
-import { runShepherdPass } from "./shepherd.js";
+import {
+  ciStub,
+  makeIsMerged,
+  makeMergeabilityWatcher,
+  reviewerStub,
+  runShepherdPass,
+} from "./shepherd.js";
 import {
   finalize,
   formatRebaseConflictReason,
@@ -502,6 +508,18 @@ const processIssue = (
               cwd: deps.cwd,
               baseBranch: deps.baseBranch,
               github: deps.github,
+              // VA-461: real mergeability watcher + merge check; the
+              // other two subscriptions stay as no-op stubs until
+              // VA-462 (CI) and VA-463 (reviewer feedback) land.
+              isMerged: makeIsMerged(deps.github),
+              subscriptions: [
+                makeMergeabilityWatcher({
+                  github: deps.github,
+                  config: deps.config,
+                }),
+                ciStub,
+                reviewerStub,
+              ],
             },
             branch,
             finalized.detail,

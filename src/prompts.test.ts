@@ -4,6 +4,7 @@ import {
   formatPriorFeedback,
   renderImplementPrompt,
   renderReviewPrompt,
+  renderShepherdRebasePrompt,
 } from "./prompts.js";
 import type { Policy } from "./policy.js";
 import type { RunwayComment, RunwayIssue } from "./linear.js";
@@ -374,5 +375,74 @@ describe("formatPriorFeedback (VA-383)", () => {
     expect(out).toContain("REVIEW: REJECTED");
     expect(out).toContain("tests do not cover");
     expect(out).toContain("prefer composition over inheritance");
+  });
+});
+
+describe("renderShepherdRebasePrompt (VA-461)", () => {
+  const baseIssue: RunwayIssue = {
+    id: "issue-uuid",
+    identifier: "VA-461",
+    title: "Mergeability watcher",
+    description: "Wire the mergeability subscription onto the shepherd loop.",
+    labels: [],
+  };
+
+  it("substitutes branch / base / mergeable_state into the rebase instructions", async () => {
+    const out = await renderShepherdRebasePrompt({
+      issue: baseIssue,
+      branch: "agent/va-461",
+      baseBranch: "master",
+      mergeableState: "dirty",
+      conflictFiles: ["src/foo.ts", "src/bar.ts"],
+    });
+    expect(out).toContain("VA-461 — Mergeability watcher");
+    expect(out).toContain("agent/va-461");
+    expect(out).toContain("origin/master");
+    expect(out).toContain("`dirty`");
+    expect(out).toContain("src/foo.ts");
+    expect(out).toContain("src/bar.ts");
+  });
+
+  it("AC: instructs `--force-with-lease`, NOT bare `--force`", async () => {
+    const out = await renderShepherdRebasePrompt({
+      issue: baseIssue,
+      branch: "agent/va-461",
+      baseBranch: "main",
+      mergeableState: "dirty",
+      conflictFiles: ["src/foo.ts"],
+    });
+    expect(out).toMatch(/--force-with-lease/);
+    // Bare `--force` (followed by whitespace, end-of-line, or end of
+    // word — not the `--force-with-lease` suffix) is a regression.
+    expect(out).not.toMatch(/--force(?!\b|-)/);
+    // Belt-and-braces: the explicit "Do NOT use plain --force" warning
+    // is present in the template, so the agent reading it sees the
+    // mandate.
+    expect(out).toMatch(/Do NOT use plain `git push --force`/);
+  });
+
+  it("renders the no-conflicts hint when the pre-detect list is empty (mergeable_state=behind)", async () => {
+    const out = await renderShepherdRebasePrompt({
+      issue: baseIssue,
+      branch: "agent/va-461",
+      baseBranch: "main",
+      mergeableState: "behind",
+      conflictFiles: [],
+    });
+    expect(out).toContain("No conflicts pre-detected");
+    expect(out).toContain("clean fast-forward");
+  });
+
+  it("instructs the agent to emit IMPL: DONE / IMPL: BLOCKED for the parser", async () => {
+    const out = await renderShepherdRebasePrompt({
+      issue: baseIssue,
+      branch: "agent/va-461",
+      baseBranch: "main",
+      mergeableState: "dirty",
+      conflictFiles: ["src/foo.ts"],
+    });
+    expect(out).toContain("IMPL: DONE");
+    expect(out).toContain("IMPL: BLOCKED");
+    expect(out).toContain("Mergeability: conflict in");
   });
 });

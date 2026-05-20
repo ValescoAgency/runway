@@ -34,11 +34,22 @@ export class GithubTimeout extends Data.TaggedError("GithubTimeout")<{
   readonly message: string;
 }> {}
 
+// VA-461: read failures (gh pr view / git merge-tree). Kept distinct
+// from PushFailed / PrCreateFailed because the recovery is different
+// — a read failure on the shepherd's poll is recoverable (try again
+// next tick); a push or pr-create failure interrupts the workflow.
+export class GithubReadFailed extends Data.TaggedError("GithubReadFailed")<{
+  readonly call: string;
+  readonly stderr: string;
+  readonly message: string;
+}> {}
+
 export type GithubError =
   | GhCliMissing
   | PushFailed
   | PrCreateFailed
-  | GithubTimeout;
+  | GithubTimeout
+  | GithubReadFailed;
 
 // VA-357: same jittered exponential shape as the Linear policy.
 export const githubRetrySchedule = Schedule.exponential("1 second").pipe(
@@ -103,6 +114,30 @@ function execaStderr(err: unknown): string {
   return "";
 }
 
+/**
+ * VA-461: GitHub's `mergeable_state` enum, narrowed to the strings
+ * runway actually reasons about. `dirty` and `behind` are the two
+ * the shepherd acts on; the rest are surfaced verbatim so dashboards
+ * can render them but the loop treats them as quiet.
+ */
+export type MergeableState =
+  | "clean"
+  | "dirty"
+  | "behind"
+  | "blocked"
+  | "unstable"
+  | "draft"
+  | "unknown";
+
+export interface PullRequestState {
+  readonly number: number;
+  readonly mergeableState: MergeableState;
+  readonly merged: boolean;
+  readonly headSha: string;
+  readonly headRefName: string;
+  readonly baseRefName: string;
+}
+
 export interface GithubGateway {
   /** Push a branch to origin. */
   pushBranch(repoPath: string, branch: string): Effect.Effect<void, GithubError>;
@@ -114,6 +149,27 @@ export interface GithubGateway {
     issue: RunwayIssue;
     body: string;
   }): Effect.Effect<string, GithubError>;
+  /**
+   * VA-461: fetch the current state of an open PR (mergeability +
+   * merged flag + head SHA + ref names). Used by the shepherd's
+   * mergeability watcher and merge-check.
+   */
+  getPullRequest(args: {
+    repoPath: string;
+    prNumber: number;
+  }): Effect.Effect<PullRequestState, GithubError>;
+  /**
+   * VA-461: list the files that would conflict if `branch` were
+   * rebased onto `origin/<baseBranch>`. Performed locally via
+   * `git merge-tree --name-only` (GitHub's API doesn't expose this).
+   * Returns an empty list when the rebase would be clean (e.g.,
+   * `mergeable_state=behind` — a fast-forward, no conflicts).
+   */
+  getConflictFiles(args: {
+    repoPath: string;
+    baseBranch: string;
+    branch: string;
+  }): Effect.Effect<readonly string[], GithubError>;
 }
 
 /**
@@ -209,5 +265,145 @@ export function createGithubGateway(): GithubGateway {
         },
       );
     },
+
+    getPullRequest({ repoPath, prNumber }) {
+      return applyGithubPolicy(
+        Effect.tryPromise({
+          try: async () => {
+            const { stdout } = await execa(
+              "gh",
+              [
+                "pr",
+                "view",
+                String(prNumber),
+                "--json",
+                "number,mergeable,mergeStateStatus,merged,headRefOid,headRefName,baseRefName",
+              ],
+              { cwd: repoPath },
+            );
+            const parsed = JSON.parse(stdout) as {
+              number: number;
+              mergeable: string;
+              mergeStateStatus: string;
+              merged: boolean;
+              headRefOid: string;
+              headRefName: string;
+              baseRefName: string;
+            };
+            // `mergeStateStatus` is the v4 enum runway maps to its
+            // own `MergeableState`. gh returns it ALL_CAPS; runway
+            // canonicalises to lowercase. Anything we don't
+            // recognise becomes `unknown` rather than throwing — the
+            // shepherd loop treats unknown as quiet, which is the
+            // safe fallback.
+            const mergeableState = canonicaliseMergeableState(
+              parsed.mergeStateStatus,
+            );
+            return {
+              number: parsed.number,
+              mergeableState,
+              merged: parsed.merged,
+              headSha: parsed.headRefOid,
+              headRefName: parsed.headRefName,
+              baseRefName: parsed.baseRefName,
+            };
+          },
+          catch: (err) => {
+            if (isCommandMissing(err)) {
+              return new GhCliMissing({
+                message: `gh CLI not found on PATH (${err instanceof Error ? err.message : String(err)})`,
+              });
+            }
+            return new GithubReadFailed({
+              call: `getPullRequest(${prNumber})`,
+              stderr: execaStderr(err),
+              message:
+                err instanceof Error
+                  ? err.message
+                  : `gh pr view failed: ${String(err)}`,
+            });
+          },
+        }),
+        {
+          call: `getPullRequest(${prNumber})`,
+          timeoutMs: 15_000,
+          retryOn: (err) => err._tag === "GithubTimeout",
+        },
+      );
+    },
+
+    getConflictFiles({ repoPath, baseBranch, branch }) {
+      return applyGithubPolicy(
+        Effect.tryPromise({
+          try: async () => {
+            // Step 1: refresh origin/<base> so the merge-tree below
+            // reasons about the latest remote state, not whatever
+            // the cwd happened to have fetched last.
+            await execa("git", ["fetch", "origin", baseBranch], {
+              cwd: repoPath,
+            });
+            // Step 2: simulate the merge. `git merge-tree --name-only`
+            // (git >= 2.38) prints only the conflicted paths, one per
+            // line, on stdout. Exit code is non-zero when there ARE
+            // conflicts, so we read stdout regardless of status.
+            const result = await execa(
+              "git",
+              [
+                "merge-tree",
+                "--name-only",
+                "--no-messages",
+                `origin/${baseBranch}`,
+                branch,
+              ],
+              { cwd: repoPath, reject: false },
+            );
+            const files = result.stdout
+              .split("\n")
+              .map((s) => s.trim())
+              .filter(Boolean);
+            return files;
+          },
+          catch: (err) => {
+            if (isCommandMissing(err)) {
+              return new GhCliMissing({
+                message: `git not found on PATH (${err instanceof Error ? err.message : String(err)})`,
+              });
+            }
+            return new GithubReadFailed({
+              call: `getConflictFiles(${branch}→${baseBranch})`,
+              stderr: execaStderr(err),
+              message:
+                err instanceof Error
+                  ? err.message
+                  : `git merge-tree failed: ${String(err)}`,
+            });
+          },
+        }),
+        {
+          call: `getConflictFiles(${branch})`,
+          timeoutMs: 30_000,
+          retryOn: (err) => err._tag === "GithubTimeout",
+        },
+      );
+    },
   };
+}
+
+function canonicaliseMergeableState(raw: string): MergeableState {
+  switch (raw.toLowerCase()) {
+    case "clean":
+      return "clean";
+    case "dirty":
+      return "dirty";
+    case "behind":
+      return "behind";
+    case "blocked":
+      return "blocked";
+    case "unstable":
+      return "unstable";
+    case "draft":
+      return "draft";
+    default:
+      return "unknown";
+  }
 }

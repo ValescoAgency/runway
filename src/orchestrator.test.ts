@@ -92,6 +92,22 @@ function makeGithub(): GithubGateway {
     openPullRequest: vi
       .fn()
       .mockReturnValue(Effect.succeed("https://example/pr/1")),
+    // VA-461: shepherd subscriptions consume these. Defaulting to
+    // `merged: true` keeps the existing orchestrator fixtures
+    // shepherd-neutral — if shepherdEnabled flips on for a test that
+    // wasn't designed around it, the loop exits `merged` immediately
+    // rather than hanging on subscription stubs.
+    getPullRequest: vi.fn().mockReturnValue(
+      Effect.succeed({
+        number: 1,
+        mergeableState: "clean" as const,
+        merged: true,
+        headSha: "deadbeef",
+        headRefName: "agent/x",
+        baseRefName: "main",
+      }),
+    ),
+    getConflictFiles: vi.fn().mockReturnValue(Effect.succeed([])),
   };
 }
 
