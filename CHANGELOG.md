@@ -4,6 +4,24 @@ All notable changes to runway are documented here. Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); breaking
 changes bump the major.
 
+## 0.12.0 — 2026-05-20
+
+Minor release. Three PRs since 0.11.1: one dashboard feature (Linear project Name + UUID in the Todo queue), one telemetry startup fix that blocked any `runway run` with OTLP enabled, and one CI fix that makes the published dashboard image run on Apple Silicon out of the box.
+
+### Added
+
+- **Dashboard Todo queue shows the Linear project Name + UUID** ([PR #145](https://github.com/ValescoAgency/runway/pull/145), VA-450). The "Todo queue (next up)" section now carries a `Project` column with the project name on top and the UUID muted underneath in the same cell — narrow column, copy-pasteable UUID, no extra row height. Unprojected issues render with an em-dash rather than being hidden (the drain still picks them up, so hiding would diverge from the actual queue). Backed by two new nullable columns on `linear_snapshots` (`project_id`, `project_name`) added via the existing idempotent `ALTER TABLE ADD COLUMN` migration pattern — existing dashboard databases pick the columns up on next boot without operator intervention. `createLinearAdapter.snapshotFromIssue` resolves Linear's `Issue.project` alongside `state` + `labels` in the same `Promise.all` so the extra round-trip costs nothing.
+
+### Fixed
+
+- **`runway run` no longer crashes at startup when `OTEL_EXPORTER_OTLP_ENDPOINT` is set** ([PR #143](https://github.com/ValescoAgency/runway/pull/143)). Setting the OTLP endpoint to wire traces + logs into the local dashboard immediately raised `Service not found: @effect/opentelemetry/Logger/OtelLoggerProvider` at runtime startup, blocking the entire drain. Root cause was a layer composition in `src/telemetry.ts` that wrapped `Logger.layerLoggerReplace` around `NodeSdk.layer`, expecting `NodeSdk.layer` to expose `OtelLoggerProvider`. It doesn't — `NodeSdk.layer` consumes the provider via `Layer.provide(layerLoggerAdd, layerLoggerProvider)` internally, and `Layer.provide(target, source)` hides `source`'s services from the result. The fix drops the redundant outer `layerLoggerReplace` and relies on the OTLP logger that `NodeSdk.layer` already wires via `layerLoggerAdd` when a `logRecordProcessor` is configured. Trade-off documented inline: the default stderr logger is no longer silenced, so `Effect.log` calls now fan out to both stderr and OTLP — for a CLI, keeping visible operator progress beats silence.
+- **Published `runway-dashboard` image now runs natively on Apple Silicon** ([PR #142](https://github.com/ValescoAgency/runway/pull/142)). `runway dash up` on a Mac with Docker Desktop failed with `no matching manifest for linux/arm64/v8 in the manifest list entries`. The GHA workflow used `docker/build-push-action@v6` without a `platforms:` input, so the published image only carried a `linux/amd64` variant. Added `platforms: linux/amd64,linux/arm64` and registered QEMU via `docker/setup-qemu-action@v3` so the arm64 build stage can execute Node + pnpm under emulation on the amd64 runner. The next published `ghcr.io/valescoagency/runway-dashboard:latest` carries both architectures and Docker selects the native one automatically.
+
+### Internal — release stats
+
+- **3 PRs since 0.11.1** (1 feat, 1 fix, 1 ci).
+- 58 test files, 778 specs pass (+3 — 2 view tests covering the new Project column for projected vs. unprojected rows, 1 storage round-trip test confirming the new columns persist correctly through SQLite for both shapes).
+
 ## 0.11.1 — 2026-05-16
 
 Patch release. One bugfix closing a regression that surfaced the moment 0.11.0 was used in anger — `runway upgrade-repo` on any tier-2 target repo last scaffolded before VA-413 failed mid-build because the rendered Dockerfile referenced a vendored shim that the upgrade path forgot to write.
