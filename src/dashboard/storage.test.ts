@@ -1533,6 +1533,81 @@ describe("createStorage — VA-455 markDrainActive + getActiveDrain", () => {
     expect(storage.getActiveDrain()).toBeNull();
   });
 
+  it("VA-469: opens cleanly against a legacy DB that has the view AND a NOT NULL drains.end_time_unix_nano", async () => {
+    // Reproduces the crash-loop: a pre-VA-455 dashboard boot left
+    // behind both `evaluator_aggregates_v1` and a `drains` table whose
+    // `end_time_unix_nano` is still NOT NULL. createStorage must drop
+    // the view before relaxDrainsEndTimeNotNull's table-rebuild, or
+    // SQLite 3.45+ rejects `DROP TABLE drains` with
+    // "error in view evaluator_aggregates_v1: no such table: main.drains".
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { DatabaseSync } = await import("node:sqlite");
+
+    const dir = mkdtempSync(join(tmpdir(), "runway-va469-"));
+    const path = join(dir, "legacy.sqlite");
+    try {
+      const seed = new DatabaseSync(path);
+      const legacySchema = [
+        `CREATE TABLE drains (
+          trace_id TEXT NOT NULL,
+          span_id TEXT NOT NULL,
+          start_time_unix_nano TEXT NOT NULL,
+          end_time_unix_nano TEXT NOT NULL,
+          attempts INTEGER,
+          opened INTEGER,
+          hitl INTEGER,
+          errored INTEGER,
+          status_code INTEGER,
+          status_message TEXT,
+          inserted_at TEXT NOT NULL DEFAULT (datetime('now')),
+          PRIMARY KEY (trace_id, span_id)
+        )`,
+        `CREATE TABLE issue_processes (
+          trace_id TEXT NOT NULL,
+          span_id TEXT NOT NULL,
+          parent_span_id TEXT,
+          issue_identifier TEXT NOT NULL,
+          issue_id TEXT,
+          branch TEXT,
+          outcome_kind TEXT,
+          outcome_detail TEXT,
+          start_time_unix_nano TEXT NOT NULL,
+          end_time_unix_nano TEXT NOT NULL,
+          status_code INTEGER,
+          status_message TEXT,
+          inserted_at TEXT NOT NULL DEFAULT (datetime('now')),
+          PRIMARY KEY (trace_id, span_id)
+        )`,
+        `CREATE TABLE agent_iterations (
+          trace_id TEXT NOT NULL,
+          id TEXT NOT NULL,
+          issue_process_id TEXT,
+          iteration_index INTEGER NOT NULL,
+          started_at TEXT NOT NULL,
+          ended_at TEXT NOT NULL,
+          sandcastle_run_id TEXT,
+          exit_status TEXT,
+          inserted_at TEXT NOT NULL DEFAULT (datetime('now')),
+          PRIMARY KEY (trace_id, id)
+        )`,
+        `CREATE VIEW evaluator_aggregates_v1 AS
+          SELECT ip.issue_identifier AS category, COUNT(*) AS sample_size
+          FROM issue_processes ip
+          WHERE ip.trace_id IN (SELECT trace_id FROM drains)
+          GROUP BY ip.issue_identifier`,
+      ];
+      for (const stmt of legacySchema) seed.prepare(stmt).run();
+      seed.close();
+
+      const legacy = createStorage(path);
+      legacy.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("legacy fallback: still surfaces a drain inferred from issue_processes when no marker exists", () => {
     // Pre-VA-455 runway emits no drain.started log, so the dashboard
     // relies on the absence of a `drains` row as the in-flight
