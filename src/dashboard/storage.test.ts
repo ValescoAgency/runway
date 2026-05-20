@@ -1741,7 +1741,7 @@ describe("createStorage — VA-465 shepherding lifecycle", () => {
     });
   });
 
-  it("markShepherdEnded terminates the row; getActiveShepherding excludes it afterward", () => {
+  it("markShepherdEnded outcome=merged terminates the row; getActiveShepherding excludes it afterward", () => {
     storage.markShepherdIterationStart({
       traceId: "trace-terminal",
       prNumber: 1,
@@ -1758,6 +1758,84 @@ describe("createStorage — VA-465 shepherding lifecycle", () => {
       timestampUnixNano: nanos(1715000050),
     });
     expect(storage.getActiveShepherding("trace-terminal")).toEqual([]);
+  });
+
+  it("markShepherdEnded outcome=ready keeps the row visible (AC: 'ready, awaiting human merge')", () => {
+    storage.markShepherdIterationStart({
+      traceId: "trace-ready",
+      prNumber: 50,
+      subscription: "subscription[0]",
+      iteration: 1,
+      maxIterations: 3,
+      description: "polled and quiet",
+      timestampUnixNano: nanos(1715000010),
+    });
+    storage.markShepherdEnded({
+      traceId: "trace-ready",
+      prNumber: 50,
+      outcome: "ready",
+      timestampUnixNano: nanos(1715000050),
+    });
+    const rows = storage.getActiveShepherding("trace-ready");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      prNumber: 50,
+      state: "ready",
+      endedUnixNano: null,
+    });
+  });
+
+  it("markShepherdEnded outcome=hitl keeps the row visible (AC: HITL row visible while drain is active)", () => {
+    storage.markShepherdIterationStart({
+      traceId: "trace-hitl",
+      prNumber: 99,
+      subscription: "subscription[0]",
+      iteration: 1,
+      maxIterations: 3,
+      description: "stuck on conflict",
+      timestampUnixNano: nanos(1715000010),
+    });
+    storage.markShepherdEnded({
+      traceId: "trace-hitl",
+      prNumber: 99,
+      outcome: "hitl",
+      timestampUnixNano: nanos(1715000050),
+    });
+    const rows = storage.getActiveShepherding("trace-hitl");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      prNumber: 99,
+      state: "hitl",
+      endedUnixNano: null,
+    });
+  });
+
+  it("merged after ready: a ready row CAN later be marked merged (human merged the PR after shepherd exited)", () => {
+    storage.markShepherdIterationStart({
+      traceId: "trace-ready-then-merge",
+      prNumber: 7,
+      subscription: "subscription[0]",
+      iteration: 1,
+      maxIterations: 3,
+      description: "running",
+      timestampUnixNano: nanos(1715000010),
+    });
+    storage.markShepherdEnded({
+      traceId: "trace-ready-then-merge",
+      prNumber: 7,
+      outcome: "ready",
+      timestampUnixNano: nanos(1715000050),
+    });
+    // Sub-strip still shows the row.
+    expect(storage.getActiveShepherding("trace-ready-then-merge")).toHaveLength(1);
+    // The PR merges later. The merged event terminates the row.
+    storage.markShepherdEnded({
+      traceId: "trace-ready-then-merge",
+      prNumber: 7,
+      outcome: "merged",
+      timestampUnixNano: nanos(1715000100),
+    });
+    expect(storage.getActiveShepherding("trace-ready-then-merge")).toEqual([]);
   });
 
   it("getActiveShepherding returns rows sorted by started_unix_nano ascending", () => {
@@ -1783,16 +1861,20 @@ describe("createStorage — VA-465 shepherding lifecycle", () => {
     expect(rows.map((r) => r.prNumber)).toEqual([100, 200]);
   });
 
-  it("markShepherdEnded with outcome=hitl is reflected in state before exclusion", () => {
-    // Same as the merged case but the terminal state value differs;
-    // the row is still excluded from getActiveShepherding.
+  it("markShepherdEnded outcome=hitl without prior iteration.start still creates a visible row (insert path)", () => {
+    // INSERT branch: shepherd.ended arrives without a preceding
+    // iteration.start (e.g., a subscription emitted hitl on its
+    // first poll). The row is created with state=hitl and stays
+    // visible.
     storage.markShepherdEnded({
       traceId: "trace-hitl-only",
       prNumber: 88,
       outcome: "hitl",
       timestampUnixNano: nanos(1715000050),
     });
-    expect(storage.getActiveShepherding("trace-hitl-only")).toEqual([]);
+    const rows = storage.getActiveShepherding("trace-hitl-only");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ state: "hitl", endedUnixNano: null });
   });
 
   it("legacy boots without shepherding_prs in the file create it via SCHEMA on next createStorage call", async () => {

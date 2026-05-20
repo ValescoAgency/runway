@@ -1326,13 +1326,22 @@ export function createStorage(
     );
   };
   const markShepherdEnded = (m: ShepherdEndedMarker): void => {
+    // VA-465: only `merged` terminates the row (sets ended_unix_nano
+    // → excluded from getActiveShepherding). `ready` and `hitl`
+    // leave ended_unix_nano NULL so the sub-strip continues to
+    // render them as "ready, awaiting human merge" / "HITL — needs
+    // human attention" rows while the drain is still active. The
+    // rows naturally disappear when the drain ends, since the list
+    // view only queries getActiveShepherding when activeDrain is
+    // non-null.
+    const endedNano = m.outcome === "merged" ? m.timestampUnixNano : null;
     markShepherdEndedStmt.run(
       m.traceId,
       m.prNumber,
       m.outcome,
       m.timestampUnixNano,
       m.timestampUnixNano,
-      m.timestampUnixNano,
+      endedNano,
     );
   };
   const getActiveShepherding = (
