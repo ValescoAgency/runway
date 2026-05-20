@@ -59,3 +59,36 @@ describe("Dockerfile.claude-code.base (VA-351)", () => {
     expect(corepackIdx).toBeLessThan(userIdx);
   });
 });
+
+describe("Dockerfile.claude-code.base (VA-457: COREPACK_HOME)", () => {
+  it("pins COREPACK_HOME under the agent's cache dir", () => {
+    expect(dockerfile).toMatch(
+      /^ENV COREPACK_HOME=\/home\/agent\/.cache\/corepack$/m,
+    );
+  });
+
+  it("pre-creates the corepack data dir alongside the other caches", () => {
+    expect(dockerfile).toMatch(/mkdir -p .*\/home\/agent\/\.cache\/corepack/);
+  });
+
+  it("chowns the corepack data dir to the agent UID after `corepack prepare`", () => {
+    // `corepack prepare` runs as root; without a trailing chown the
+    // files it writes would stay root-owned and unreadable to the
+    // agent UID, defeating the purpose of pinning COREPACK_HOME.
+    const prepareIdx = dockerfile.indexOf("corepack prepare");
+    const chownIdx = dockerfile.indexOf(
+      "chown -R $AGENT_UID:$AGENT_GID /home/agent/.cache/corepack",
+    );
+    expect(prepareIdx).toBeGreaterThan(-1);
+    expect(chownIdx).toBeGreaterThan(prepareIdx);
+  });
+
+  it("chowns the corepack data dir BEFORE switching to the unprivileged USER", () => {
+    const chownIdx = dockerfile.indexOf(
+      "chown -R $AGENT_UID:$AGENT_GID /home/agent/.cache/corepack",
+    );
+    const userIdx = dockerfile.indexOf("USER ${AGENT_UID}");
+    expect(chownIdx).toBeGreaterThan(-1);
+    expect(chownIdx).toBeLessThan(userIdx);
+  });
+});
