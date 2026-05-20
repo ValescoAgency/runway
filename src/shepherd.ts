@@ -85,6 +85,29 @@ const DEFAULT_MAX_ITERATIONS = 3;
 const DEFAULT_NO_OP_MERGE_CHECK: MergeCheck = () => Effect.succeed(false);
 
 /**
+ * VA-460: named no-op subscription stubs. VA-461..463 will each
+ * replace one of these with a real handler. Exported (not just used
+ * as defaults) so sub-issues can swap in named replacements while
+ * keeping the array shape stable.
+ *
+ *   A. mergeabilityStub — replaced by VA-461 (pulls/:n watcher)
+ *   B. ciStub           — replaced by VA-462 (check-runs watcher)
+ *   C. reviewerStub     — replaced by VA-463 (PR comment watcher)
+ */
+export const mergeabilityStub: Subscription = () =>
+  Effect.succeed({ kind: "quiet" });
+export const ciStub: Subscription = () =>
+  Effect.succeed({ kind: "quiet" });
+export const reviewerStub: Subscription = () =>
+  Effect.succeed({ kind: "quiet" });
+
+export const DEFAULT_SUBSCRIPTIONS: readonly Subscription[] = [
+  mergeabilityStub,
+  ciStub,
+  reviewerStub,
+];
+
+/**
  * Parse the PR number from a GitHub PR URL
  * (`https://github.com/<owner>/<repo>/pull/<n>`). Throws when the URL
  * doesn't match — finalize only hands us GitHub PR URLs, so a parse
@@ -111,7 +134,7 @@ export const runShepherdPass = (
   Effect.gen(function* () {
     const prNumber = parsePrNumber(prUrl);
     const isMerged = deps.isMerged ?? DEFAULT_NO_OP_MERGE_CHECK;
-    const subscriptions = deps.subscriptions ?? [];
+    const subscriptions = deps.subscriptions ?? DEFAULT_SUBSCRIPTIONS;
     const maxIterations = deps.maxIterations ?? DEFAULT_MAX_ITERATIONS;
     const pollSeconds =
       deps.pollIntervalSeconds ?? deps.config.shepherdPollIntervalSeconds;

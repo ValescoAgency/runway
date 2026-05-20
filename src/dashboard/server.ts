@@ -35,7 +35,16 @@ import type { OtlpLogsPayload, OtlpTracesPayload } from "./otlp.js";
 
 // VA-389: phase spans we surface on the detail page's timeline.
 // Anything else stays in raw_spans for debugging but isn't rendered.
-const DETAIL_PHASE_NAMES = ["review", "pushBranch", "openPullRequest"] as const;
+const DETAIL_PHASE_NAMES = [
+  "review",
+  "pushBranch",
+  "openPullRequest",
+  // VA-460: shepherd span — emitted by runShepherdPass when
+  // `config.shepherdEnabled=true`. Surfaced alongside review so the
+  // operator sees post-finalize loop time on the timeline. Missing
+  // for any issue process whose drain ran without the feature gate.
+  "shepherd",
+] as const;
 const ISSUE_DETAIL_RE = /^\/issue\/([^/?#]+)\/([^/?#]+)\/?$/;
 // VA-387: canonical detail route. `:id` is the issue process span_id;
 // the lookup falls back to the (trace_id, span_id) pair only for
