@@ -3,14 +3,33 @@ import { describe, expect, it, vi } from "vitest";
 import type { Config } from "./config.js";
 import type { GithubGateway, PullRequestState } from "./github.js";
 import type { RunwayIssue } from "./linear.js";
-import {
+
+// VA-461: mock the sandcastle SDK so the integration test below can
+// drive `runShepherdPass` through the production `defaultInvokeRebaseAgent`
+// path without booting Docker. Hoisted by vitest. Tests that don't
+// exercise this path (the watcher unit tests further down) inject
+// their own `invokeRebaseAgent` stub and never reach the mock.
+const sandcastleRunMock = vi.fn();
+vi.mock("@ai-hero/sandcastle", () => ({
+  run: sandcastleRunMock,
+  claudeCode: vi.fn(() => ({ kind: "claudeCode" })),
+}));
+vi.mock("@ai-hero/sandcastle/sandboxes/docker", () => ({
+  docker: vi.fn(() => ({ kind: "docker" })),
+}));
+
+const {
   makeIsMerged,
   makeMergeabilityWatcher,
   parsePrNumber,
   parseRebaseVerdict,
   runShepherdPass,
-  type Subscription,
-} from "./shepherd.js";
+} = await import("./shepherd.js");
+type Subscription = Parameters<typeof runShepherdPass>[1] extends {
+  subscriptions?: ReadonlyArray<infer S>;
+}
+  ? S
+  : never;
 
 // VA-460 — shepherd-phase scaffolding tests. The subscriptions are
 // stubbed via the `subscriptions` dep so we drive each outcome kind
@@ -436,3 +455,118 @@ describe("makeMergeabilityWatcher (VA-461)", () => {
 // never bare `--force`. The prompt is read from disk, so this lives
 // as a snapshot-shape test in src/prompts.test.ts — see
 // "renderShepherdRebasePrompt" cases there.
+
+// ---------------------------------------------------------------------------
+// VA-461 integration: full runShepherdPass loop drives sandcastle with
+// the right branchStrategy + prompt content
+// ---------------------------------------------------------------------------
+
+describe("runShepherdPass — VA-461 integration", () => {
+  it("on dirty: drives sandcastle with branchStrategy={type:branch,branch} and a force-with-lease prompt", async () => {
+    sandcastleRunMock.mockReset();
+    sandcastleRunMock.mockResolvedValueOnce({ stdout: "IMPL: DONE" });
+
+    // Iteration 1 calls getPullRequest twice (isMerged check, then
+    // watcher poll); iteration 2's isMerged sees the merged state and
+    // exits the loop. Two mockReturnValueOnce for iteration 1, then
+    // mockReturnValue for all subsequent ticks.
+    const dirtyPr = makePr({ mergeableState: "dirty", merged: false });
+    const getPullRequest = vi
+      .fn()
+      .mockReturnValueOnce(Effect.succeed(dirtyPr))
+      .mockReturnValueOnce(Effect.succeed(dirtyPr))
+      .mockReturnValue(Effect.succeed(makePr({ merged: true })));
+    const getConflictFiles = vi
+      .fn()
+      .mockReturnValue(Effect.succeed(["src/foo.ts", "src/bar.ts"]));
+    const github = makeGithub({ getPullRequest, getConflictFiles });
+
+    const outcome = await Effect.runPromise(
+      runShepherdPass(
+        ISSUE,
+        {
+          config: makeConfig(),
+          cwd: "/tmp/repo",
+          baseBranch: "main",
+          github,
+          isMerged: makeIsMerged(github),
+          // Production wiring — no invokeRebaseAgent override, so the
+          // fix action calls defaultInvokeRebaseAgent → runSandcastle
+          // → the mocked `run` above.
+          subscriptions: [
+            makeMergeabilityWatcher({ github, config: makeConfig() }),
+          ],
+          pollIntervalSeconds: 0,
+          maxIterations: 3,
+        },
+        "agent/va-460",
+        PR_URL,
+      ),
+    );
+
+    expect(outcome.kind).toBe("merged");
+    expect(sandcastleRunMock).toHaveBeenCalledOnce();
+    const args = sandcastleRunMock.mock.calls[0]![0];
+    // Linear AC: branchStrategy is { type: "branch", branch }, NEVER
+    // { type: "head" } (VA-456's regression contract).
+    expect(args.branchStrategy).toEqual({
+      type: "branch",
+      branch: "agent/va-460",
+    });
+    expect(args.maxIterations).toBe(1);
+    expect(args.name).toMatch(/shepherd-rebase-VA-460/);
+    // The prompt instructs --force-with-lease and lists the pre-detected
+    // conflict files. Bare --force MUST NOT appear (regression guard
+    // — the prompt-level test in prompts.test.ts also pins this).
+    expect(args.prompt).toMatch(/--force-with-lease/);
+    expect(args.prompt).not.toMatch(/--force(?!\b|-)/);
+    expect(args.prompt).toContain("src/foo.ts");
+    expect(args.prompt).toContain("src/bar.ts");
+    expect(args.prompt).toContain("origin/main");
+    expect(args.prompt).toContain("`dirty`");
+  });
+
+  it("on dirty + agent BLOCKED: loop routes to hitl with the canonical mergeability reason", async () => {
+    sandcastleRunMock.mockReset();
+    sandcastleRunMock.mockResolvedValueOnce({
+      stdout:
+        "IMPL: BLOCKED — Mergeability: conflict in src/orchestrator.ts required human resolution",
+    });
+
+    const getPullRequest = vi
+      .fn()
+      .mockReturnValue(
+        Effect.succeed(makePr({ mergeableState: "dirty", merged: false })),
+      );
+    const getConflictFiles = vi
+      .fn()
+      .mockReturnValue(Effect.succeed(["src/orchestrator.ts"]));
+    const github = makeGithub({ getPullRequest, getConflictFiles });
+
+    const outcome = await Effect.runPromise(
+      runShepherdPass(
+        ISSUE,
+        {
+          config: makeConfig(),
+          cwd: "/tmp/repo",
+          baseBranch: "main",
+          github,
+          isMerged: makeIsMerged(github),
+          subscriptions: [
+            makeMergeabilityWatcher({ github, config: makeConfig() }),
+          ],
+          pollIntervalSeconds: 0,
+          maxIterations: 3,
+        },
+        "agent/va-460",
+        PR_URL,
+      ),
+    );
+
+    expect(outcome).toEqual({
+      kind: "hitl",
+      reason:
+        "Mergeability: conflict in src/orchestrator.ts required human resolution",
+    });
+  });
+});
