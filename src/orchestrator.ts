@@ -13,6 +13,7 @@ import {
   formatPriorFeedback,
 } from "./prompts.js";
 import { runReviewPass } from "./review.js";
+import { runShepherdPass } from "./shepherd.js";
 import {
   finalize,
   formatRebaseConflictReason,
@@ -486,6 +487,33 @@ const processIssue = (
           const reason = formatRebaseFailureReason(finalized);
           yield* flagHitl(issue, deps, reason);
           return { kind: "hitl", detail: reason };
+        }
+        // VA-460: post-finalize shepherd loop. Gated off by default —
+        // first ship lands the scaffolding only; VA-461..463 wire the
+        // mergeability / CI / reviewer subscriptions, VA-464 the
+        // budget knobs. When gated off the composer returns the
+        // `opened` outcome verbatim, preserving the historical
+        // behavior.
+        if (deps.config.shepherdEnabled) {
+          const shepherd = yield* runShepherdPass(
+            issue,
+            {
+              config: deps.config,
+              cwd: deps.cwd,
+              baseBranch: deps.baseBranch,
+              github: deps.github,
+            },
+            branch,
+            finalized.detail,
+          );
+          if (shepherd.kind === "hitl") {
+            const reason = `Shepherd routed PR to HITL: ${shepherd.reason}`;
+            yield* flagHitl(issue, deps, reason);
+            return { kind: "hitl", detail: reason };
+          }
+          // `merged` and `ready` both preserve the `opened` outcome —
+          // the PR exists; whether it's merged yet doesn't change the
+          // per-issue verdict the operator sees in the exit summary.
         }
         return finalized;
       }

@@ -32,6 +32,8 @@ const baseConfig = (over: Partial<RunwayConfig> = {}): RunwayConfig => ({
   maxIterations: 5,
   implTurns: 3,
   reviewRetries: 1,
+  shepherdEnabled: false,
+  shepherdPollIntervalSeconds: 15,
   ...over,
 });
 

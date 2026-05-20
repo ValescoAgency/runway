@@ -51,6 +51,8 @@ const config: Config = {
   reviewRetries: 0,
   metaReviewModel: "claude-sonnet-4-6",
   metaProjectName: "runway-meta",
+  shepherdEnabled: false,
+  shepherdPollIntervalSeconds: 15,
 };
 
 const issue: RunwayIssue = {

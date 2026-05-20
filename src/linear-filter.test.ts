@@ -41,6 +41,8 @@ const baseConfig = {
   reviewRetries: 1,
   metaReviewModel: "claude-sonnet-4-6",
   metaProjectName: "runway-meta",
+  shepherdEnabled: false,
+  shepherdPollIntervalSeconds: 15,
 } as const;
 
 beforeEach(() => {
