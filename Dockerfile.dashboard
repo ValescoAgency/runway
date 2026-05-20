@@ -15,13 +15,13 @@ FROM node:26-slim AS build
 WORKDIR /app
 
 # VA-393: install pnpm directly rather than going through corepack.
-# Recent Node 24 + corepack combinations require an integrity hash in
-# package.json#packageManager to auto-download a pinned pnpm version;
-# without one, `pnpm install` fails non-interactively in CI. Direct
-# `npm i -g` skips the corepack signature/prompt flow entirely. The
-# version is kept in sync manually with package.json#packageManager
-# (currently pnpm@11.1.1) — both lines are one-liners, so the
-# drift risk is low and grep-discoverable.
+# Recent Node + corepack combinations (24, 26) require an integrity
+# hash in package.json#packageManager to auto-download a pinned pnpm
+# version; without one, `pnpm install` fails non-interactively in CI.
+# Direct `npm i -g` skips the corepack signature/prompt flow entirely.
+# The version is kept in sync manually with
+# package.json#packageManager (currently pnpm@11.1.1) — both lines
+# are one-liners, so the drift risk is low and grep-discoverable.
 RUN npm install -g pnpm@11.1.1
 # pnpm 11 reads build-script approval from pnpm-workspace.yaml
 # (`allowBuilds`); without it pnpm errors out on every install with

@@ -4,6 +4,19 @@ All notable changes to runway are documented here. Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); breaking
 changes bump the major.
 
+## 0.14.2 — 2026-05-20
+
+Patch release. One PR — Docker Scout was reporting 17 high-severity CVEs against the published `runway-dashboard` image; investigation triaged them into 5 real (Debian `gnutls28` unpatched on `node:24-slim`'s bookworm base), 1 stale-index false positive (`picomatch` was already 4.0.4 in the image), and 11 BuildKit-provenance-attestation artifacts (no Go runtime in the container).
+
+### Fixed
+
+- **Dashboard image: bump base to `node:26-slim` + `provenance: mode=min`** ([PR #175](https://github.com/ValescoAgency/runway/pull/175), VA-467). Both stages of `Dockerfile.dashboard` move from `node:24-slim` (Debian bookworm) to `node:26-slim` (Debian trixie). trixie ships a patched `gnutls28`, which clears all 5 real CVEs Scout flagged. `engines.node = ">=24"` still satisfies; `node:sqlite` (added in 22.5, stabilised in 24) remains; `--experimental-sqlite` continues as a no-op. The `.github/workflows/dashboard-image.yml` workflow's `docker/build-push-action@v6` step gains `provenance: mode=min` — keeps the in-toto provenance predicate attached for supply-chain integrity but drops the verbose SBOM that surfaced BuildKit's own Go-stdlib transitive CVEs as image-level findings (the 11 false positives). Locally smoke-tested: `docker build` succeeds against the new base, `docker run` boots cleanly, `GET /` returns 200, `POST /v1/traces` returns 200. Node 26 is "Current," not LTS until Oct 2026 — fine for a self-hosted dashboard container, flag if you run under a strict LTS-only policy.
+
+### Internal — release stats
+
+- **1 PR since 0.14.1** (1 fix).
+- 59 test files, 814 specs pass (no test-suite changes — infra-only fix).
+
 ## 0.14.1 — 2026-05-20
 
 Patch release. One PR — `runway upgrade-repo`'s manual-edit detector was reporting "manual Dockerfile edits detected" on target repos whose `.sandcastle/Dockerfile` was vendored by an older runway, forcing operators to pass `--force` and lose the detector's real signal. Surfaced on the FFL manager during the 0.13.0 → 0.14.0 upgrade.
