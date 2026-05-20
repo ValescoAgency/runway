@@ -1,4 +1,4 @@
-import { Logger as OtelLogger, NodeSdk } from "@effect/opentelemetry";
+import { NodeSdk } from "@effect/opentelemetry";
 import { OTLPLogExporter } from "@opentelemetry/exporter-logs-otlp-http";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
 import { BatchLogRecordProcessor } from "@opentelemetry/sdk-logs";
@@ -50,20 +50,15 @@ const liveLayer = NodeSdk.layer(() => ({
   logRecordProcessor: new BatchLogRecordProcessor(new OTLPLogExporter()),
 }));
 
-// VA-388: replace Effect's default logger with one that fans out to
-// the OtelLoggerProvider built by `NodeSdk.layer`. Provided ON TOP of
-// `liveLayer` so the OtelLoggerProvider context is satisfied; without
-// the SDK behind it, this layer would fail to construct.
-const loggerLayer = Layer.provide(
-  OtelLogger.layerLoggerReplace,
-  liveLayer,
-);
-
+// VA-388: when `logRecordProcessor` is set above, `NodeSdk.layer`
+// internally composes `Logger.layerLoggerAdd` against an internal
+// `OtelLoggerProvider`, so `Effect.log` calls fan out to OTLP in
+// addition to the default stderr logger. An earlier revision wrapped
+// `Logger.layerLoggerReplace` around `liveLayer` to silence stderr,
+// but `NodeSdk.layer` consumes `OtelLoggerProvider` via `Layer.provide`
+// internally and does not re-export it — that composition raised
+// "Service not found: OtelLoggerProvider" at startup.
 export const TelemetryLive: Layer.Layer<never, never, never> =
   isTelemetryEnabled()
-    ? (Layer.merge(liveLayer, loggerLayer) as unknown as Layer.Layer<
-        never,
-        never,
-        never
-      >)
+    ? (liveLayer as unknown as Layer.Layer<never, never, never>)
     : (NodeSdk.layerEmpty as unknown as Layer.Layer<never, never, never>);
