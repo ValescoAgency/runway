@@ -42,6 +42,9 @@ const FORWARDED_ENV_KEYS = [
   "LINEAR_POLL_INTERVAL_SECONDS",
   "RUNWAY_LINEAR_TEAM",
   "RUNWAY_READY_LABEL",
+  // VA-452: workspace slug for the dashboard's `↗ open in Linear`
+  // affordance. Unset → identifiers render as plain text.
+  "RUNWAY_LINEAR_WORKSPACE",
 ] as const;
 
 export interface DashOptions {

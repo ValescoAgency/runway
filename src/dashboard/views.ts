@@ -61,6 +61,9 @@ const SHARED_STYLE = `
     .detail { color: #d4d4d8; }
     .muted { color: #9ca3af; }
     .project-uuid { color: #9ca3af; font-size: 11px; display: block; }
+    .linear-link { color: #6b7280; text-decoration: none; margin-left: 6px;
+                   font-size: 11px; vertical-align: middle; }
+    .linear-link:hover { color: #93c5fd; }
     code { background: #1f2937; padding: 1px 6px; border-radius: 3px; }
     .status-badge { display: inline-block; margin-left: 8px;
                     padding: 1px 6px; border-radius: 3px; font-size: 11px;
@@ -82,6 +85,13 @@ export interface ListViewModel {
   readonly todoQueue: readonly LinearSnapshotRow[];
   /** Latest Linear snapshot keyed by issue_identifier. Empty when sync disabled. */
   readonly snapshotsByIdentifier: ReadonlyMap<string, LinearSnapshotRow>;
+  /**
+   * VA-452: Linear workspace slug (e.g. "valescoagency") read from
+   * `RUNWAY_LINEAR_WORKSPACE`. When null/undefined, identifier rows
+   * render without the `↗ open in Linear` affordance — preserves the
+   * pre-VA-452 dashboard for users who don't set the env var.
+   */
+  readonly linearWorkspace?: string | null;
   /**
    * VA-391: present when an in-flight drain is running, null when the
    * dashboard is idle. The drain summary strip renders one or the
@@ -127,14 +137,18 @@ export function renderListView(input: ListViewModel | readonly StoredIssueProces
   const isFiltered = vm.isFiltered ?? false;
   const recentDrains = vm.recentDrains ?? [];
 
+  const linearWorkspace = vm.linearWorkspace ?? null;
   const tableBody = renderIssueProcessRows({
     rows: vm.rows,
     linearEnabled: vm.linearEnabled,
     snapshotsByIdentifier: vm.snapshotsByIdentifier,
     isFiltered,
+    linearWorkspace,
   });
 
-  const queueSection = vm.linearEnabled ? renderTodoQueue(vm.todoQueue) : "";
+  const queueSection = vm.linearEnabled
+    ? renderTodoQueue(vm.todoQueue, linearWorkspace)
+    : "";
   // VA-391: drain summary strip renders ABOVE the queue + run list
   // so the operator sees in-flight progress at the top of the page.
   const drainStrip = renderDrainStrip(vm.activeDrain ?? null);
@@ -275,6 +289,8 @@ export function renderIssueProcessRows(input: {
    * pre-VA-392 callers on the original empty message.
    */
   readonly isFiltered?: boolean;
+  /** VA-452: workspace slug for the per-row Linear `↗` affordance. */
+  readonly linearWorkspace?: string | null;
 }): string {
   if (input.rows.length === 0) {
     if (input.isFiltered) {
@@ -282,9 +298,26 @@ export function renderIssueProcessRows(input: {
     }
     return `<tr><td colspan="4" class="empty">No issue processes yet. Run <code>runway run</code> with <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> pointing here to populate.</td></tr>`;
   }
+  const linearWorkspace = input.linearWorkspace ?? null;
   return input.rows
-    .map((r) => renderRow(r, input.snapshotsByIdentifier))
+    .map((r) => renderRow(r, input.snapshotsByIdentifier, linearWorkspace))
     .join("");
+}
+
+/**
+ * VA-452: render the `↗` anchor that opens the issue in Linear, or
+ * an empty string when the workspace slug isn't configured. Kept
+ * tiny + identifier-agnostic so every render site uses the same
+ * shape. Linear's URL accepts the identifier alone — no slug needed,
+ * the server redirects to the canonical URL.
+ */
+function linearIssueLink(
+  identifier: string,
+  workspace: string | null,
+): string {
+  if (workspace == null || workspace === "") return "";
+  const url = `https://linear.app/${encodeURIComponent(workspace)}/issue/${encodeURIComponent(identifier)}`;
+  return ` <a class="linear-link" target="_blank" rel="noopener noreferrer" title="Open ${escapeHtml(identifier)} in Linear" href="${escapeHtml(url)}">↗</a>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -428,11 +461,14 @@ export function filterStateToQueryString(state: ListFilterState): string {
  * with an empty-state row so the operator knows the poller ran and
  * found nothing to pick up.
  */
-function renderTodoQueue(queue: readonly LinearSnapshotRow[]): string {
+function renderTodoQueue(
+  queue: readonly LinearSnapshotRow[],
+  linearWorkspace: string | null,
+): string {
   const body =
     queue.length === 0
       ? `<tr><td colspan="4" class="empty">Linear Todo queue is empty.</td></tr>`
-      : queue.map(renderQueueRow).join("");
+      : queue.map((s) => renderQueueRow(s, linearWorkspace)).join("");
   return `<h2>Todo queue (next up)</h2>
   <table>
     <thead>
@@ -447,7 +483,10 @@ function renderTodoQueue(queue: readonly LinearSnapshotRow[]): string {
   </table>`;
 }
 
-function renderQueueRow(s: LinearSnapshotRow): string {
+function renderQueueRow(
+  s: LinearSnapshotRow,
+  linearWorkspace: string | null,
+): string {
   const labels = s.labels.length === 0 ? "" : s.labels.join(", ");
   // VA-450: project cell shows the name on top with the UUID muted
   // underneath in the same column. Unprojected issues degrade to an
@@ -460,7 +499,7 @@ function renderQueueRow(s: LinearSnapshotRow): string {
           ? ""
           : `<span class="project-uuid">${escapeHtml(s.projectId)}</span>`);
   return `<tr>
-    <td class="id">${escapeHtml(s.issueIdentifier)}</td>
+    <td class="id">${escapeHtml(s.issueIdentifier)}${linearIssueLink(s.issueIdentifier, linearWorkspace)}</td>
     <td class="detail">${escapeHtml(s.title)}</td>
     <td class="muted">${escapeHtml(labels)}</td>
     <td class="detail">${project}</td>
@@ -470,6 +509,7 @@ function renderQueueRow(s: LinearSnapshotRow): string {
 function renderRow(
   r: StoredIssueProcess,
   snapshots: ReadonlyMap<string, LinearSnapshotRow>,
+  linearWorkspace: string | null,
 ): string {
   const kind = r.outcomeKind ?? "pending";
   const outcomeCls = `outcome outcome-${escapeHtml(kind)}`;
@@ -487,7 +527,7 @@ function renderRow(
     ? `<span class="status-badge">${escapeHtml(snapshot.status)}</span>`
     : "";
   return `<tr>
-    <td class="id"><a href="${escapeHtml(href)}">${escapeHtml(r.issueIdentifier)}</a>${statusBadge}</td>
+    <td class="id"><a href="${escapeHtml(href)}">${escapeHtml(r.issueIdentifier)}</a>${linearIssueLink(r.issueIdentifier, linearWorkspace)}${statusBadge}</td>
     <td class="${outcomeCls}">${escapeHtml(kind)}</td>
     <td class="detail">${escapeHtml(r.outcomeDetail ?? "")}</td>
     <td>${escapeHtml(r.insertedAt)}</td>
@@ -510,6 +550,8 @@ export interface DetailViewModel {
    * (the section is omitted in that case).
    */
   readonly logs?: readonly StoredLogRecord[];
+  /** VA-452: workspace slug for the header's Linear `↗` affordance. */
+  readonly linearWorkspace?: string | null;
 }
 
 interface PhaseRow {
@@ -599,7 +641,7 @@ export function renderDetailView(vm: DetailViewModel): string {
 </head>
 <body>
   <div class="breadcrumb"><a href="/">← all issue processes</a></div>
-  <h1>${escapeHtml(ip.issueIdentifier)} · <span class="${outcomeCls}">${escapeHtml(kind)}</span></h1>
+  <h1>${escapeHtml(ip.issueIdentifier)}${linearIssueLink(ip.issueIdentifier, vm.linearWorkspace ?? null)} · <span class="${outcomeCls}">${escapeHtml(kind)}</span></h1>
   ${titleLine}
   <div class="meta">
     <div><span class="label">branch:</span><code>${escapeHtml(ip.branch ?? "—")}</code></div>

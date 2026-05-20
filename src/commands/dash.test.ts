@@ -148,6 +148,16 @@ describe("buildDockerRunArgs (VA-393)", () => {
     expect(args).not.toContain("secret-value");
   });
 
+  // VA-452
+  it("forwards RUNWAY_LINEAR_WORKSPACE into the container when set", () => {
+    const args = buildDockerRunArgs(baseOpts, {
+      RUNWAY_LINEAR_WORKSPACE: "valescoagency",
+    });
+    const idx = args.indexOf("RUNWAY_LINEAR_WORKSPACE");
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx - 1]).toBe("-e");
+  });
+
   it("skips forwarded env keys that are unset or empty", () => {
     const args = buildDockerRunArgs(baseOpts, { LINEAR_API_KEY: "" });
     expect(args).not.toContain("LINEAR_API_KEY");
