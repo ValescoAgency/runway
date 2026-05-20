@@ -79,12 +79,14 @@ describe("startLinearSync — getReadyQueue tick (VA-390)", () => {
   it("stores the Todo queue with sequential queue_position values", async () => {
     const adapter = makeFakeAdapter();
     adapter.nextQueue = [
-      { identifier: "VA-1", title: "First", status: "Todo", labels: ["bug"] },
+      { identifier: "VA-1", title: "First", status: "Todo", labels: ["bug"], projectId: null, projectName: null },
       {
         identifier: "VA-2",
         title: "Second",
         status: "Todo",
         labels: ["feature"],
+      projectId: null,
+      projectName: null,
       },
     ];
 
@@ -110,8 +112,8 @@ describe("startLinearSync — getReadyQueue tick (VA-390)", () => {
   it("clears prior queue_position so issues that left Todo drop out of the preview", async () => {
     const adapter = makeFakeAdapter();
     adapter.nextQueue = [
-      { identifier: "VA-1", title: "stale", status: "Todo", labels: [] },
-      { identifier: "VA-2", title: "stays", status: "Todo", labels: [] },
+      { identifier: "VA-1", title: "stale", status: "Todo", labels: [], projectId: null, projectName: null },
+      { identifier: "VA-2", title: "stays", status: "Todo", labels: [], projectId: null, projectName: null },
     ];
     handle = startLinearSync({
       adapter,
@@ -130,7 +132,7 @@ describe("startLinearSync — getReadyQueue tick (VA-390)", () => {
     // returns only VA-2, and VA-1 must vanish from the queue preview
     // even though we never explicitly deleted its row.
     adapter.nextQueue = [
-      { identifier: "VA-2", title: "stays", status: "Todo", labels: [] },
+      { identifier: "VA-2", title: "stays", status: "Todo", labels: [], projectId: null, projectName: null },
     ];
     await handle.tick();
     const queue = storage.listLinearTodoQueue();
@@ -150,6 +152,8 @@ describe("startLinearSync — getReadyQueue tick (VA-390)", () => {
         title: "fresh",
         status: "In Review",
         labels: [],
+      projectId: null,
+      projectName: null,
       },
     ];
 
@@ -180,6 +184,8 @@ describe("startLinearSync — refreshStatus tick (VA-390)", () => {
         title: "in review",
         status: "In Review",
         labels: ["bug"],
+      projectId: null,
+      projectName: null,
       },
     ];
 
@@ -220,7 +226,7 @@ describe("startLinearSync — refreshStatus tick (VA-390)", () => {
   it("survives a refreshStatus error without affecting prior queue snapshot", async () => {
     const adapter = makeFakeAdapter();
     adapter.nextQueue = [
-      { identifier: "VA-1", title: "queued", status: "Todo", labels: [] },
+      { identifier: "VA-1", title: "queued", status: "Todo", labels: [], projectId: null, projectName: null },
     ];
     adapter.failRefreshStatus = true;
 
@@ -252,7 +258,7 @@ describe("startLinearSync — refreshStatus tick (VA-390)", () => {
     // even though Linear still has it in Todo.
     const adapter = makeFakeAdapter();
     adapter.nextQueue = [
-      { identifier: "VA-1", title: "queued", status: "Todo", labels: ["bug"] },
+      { identifier: "VA-1", title: "queued", status: "Todo", labels: ["bug"], projectId: null, projectName: null },
     ];
     adapter.nextRefresh = [
       {
@@ -260,6 +266,8 @@ describe("startLinearSync — refreshStatus tick (VA-390)", () => {
         title: "queued (refreshed)",
         status: "Todo",
         labels: ["bug"],
+      projectId: null,
+      projectName: null,
       },
     ];
     handle = startLinearSync({

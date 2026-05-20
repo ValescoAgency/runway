@@ -129,6 +129,10 @@ export interface LinearSnapshotRow {
   readonly labels: readonly string[];
   /** Non-null when the issue is in the Todo queue at last poll. */
   readonly queuePosition: number | null;
+  /** VA-450: Linear project UUID, or null when the issue is unprojected. */
+  readonly projectId: string | null;
+  /** VA-450: Linear project display name, or null when the issue is unprojected. */
+  readonly projectName: string | null;
 }
 
 /**
@@ -491,7 +495,9 @@ const SCHEMA = `
     status TEXT NOT NULL,
     title TEXT NOT NULL,
     labels_json TEXT,
-    queue_position INTEGER
+    queue_position INTEGER,
+    project_id TEXT,
+    project_name TEXT
   );
 
   CREATE INDEX IF NOT EXISTS idx_linear_snapshots_queue_position
@@ -687,6 +693,9 @@ export function createStorage(
     `ALTER TABLE issue_processes ADD COLUMN issue_labels TEXT`,
     `ALTER TABLE issue_processes ADD COLUMN pr_url TEXT`,
     `ALTER TABLE issue_processes ADD COLUMN hitl_reason TEXT`,
+    // VA-450: project Name + UUID for the Todo queue Project column.
+    `ALTER TABLE linear_snapshots ADD COLUMN project_id TEXT`,
+    `ALTER TABLE linear_snapshots ADD COLUMN project_name TEXT`,
   ]) {
     try {
       db.exec(sql);
@@ -812,14 +821,17 @@ export function createStorage(
 
   const upsertLinearSnapshot = db.prepare(`
     INSERT INTO linear_snapshots (
-      issue_identifier, snapshot_at, status, title, labels_json, queue_position
-    ) VALUES (?, ?, ?, ?, ?, ?)
+      issue_identifier, snapshot_at, status, title, labels_json, queue_position,
+      project_id, project_name
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (issue_identifier) DO UPDATE SET
       snapshot_at = excluded.snapshot_at,
       status = excluded.status,
       title = excluded.title,
       labels_json = excluded.labels_json,
-      queue_position = excluded.queue_position
+      queue_position = excluded.queue_position,
+      project_id = excluded.project_id,
+      project_name = excluded.project_name
   `);
 
   const clearQueuePositionsStmt = db.prepare(
@@ -827,14 +839,16 @@ export function createStorage(
   );
 
   const listTodoQueueStmt = db.prepare(`
-    SELECT issue_identifier, snapshot_at, status, title, labels_json, queue_position
+    SELECT issue_identifier, snapshot_at, status, title, labels_json, queue_position,
+           project_id, project_name
     FROM linear_snapshots
     WHERE queue_position IS NOT NULL
     ORDER BY queue_position ASC
   `);
 
   const listAllSnapshotsStmt = db.prepare(`
-    SELECT issue_identifier, snapshot_at, status, title, labels_json, queue_position
+    SELECT issue_identifier, snapshot_at, status, title, labels_json, queue_position,
+           project_id, project_name
     FROM linear_snapshots
   `);
 
@@ -1104,6 +1118,8 @@ export function createStorage(
       s.title,
       s.labels.length === 0 ? null : JSON.stringify(s.labels),
       s.queuePosition,
+      s.projectId,
+      s.projectName,
     );
   };
 
@@ -1393,6 +1409,8 @@ function rowToLinearSnapshot(row: unknown): LinearSnapshotRow {
     title: String(r.title ?? ""),
     labels: parseLabels(r.labels_json),
     queuePosition: nullableNum(r.queue_position),
+    projectId: r.project_id == null ? null : String(r.project_id),
+    projectName: r.project_name == null ? null : String(r.project_name),
   };
 }
 

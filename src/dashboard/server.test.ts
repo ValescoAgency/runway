@@ -357,6 +357,8 @@ describe("dashboard HTTP server — Linear sync surfaces (VA-390)", () => {
       title: "Queued one",
       labels: ["a"],
       queuePosition: 0,
+      projectId: null,
+      projectName: null,
     });
     storage.saveLinearSnapshot({
       issueIdentifier: "VA-312",
@@ -365,6 +367,8 @@ describe("dashboard HTTP server — Linear sync surfaces (VA-390)", () => {
       title: "Already processed",
       labels: [],
       queuePosition: null,
+      projectId: null,
+      projectName: null,
     });
     // Push a processIssue span so the row's identifier exists in
     // issue_processes — the badge join key is issueIdentifier.
