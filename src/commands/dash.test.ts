@@ -27,12 +27,12 @@ describe("parseDashArgs (VA-393)", () => {
   it("accepts --image / --otlp-port / --dashboard-port on upgrade", () => {
     const parsed = parseDashArgs([
       "upgrade",
-      "--image=ghcr.io/x/y:0.12.0",
+      "--image=ghcr.io/x/y:tag",
       "--otlp-port=4318",
       "--dashboard-port=3001",
     ]);
     expect(parsed.verb).toBe("upgrade");
-    expect(parsed.image).toBe("ghcr.io/x/y:0.12.0");
+    expect(parsed.image).toBe("ghcr.io/x/y:tag");
     expect(parsed.otlpPort).toBe("4318");
     expect(parsed.dashboardPort).toBe("3001");
   });
