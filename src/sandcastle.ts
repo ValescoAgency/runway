@@ -1,6 +1,58 @@
 import { run } from "@ai-hero/sandcastle";
 import { Effect, Redacted } from "effect";
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
 import type { Config } from "./config.js";
+
+/**
+ * VA-454: when sandcastle throws, its `Error.message` is opaque
+ * (`claude-code exited with code 1:` with no body — the colon is
+ * literal, the stderr text goes only to the log file). To stop
+ * operators from having to hunt `.sandcastle/logs/` for the real
+ * cause on every failure, we read the tail of the most-recently
+ * modified log file in the project's `.sandcastle/logs/` directory
+ * and append it to the error message.
+ *
+ * Tail is read by capping the byte window (cheap on huge logs) and
+ * then trimming to the last `maxLines`. A missing directory or a
+ * read error degrades silently — the error path must not be the
+ * source of a NEW error.
+ */
+const SANDCASTLE_LOG_TAIL_LINES = 20;
+const SANDCASTLE_LOG_TAIL_MAX_BYTES = 16 * 1024;
+
+export function readLatestSandcastleLogTail(
+  cwd: string,
+  maxLines: number = SANDCASTLE_LOG_TAIL_LINES,
+): string | null {
+  try {
+    const dir = join(cwd, ".sandcastle", "logs");
+    const entries = readdirSync(dir);
+    let newestPath: string | null = null;
+    let newestMtime = -Infinity;
+    for (const name of entries) {
+      if (!name.endsWith(".log")) continue;
+      const path = join(dir, name);
+      const mtime = statSync(path).mtimeMs;
+      if (mtime > newestMtime) {
+        newestMtime = mtime;
+        newestPath = path;
+      }
+    }
+    if (!newestPath) return null;
+    const size = statSync(newestPath).size;
+    const offset = Math.max(0, size - SANDCASTLE_LOG_TAIL_MAX_BYTES);
+    const buf = readFileSync(newestPath);
+    // Trim trailing newline BEFORE splitting so a `…line 200\n` file
+    // doesn't yield an empty final element that eats one slot in the
+    // `slice(-maxLines)` window.
+    const tail = buf.subarray(offset).toString("utf8").replace(/\n+$/, "");
+    const lines = tail.split("\n");
+    return lines.slice(-maxLines).join("\n");
+  } catch {
+    return null;
+  }
+}
 
 /**
  * VA-358: thin Effect wrapper around `sandcastle.run`. The agent run
@@ -21,9 +73,20 @@ export const runSandcastle = (
 > =>
   Effect.tryPromise({
     try: () => run(args),
-    catch: (err) => ({
-      message: err instanceof Error ? err.message : String(err),
-    }),
+    catch: (err) => {
+      const base = err instanceof Error ? err.message : String(err);
+      // VA-454: append the tail of the most-recent `.sandcastle/logs/`
+      // file so the operator sees the real cause (e.g. "Invalid API
+      // key · Fix external API key") on the same line as the
+      // INFRA_ERROR — instead of having to scroll back to the run-
+      // start banner for the log path and open it.
+      const tail = readLatestSandcastleLogTail(
+        args.cwd ?? process.cwd(),
+      );
+      return {
+        message: tail ? `${base}\n${tail}` : base,
+      };
+    },
   });
 
 /**
