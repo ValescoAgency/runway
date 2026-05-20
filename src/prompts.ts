@@ -92,6 +92,21 @@ export async function renderShepherdRebasePrompt(args: {
   return renderPrompt(template, shepherdRebaseVars(args));
 }
 
+/**
+ * VA-462: render the shepherd-ci-fix prompt. The agent receives the
+ * failing check name and the trailing log lines and executes a
+ * targeted fix on the impl branch (commit + push, not force-push).
+ */
+export async function renderShepherdCiFixPrompt(args: {
+  issue: RunwayIssue;
+  branch: string;
+  checkName: string;
+  logTail: string;
+}): Promise<string> {
+  const template = await loadShepherdCiFixPrompt();
+  return renderPrompt(template, shepherdCiFixVars(args));
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -106,6 +121,10 @@ async function loadReviewPrompt(): Promise<string> {
 
 async function loadShepherdRebasePrompt(): Promise<string> {
   return readFile(join(PROMPT_DIR, "shepherd-rebase.md"), "utf8");
+}
+
+async function loadShepherdCiFixPrompt(): Promise<string> {
+  return readFile(join(PROMPT_DIR, "shepherd-ci-fix.md"), "utf8");
 }
 
 /**
@@ -161,6 +180,22 @@ function reviewVars(args: {
     ISSUE_DESCRIPTION: args.issue.description || "(no description)",
     DIFF: args.diff || "(empty diff)",
     COMMITS: args.commits || "(no commits)",
+  };
+}
+
+function shepherdCiFixVars(args: {
+  issue: RunwayIssue;
+  branch: string;
+  checkName: string;
+  logTail: string;
+}): Record<string, string> {
+  return {
+    ISSUE_IDENTIFIER: args.issue.identifier,
+    ISSUE_TITLE: args.issue.title,
+    ISSUE_DESCRIPTION: args.issue.description || "(no description)",
+    BRANCH: args.branch,
+    CHECK_NAME: args.checkName,
+    LOG_TAIL: args.logTail.trim() || "(log unavailable)",
   };
 }
 

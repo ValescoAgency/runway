@@ -4,6 +4,7 @@ import {
   formatPriorFeedback,
   renderImplementPrompt,
   renderReviewPrompt,
+  renderShepherdCiFixPrompt,
   renderShepherdRebasePrompt,
 } from "./prompts.js";
 import type { Policy } from "./policy.js";
@@ -444,5 +445,69 @@ describe("renderShepherdRebasePrompt (VA-461)", () => {
     expect(out).toContain("IMPL: DONE");
     expect(out).toContain("IMPL: BLOCKED");
     expect(out).toContain("Mergeability: conflict in");
+  });
+});
+
+describe("renderShepherdCiFixPrompt (VA-462)", () => {
+  const issue: RunwayIssue = {
+    id: "issue-uuid",
+    identifier: "VA-462",
+    title: "CI failure watcher",
+    description: "Wire the CI subscription onto the shepherd loop.",
+    labels: [],
+  };
+
+  it("substitutes check name + log tail + branch into the rendered prompt", async () => {
+    const out = await renderShepherdCiFixPrompt({
+      issue,
+      branch: "agent/va-462",
+      checkName: "pnpm test",
+      logTail:
+        "FAIL src/shepherd.test.ts\nAssertionError: expected 'a' to equal 'b'\n  at line 123",
+    });
+    expect(out).toContain("VA-462 — CI failure watcher");
+    expect(out).toContain("`pnpm test`");
+    expect(out).toContain("agent/va-462");
+    expect(out).toContain("FAIL src/shepherd.test.ts");
+    expect(out).toContain("AssertionError");
+  });
+
+  it("AC: instructs `git push origin BRANCH` and explicitly forbids --force / --force-with-lease", async () => {
+    const out = await renderShepherdCiFixPrompt({
+      issue,
+      branch: "agent/va-462",
+      checkName: "pnpm test",
+      logTail: "FAIL",
+    });
+    expect(out).toMatch(/git push origin/);
+    // Append commits, don't rewrite history — the prompt mentions
+    // `--force` and `--force-with-lease` only as things the agent
+    // must NOT use (verified via the surrounding warning text), not
+    // as the push command itself.
+    expect(out).toMatch(/NOT\s+`?--force`?\s+or\s+`?--force-with-lease`?/);
+    // The actual push command on the same line is `git push origin
+    // {{BRANCH}}` — no flags. Assert that pattern present.
+    expect(out).toMatch(/`git push origin agent\/va-462`/);
+  });
+
+  it("falls back to `(log unavailable)` when the log tail is empty", async () => {
+    const out = await renderShepherdCiFixPrompt({
+      issue,
+      branch: "agent/va-462",
+      checkName: "weird-check",
+      logTail: "",
+    });
+    expect(out).toContain("(log unavailable)");
+  });
+
+  it("instructs IMPL: DONE / IMPL: BLOCKED markers for the parser", async () => {
+    const out = await renderShepherdCiFixPrompt({
+      issue,
+      branch: "agent/va-462",
+      checkName: "pnpm test",
+      logTail: "FAIL",
+    });
+    expect(out).toContain("IMPL: DONE");
+    expect(out).toContain("IMPL: BLOCKED");
   });
 });

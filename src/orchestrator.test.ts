@@ -108,6 +108,12 @@ function makeGithub(): GithubGateway {
       }),
     ),
     getConflictFiles: vi.fn().mockReturnValue(Effect.succeed([])),
+    // VA-462: CI watcher consumes these. Defaulting to "no checks
+    // failing" keeps the existing fixtures CI-neutral; tests that
+    // need the CI path override these explicitly.
+    getCheckRuns: vi.fn().mockReturnValue(Effect.succeed([])),
+    getRequiredChecks: vi.fn().mockReturnValue(Effect.succeed([])),
+    getCheckRunLogTail: vi.fn().mockReturnValue(Effect.succeed("")),
   };
 }
 

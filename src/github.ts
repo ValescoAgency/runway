@@ -138,6 +138,31 @@ export interface PullRequestState {
   readonly baseRefName: string;
 }
 
+/**
+ * VA-462: a single check run from
+ * `GET /repos/:owner/:repo/commits/:sha/check-runs`. We narrow the
+ * GitHub-returned conclusion enum to the values runway actually
+ * reasons about; anything else falls through to `null` (incomplete).
+ */
+export interface CheckRun {
+  readonly id: number;
+  readonly name: string;
+  readonly status: "queued" | "in_progress" | "completed";
+  readonly conclusion:
+    | "success"
+    | "failure"
+    | "cancelled"
+    | "timed_out"
+    | "neutral"
+    | "skipped"
+    | "action_required"
+    | "stale"
+    | "startup_failure"
+    | null;
+  /** Workflow run ID — set when status=completed for Actions checks; null for other check providers. */
+  readonly runId: number | null;
+}
+
 export interface GithubGateway {
   /** Push a branch to origin. */
   pushBranch(repoPath: string, branch: string): Effect.Effect<void, GithubError>;
@@ -170,6 +195,38 @@ export interface GithubGateway {
     baseBranch: string;
     branch: string;
   }): Effect.Effect<readonly string[], GithubError>;
+  /**
+   * VA-462: list check runs for a specific commit SHA. Used by the
+   * CI failure watcher to spot `conclusion: failure` on the PR's
+   * head SHA. Returns an empty list when the SHA has no check runs
+   * yet (e.g., right after a force-push, before CI started).
+   */
+  getCheckRuns(args: {
+    repoPath: string;
+    sha: string;
+  }): Effect.Effect<readonly CheckRun[], GithubError>;
+  /**
+   * VA-462: list required-status-check context names from branch
+   * protection. Returns `null` when the protection rule isn't
+   * accessible (no admin scope, or the branch isn't protected) — the
+   * watcher then conservatively treats every check as required so a
+   * silent misconfiguration can't make CI failures invisible.
+   */
+  getRequiredChecks(args: {
+    repoPath: string;
+    baseBranch: string;
+  }): Effect.Effect<readonly string[] | null, GithubError>;
+  /**
+   * VA-462: fetch the trailing `lines` of a workflow run's failed-
+   * step log. Used to populate the re-impl prompt with the agent
+   * context. Returns the empty string when no logs are available
+   * (cancelled / startup_failure / non-Actions check providers).
+   */
+  getCheckRunLogTail(args: {
+    repoPath: string;
+    runId: number;
+    lines: number;
+  }): Effect.Effect<string, GithubError>;
 }
 
 /**
@@ -332,6 +389,181 @@ export function createGithubGateway(): GithubGateway {
       );
     },
 
+    getCheckRuns({ repoPath, sha }) {
+      return applyGithubPolicy(
+        Effect.tryPromise({
+          try: async () => {
+            const { stdout } = await execa(
+              "gh",
+              [
+                "api",
+                `repos/{owner}/{repo}/commits/${sha}/check-runs`,
+                "--paginate",
+                "--jq",
+                ".check_runs[] | {id, name, status, conclusion, run_id: (.details_url | capture(\"/runs/(?<id>[0-9]+)\") | .id | tonumber? // null)}",
+              ],
+              { cwd: repoPath },
+            );
+            // `--jq` with the streaming form returns one JSON object
+            // per line. Empty stdout → no check runs yet.
+            const lines = stdout.split("\n").filter((s) => s.trim().length > 0);
+            return lines.map((line): CheckRun => {
+              const o = JSON.parse(line) as {
+                id: number;
+                name: string;
+                status: string;
+                conclusion: string | null;
+                run_id: number | null;
+              };
+              return {
+                id: o.id,
+                name: o.name,
+                status: canonicaliseCheckStatus(o.status),
+                conclusion: canonicaliseCheckConclusion(o.conclusion),
+                runId: typeof o.run_id === "number" ? o.run_id : null,
+              };
+            });
+          },
+          catch: (err) => {
+            if (isCommandMissing(err)) {
+              return new GhCliMissing({
+                message: `gh CLI not found on PATH (${err instanceof Error ? err.message : String(err)})`,
+              });
+            }
+            return new GithubReadFailed({
+              call: `getCheckRuns(${sha})`,
+              stderr: execaStderr(err),
+              message:
+                err instanceof Error
+                  ? err.message
+                  : `gh api check-runs failed: ${String(err)}`,
+            });
+          },
+        }),
+        {
+          call: `getCheckRuns(${sha})`,
+          timeoutMs: 15_000,
+          retryOn: (err) => err._tag === "GithubTimeout",
+        },
+      );
+    },
+
+    getRequiredChecks({ repoPath, baseBranch }) {
+      return applyGithubPolicy(
+        Effect.tryPromise({
+          try: async () => {
+            try {
+              const { stdout } = await execa(
+                "gh",
+                [
+                  "api",
+                  `repos/{owner}/{repo}/branches/${baseBranch}/protection/required_status_checks`,
+                  "--jq",
+                  ".contexts // []",
+                ],
+                { cwd: repoPath },
+              );
+              const trimmed = stdout.trim();
+              if (!trimmed) return null;
+              const parsed = JSON.parse(trimmed) as string[];
+              return parsed;
+            } catch (err) {
+              // 404 (branch not protected) and 403 (no admin) are
+              // both expected — fall back to "filter unknown" by
+              // returning null. The watcher treats null as
+              // "conservatively require all checks" so a missing
+              // protection rule can't silently hide failures.
+              const stderr = execaStderr(err);
+              if (
+                stderr.includes("404") ||
+                stderr.includes("403") ||
+                stderr.includes("Branch not protected")
+              ) {
+                return null;
+              }
+              throw err;
+            }
+          },
+          catch: (err) => {
+            if (isCommandMissing(err)) {
+              return new GhCliMissing({
+                message: `gh CLI not found on PATH (${err instanceof Error ? err.message : String(err)})`,
+              });
+            }
+            return new GithubReadFailed({
+              call: `getRequiredChecks(${baseBranch})`,
+              stderr: execaStderr(err),
+              message:
+                err instanceof Error
+                  ? err.message
+                  : `gh api branch-protection failed: ${String(err)}`,
+            });
+          },
+        }),
+        {
+          call: `getRequiredChecks(${baseBranch})`,
+          timeoutMs: 15_000,
+          retryOn: (err) => err._tag === "GithubTimeout",
+        },
+      );
+    },
+
+    getCheckRunLogTail({ repoPath, runId, lines }) {
+      return applyGithubPolicy(
+        Effect.tryPromise({
+          try: async () => {
+            try {
+              // `gh run view <id> --log-failed` is the supported way
+              // to fetch only the failed-step logs of an Actions run.
+              // Non-Actions checks have no runId and don't reach this
+              // path; the gateway caller maps `runId === null` to an
+              // empty tail upstream.
+              const { stdout } = await execa(
+                "gh",
+                ["run", "view", String(runId), "--log-failed"],
+                { cwd: repoPath },
+              );
+              const all = stdout.split("\n");
+              if (all.length <= lines) return stdout;
+              return all.slice(-lines).join("\n");
+            } catch (err) {
+              const stderr = execaStderr(err);
+              // 404 (run gone) or "no logs" → empty tail rather than
+              // throwing; the agent gets the check name only.
+              if (
+                stderr.includes("404") ||
+                stderr.includes("no logs") ||
+                stderr.includes("expired")
+              ) {
+                return "";
+              }
+              throw err;
+            }
+          },
+          catch: (err) => {
+            if (isCommandMissing(err)) {
+              return new GhCliMissing({
+                message: `gh CLI not found on PATH (${err instanceof Error ? err.message : String(err)})`,
+              });
+            }
+            return new GithubReadFailed({
+              call: `getCheckRunLogTail(${runId})`,
+              stderr: execaStderr(err),
+              message:
+                err instanceof Error
+                  ? err.message
+                  : `gh run view failed: ${String(err)}`,
+            });
+          },
+        }),
+        {
+          call: `getCheckRunLogTail(${runId})`,
+          timeoutMs: 30_000,
+          retryOn: (err) => err._tag === "GithubTimeout",
+        },
+      );
+    },
+
     getConflictFiles({ repoPath, baseBranch, branch }) {
       return applyGithubPolicy(
         Effect.tryPromise({
@@ -387,6 +619,41 @@ export function createGithubGateway(): GithubGateway {
       );
     },
   };
+}
+
+function canonicaliseCheckStatus(raw: string): CheckRun["status"] {
+  switch (raw.toLowerCase()) {
+    case "queued":
+      return "queued";
+    case "in_progress":
+      return "in_progress";
+    case "completed":
+      return "completed";
+    default:
+      // Unknown status — treat as queued so the watcher waits for a
+      // final conclusion rather than acting on intermediate state.
+      return "queued";
+  }
+}
+
+function canonicaliseCheckConclusion(
+  raw: string | null,
+): CheckRun["conclusion"] {
+  if (raw === null) return null;
+  switch (raw.toLowerCase()) {
+    case "success":
+    case "failure":
+    case "cancelled":
+    case "timed_out":
+    case "neutral":
+    case "skipped":
+    case "action_required":
+    case "stale":
+    case "startup_failure":
+      return raw.toLowerCase() as CheckRun["conclusion"];
+    default:
+      return null;
+  }
 }
 
 function canonicaliseMergeableState(raw: string): MergeableState {

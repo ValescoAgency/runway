@@ -2,9 +2,12 @@ import { claudeCode } from "@ai-hero/sandcastle";
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
 import { Duration, Effect } from "effect";
 import type { Config } from "./config.js";
-import type { GithubError, GithubGateway } from "./github.js";
+import type { CheckRun, GithubError, GithubGateway } from "./github.js";
 import type { RunwayIssue } from "./linear.js";
-import { renderShepherdRebasePrompt } from "./prompts.js";
+import {
+  renderShepherdCiFixPrompt,
+  renderShepherdRebasePrompt,
+} from "./prompts.js";
 import {
   dockerEnv,
   runSandcastle,
@@ -223,6 +226,272 @@ export function parseRebaseVerdict(output: string): RebaseAgentResult {
     reason: "rebase agent produced no IMPL: marker",
     conflictFiles: [],
   };
+}
+
+/**
+ * VA-462: shepherd subscription B — CI failure watcher.
+ *
+ * Polls `check-runs` for the PR's head SHA, filters to failures, and
+ * splits required vs. optional via branch protection. The first
+ * required failure each tick fires a `fix` action that launches
+ * sandcastle with the existing impl context + the log tail. Optional
+ * failures are logged and ignored — they don't burn iteration
+ * budget.
+ *
+ * Per-shepherd-pass de-dupe state lives in the watcher closure
+ * (`failureHistory`). The key is the check name; the value tracks
+ * the most-recently-seen (errorHash, sha, count). Three rules,
+ * applied in order:
+ *
+ *   1. Same `(name, errorHash, sha)` as the prior poll → quiet. We
+ *      already acted on this failure; the new commit hasn't started
+ *      CI yet (the AC's "don't re-act on stale SHA").
+ *   2. Same `(name, errorHash)` on a NEW sha → increment counter.
+ *      Reaching 3 consecutive identical failures across SHAs →
+ *      `hitl` with the AC's canonical reason.
+ *   3. Anything else (new check, different error, fresh window) →
+ *      reset counter to 1 and fire `fix`.
+ */
+export type CiFixAgentResult =
+  | { readonly kind: "done" }
+  | { readonly kind: "blocked"; readonly reason: string };
+
+export interface CiFixAgentInvocation {
+  readonly issue: RunwayIssue;
+  readonly branch: string;
+  readonly checkName: string;
+  readonly logTail: string;
+  readonly cwd: string;
+  readonly config: Config;
+}
+
+/**
+ * Production CI-fix invocation: render the prompt, run one sandcastle
+ * iteration, parse the verdict. Tests stub via the watcher deps.
+ */
+export const defaultInvokeCiFixAgent = (
+  args: CiFixAgentInvocation,
+): Effect.Effect<CiFixAgentResult, { readonly message: string }> =>
+  Effect.gen(function* () {
+    const prompt = yield* Effect.promise(() =>
+      renderShepherdCiFixPrompt({
+        issue: args.issue,
+        branch: args.branch,
+        checkName: args.checkName,
+        logTail: args.logTail,
+      }),
+    );
+    const result = yield* runSandcastle({
+      agent: claudeCode("claude-opus-4-7"),
+      sandbox: docker({ env: dockerEnv(args.config) }),
+      cwd: args.cwd,
+      prompt,
+      branchStrategy: { type: "branch", branch: args.branch },
+      maxIterations: 1,
+      name: `shepherd-ci-fix-${args.issue.identifier}-${sanitiseCheckName(args.checkName)}`,
+    });
+    return parseCiFixVerdict(stringifyResult(result));
+  });
+
+/**
+ * Parse the CI-fix agent's verdict. Mirrors `parseRebaseVerdict` — same
+ * IMPL: DONE / IMPL: BLOCKED markers, same fallback to BLOCKED when
+ * no marker fires.
+ */
+export function parseCiFixVerdict(output: string): CiFixAgentResult {
+  const blocked = output.match(/^IMPL:\s*BLOCKED(?:\s*[—-]\s*(.*))?$/im);
+  if (blocked) {
+    return { kind: "blocked", reason: (blocked[1] ?? "").trim() };
+  }
+  if (/^IMPL:\s*DONE\b/im.test(output)) {
+    return { kind: "done" };
+  }
+  return {
+    kind: "blocked",
+    reason: "ci-fix agent produced no IMPL: marker",
+  };
+}
+
+/**
+ * VA-462: stable hash for a log tail used as the de-dup key. Just a
+ * cheap DJB2 — collisions don't cause correctness issues here (worst
+ * case is one extra re-impl), and we want determinism without a crypto
+ * import.
+ */
+function hashLogTail(s: string): string {
+  let hash = 5381;
+  for (let i = 0; i < s.length; i++) {
+    hash = ((hash << 5) + hash + s.charCodeAt(i)) | 0;
+  }
+  return String(hash);
+}
+
+function sanitiseCheckName(name: string): string {
+  return name.replace(/[^a-z0-9_-]+/gi, "-").slice(0, 40);
+}
+
+interface CiFailureRecord {
+  readonly errorHash: string;
+  readonly count: number;
+  readonly sha: string;
+}
+
+export interface CiWatcherDeps {
+  readonly github: GithubGateway;
+  readonly config: Config;
+  /** Production default; tests inject a stub. */
+  readonly invokeCiFixAgent?: typeof defaultInvokeCiFixAgent;
+  /**
+   * VA-462 AC: 3 consecutive identical failures (across SHAs) →
+   * HITL. Exposed as a knob mostly for tests, which set it to 2 so
+   * the dedup escalation fires without 3 mock sequences.
+   */
+  readonly maxConsecutiveSameFailure?: number;
+}
+
+const DEFAULT_MAX_CONSECUTIVE_SAME_FAILURE = 3;
+
+export function makeCiWatcher(deps: CiWatcherDeps): Subscription {
+  const invoke = deps.invokeCiFixAgent ?? defaultInvokeCiFixAgent;
+  const maxConsecutive =
+    deps.maxConsecutiveSameFailure ?? DEFAULT_MAX_CONSECUTIVE_SAME_FAILURE;
+  // Per-PR-shepherd state. The closure lives for the duration of one
+  // runShepherdPass invocation; a new PR opens fresh history.
+  const failureHistory = new Map<string, CiFailureRecord>();
+
+  return (ctx) =>
+    Effect.gen(function* () {
+      const pr = yield* deps.github.getPullRequest({
+        repoPath: ctx.cwd,
+        prNumber: ctx.prNumber,
+      });
+
+      // Merged PRs short-circuit before we burn an API call on
+      // check-runs. The merge-check upstream is the canonical exit;
+      // this is defense-in-depth.
+      if (pr.merged) return { kind: "quiet" } as const;
+
+      const checkRuns = yield* deps.github.getCheckRuns({
+        repoPath: ctx.cwd,
+        sha: pr.headSha,
+      });
+
+      const failing = checkRuns.filter(
+        (c) => c.status === "completed" && c.conclusion === "failure",
+      );
+      if (failing.length === 0) return { kind: "quiet" } as const;
+
+      // Branch-protection lookup can return null (no admin / no
+      // protection rule); the watcher then treats every check as
+      // required to err on the side of acting on failures rather
+      // than swallowing them silently.
+      const required = yield* deps.github.getRequiredChecks({
+        repoPath: ctx.cwd,
+        baseBranch: ctx.baseBranch,
+      });
+
+      const requiredFailing: readonly CheckRun[] =
+        required === null
+          ? failing
+          : failing.filter((c) => required.includes(c.name));
+
+      if (requiredFailing.length === 0) {
+        // Optional failures: surface in logs so the operator sees
+        // them but don't burn iteration budget. The AC pinpoints
+        // exactly this behavior.
+        const names = failing.map((c) => c.name).join(", ");
+        yield* Effect.logInfo(
+          `${ctx.issue.identifier}: shepherd.ci.optional_failure pr=${pr.number} checks=${names} (no action)`,
+        );
+        return { kind: "quiet" } as const;
+      }
+
+      // First required failure wins for this tick. The next iteration
+      // (after the fix lands) re-polls and picks up whatever's still
+      // broken.
+      const first = requiredFailing[0]!;
+      const logTail =
+        first.runId !== null
+          ? yield* deps.github.getCheckRunLogTail({
+              repoPath: ctx.cwd,
+              runId: first.runId,
+              lines: 50,
+            })
+          : "";
+
+      const errorHash = hashLogTail(logTail);
+      const prior = failureHistory.get(first.name);
+
+      // Rule 1: identical failure on the same SHA → quiet (already acted).
+      if (
+        prior &&
+        prior.errorHash === errorHash &&
+        prior.sha === pr.headSha
+      ) {
+        return { kind: "quiet" } as const;
+      }
+
+      // Rule 2: identical failure on a NEW SHA → escalate after the
+      // configured threshold.
+      if (prior && prior.errorHash === errorHash) {
+        const newCount = prior.count + 1;
+        failureHistory.set(first.name, {
+          errorHash,
+          count: newCount,
+          sha: pr.headSha,
+        });
+        if (newCount >= maxConsecutive) {
+          const lastLine = lastNonEmptyLine(logTail);
+          return {
+            kind: "hitl",
+            reason: `Repeated CI failure in \`${first.name}\`: ${lastLine}`,
+          } as const;
+        }
+        // else: fall through to fix
+      } else {
+        // Rule 3: fresh failure window.
+        failureHistory.set(first.name, {
+          errorHash,
+          count: 1,
+          sha: pr.headSha,
+        });
+      }
+
+      const checkName = first.name;
+      return {
+        kind: "fix",
+        description: `Re-impl after CI failure in \`${checkName}\``,
+        action: Effect.gen(function* () {
+          const result = yield* invoke({
+            issue: ctx.issue,
+            branch: ctx.branch,
+            checkName,
+            logTail,
+            cwd: ctx.cwd,
+            config: deps.config,
+          });
+          if (result.kind === "blocked") {
+            return {
+              kind: "hitl",
+              reason: `CI fix BLOCKED in \`${checkName}\`: ${result.reason}`,
+            } as const;
+          }
+          return {
+            kind: "fixed",
+            detail: `Re-impl after \`${checkName}\` failure`,
+          } as const;
+        }),
+      } as const;
+    });
+}
+
+function lastNonEmptyLine(s: string): string {
+  const lines = s.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!.trim();
+    if (line.length > 0) return line;
+  }
+  return "(empty log)";
 }
 
 function extractConflictFilesFromReason(reason: string): readonly string[] {
