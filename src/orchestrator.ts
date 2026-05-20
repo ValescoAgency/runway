@@ -17,7 +17,7 @@ import {
   makeCiWatcher,
   makeIsMerged,
   makeMergeabilityWatcher,
-  reviewerStub,
+  makeReviewerWatcher,
   runShepherdPass,
 } from "./shepherd.js";
 import {
@@ -508,10 +508,12 @@ const processIssue = (
               cwd: deps.cwd,
               baseBranch: deps.baseBranch,
               github: deps.github,
-              // VA-461 + VA-462: real mergeability + CI watchers,
-              // wired ahead of the still-stubbed reviewer subscription
-              // (VA-463). Mergeability runs first because conflicts
-              // would prevent CI from even running on the new base.
+              // VA-461 / VA-462 / VA-463: three real subscriptions
+              // wired in precedence order. Mergeability runs first
+              // (a dirty base would prevent CI from even running);
+              // CI second; reviewer feedback last (CI fixes that
+              // address reviewer concerns push commits which will
+              // be seen on the next tick).
               isMerged: makeIsMerged(deps.github),
               subscriptions: [
                 makeMergeabilityWatcher({
@@ -522,7 +524,10 @@ const processIssue = (
                   github: deps.github,
                   config: deps.config,
                 }),
-                reviewerStub,
+                makeReviewerWatcher({
+                  github: deps.github,
+                  config: deps.config,
+                }),
               ],
             },
             branch,

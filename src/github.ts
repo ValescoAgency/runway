@@ -139,6 +139,26 @@ export interface PullRequestState {
 }
 
 /**
+ * VA-463: a single comment on a PR — either a top-level discussion
+ * comment, a review-thread inline comment, or a review summary
+ * comment. The gateway flattens all three sources into one stream
+ * so the shepherd's reviewer watcher can reason about chronological
+ * order without juggling endpoints.
+ */
+export interface PrComment {
+  /** Stable, unique within the repo for the comment's source. */
+  readonly id: number;
+  /** GitHub login of the comment's author. Empty string for system / app comments with no user. */
+  readonly authorLogin: string;
+  /** Raw markdown body as posted. */
+  readonly body: string;
+  /** Unix timestamp in seconds when the comment was posted. */
+  readonly createdAtUnixSeconds: number;
+  /** Which endpoint surfaced this comment — useful when the watcher needs to round-trip a reply. */
+  readonly source: "issue" | "review" | "review-summary";
+}
+
+/**
  * VA-462: a single check run from
  * `GET /repos/:owner/:repo/commits/:sha/check-runs`. We narrow the
  * GitHub-returned conclusion enum to the values runway actually
@@ -227,6 +247,18 @@ export interface GithubGateway {
     runId: number;
     lines: number;
   }): Effect.Effect<string, GithubError>;
+  /**
+   * VA-463: fetch every comment on the PR — top-level issue
+   * comments, review-thread inline comments, and review summary
+   * comments — flattened and sorted by `createdAtUnixSeconds`
+   * ascending. The shepherd's reviewer watcher partitions by author
+   * to decide whether to parse a `REVIEW:` marker or treat the body
+   * as a verbatim human comment.
+   */
+  getPullRequestComments(args: {
+    repoPath: string;
+    prNumber: number;
+  }): Effect.Effect<readonly PrComment[], GithubError>;
 }
 
 /**
@@ -558,6 +590,95 @@ export function createGithubGateway(): GithubGateway {
         }),
         {
           call: `getCheckRunLogTail(${runId})`,
+          timeoutMs: 30_000,
+          retryOn: (err) => err._tag === "GithubTimeout",
+        },
+      );
+    },
+
+    getPullRequestComments({ repoPath, prNumber }) {
+      return applyGithubPolicy(
+        Effect.tryPromise({
+          try: async () => {
+            // Three endpoints, three flavors of comment. We fetch
+            // them in parallel and merge by createdAt — keeping
+            // source labels so the watcher knows where each one
+            // came from if it ever needs to round-trip a reply.
+            const fetchJson = async (path: string, jq: string) => {
+              const { stdout } = await execa(
+                "gh",
+                ["api", path, "--paginate", "--jq", jq],
+                { cwd: repoPath },
+              );
+              const lines = stdout
+                .split("\n")
+                .filter((s) => s.trim().length > 0);
+              return lines.map((line) => JSON.parse(line) as Record<string, unknown>);
+            };
+            const projection =
+              ".[] | {id, body, login: (.user.login // \"\"), created_at}";
+            const [issueComments, reviewComments, reviewSummaries] =
+              await Promise.all([
+                fetchJson(
+                  `repos/{owner}/{repo}/issues/${prNumber}/comments`,
+                  projection,
+                ),
+                fetchJson(
+                  `repos/{owner}/{repo}/pulls/${prNumber}/comments`,
+                  projection,
+                ),
+                // Review summaries omit empty bodies (a review can be
+                // submitted with no top-level body — only inline
+                // comments). The `select(.body != "")` filter drops
+                // those so they don't show up as ghost entries.
+                fetchJson(
+                  `repos/{owner}/{repo}/pulls/${prNumber}/reviews`,
+                  ".[] | select(.body != \"\" and .body != null) | {id, body, login: (.user.login // \"\"), submitted_at}",
+                ),
+              ]);
+            const norm = (
+              o: Record<string, unknown>,
+              source: PrComment["source"],
+              tsField: "created_at" | "submitted_at",
+            ): PrComment => ({
+              id: Number(o.id ?? 0),
+              authorLogin: String(o.login ?? ""),
+              body: String(o.body ?? ""),
+              createdAtUnixSeconds: Math.floor(
+                new Date(String(o[tsField] ?? 0)).getTime() / 1000,
+              ),
+              source,
+            });
+            const merged: PrComment[] = [
+              ...issueComments.map((c) => norm(c, "issue", "created_at")),
+              ...reviewComments.map((c) => norm(c, "review", "created_at")),
+              ...reviewSummaries.map((c) =>
+                norm(c, "review-summary", "submitted_at"),
+              ),
+            ];
+            merged.sort(
+              (a, b) => a.createdAtUnixSeconds - b.createdAtUnixSeconds,
+            );
+            return merged;
+          },
+          catch: (err) => {
+            if (isCommandMissing(err)) {
+              return new GhCliMissing({
+                message: `gh CLI not found on PATH (${err instanceof Error ? err.message : String(err)})`,
+              });
+            }
+            return new GithubReadFailed({
+              call: `getPullRequestComments(${prNumber})`,
+              stderr: execaStderr(err),
+              message:
+                err instanceof Error
+                  ? err.message
+                  : `gh api comments failed: ${String(err)}`,
+            });
+          },
+        }),
+        {
+          call: `getPullRequestComments(${prNumber})`,
           timeoutMs: 30_000,
           retryOn: (err) => err._tag === "GithubTimeout",
         },

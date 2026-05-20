@@ -114,6 +114,10 @@ function makeGithub(): GithubGateway {
     getCheckRuns: vi.fn().mockReturnValue(Effect.succeed([])),
     getRequiredChecks: vi.fn().mockReturnValue(Effect.succeed([])),
     getCheckRunLogTail: vi.fn().mockReturnValue(Effect.succeed("")),
+    // VA-463: reviewer watcher consumes this. Empty list = no new
+    // comments to respond to; combined with the watcher's
+    // initial-snapshot priming, this is the quiet path.
+    getPullRequestComments: vi.fn().mockReturnValue(Effect.succeed([])),
   };
 }
 
