@@ -14,7 +14,7 @@ import {
 } from "./prompts.js";
 import { runReviewPass } from "./review.js";
 import {
-  ciStub,
+  makeCiWatcher,
   makeIsMerged,
   makeMergeabilityWatcher,
   reviewerStub,
@@ -508,16 +508,20 @@ const processIssue = (
               cwd: deps.cwd,
               baseBranch: deps.baseBranch,
               github: deps.github,
-              // VA-461: real mergeability watcher + merge check; the
-              // other two subscriptions stay as no-op stubs until
-              // VA-462 (CI) and VA-463 (reviewer feedback) land.
+              // VA-461 + VA-462: real mergeability + CI watchers,
+              // wired ahead of the still-stubbed reviewer subscription
+              // (VA-463). Mergeability runs first because conflicts
+              // would prevent CI from even running on the new base.
               isMerged: makeIsMerged(deps.github),
               subscriptions: [
                 makeMergeabilityWatcher({
                   github: deps.github,
                   config: deps.config,
                 }),
-                ciStub,
+                makeCiWatcher({
+                  github: deps.github,
+                  config: deps.config,
+                }),
                 reviewerStub,
               ],
             },
