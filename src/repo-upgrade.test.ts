@@ -16,6 +16,7 @@ import { writeShim } from "./scaffolder-varlock.js";
 import {
   composeAndApplyScaffoldChanges,
   parseOpRefs,
+  renderDockerfile,
 } from "./repo-upgrade.js";
 
 // `varlock` invokes 1Password via a `<execName>("op read ...")` DSL.
@@ -321,5 +322,74 @@ describe("composeAndApplyScaffoldChanges (VA-426 — tier-2 composition)", () =>
     ).rejects.toThrow(/__process_exit__\(0\)/);
 
     expect(exitSpy).toHaveBeenCalledWith(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// VA-466: history-aware manual-edit detector
+// ---------------------------------------------------------------------------
+
+describe("renderDockerfile manual-edit detector (VA-466)", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "runway-detector-"));
+    mkdirSync(join(tmpDir, ".sandcastle"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  const opts = {
+    check: false,
+    skipBuild: true,
+    allowDirty: true,
+    force: false,
+  } as const;
+
+  it("does NOT flag a Dockerfile rendered by the previous canonical template (history union)", () => {
+    // The FFL manager regression: a target Dockerfile written by an
+    // older runway diverges from the current template only in lines
+    // the prior canonical template owned. Pre-VA-466 the detector
+    // treated every cross-version delta as a manual edit and forced
+    // operators to pass --force; that's a false positive.
+    const v013 = readFileSync(
+      join(TEMPLATES_DIR, "history", "Dockerfile.claude-code.base.v0.13.0"),
+      "utf8",
+    );
+    writeFileSync(join(tmpDir, ".sandcastle", "Dockerfile"), v013);
+
+    expect(() => renderDockerfile(tmpDir, 1, opts, true)).not.toThrow();
+  });
+
+  it("STILL flags a genuine manual edit (a line absent from every known template)", () => {
+    // Defense-in-depth: the history union must not silently approve
+    // every diff — a foreign line that's not in the current template
+    // OR any historical snapshot must still trip the detector.
+    const v013 = readFileSync(
+      join(TEMPLATES_DIR, "history", "Dockerfile.claude-code.base.v0.13.0"),
+      "utf8",
+    );
+    const tampered = v013.replace(
+      /^WORKDIR \/home\/agent$/m,
+      'RUN echo "hello from operator"\nWORKDIR /home/agent',
+    );
+    writeFileSync(join(tmpDir, ".sandcastle", "Dockerfile"), tampered);
+
+    expect(() => renderDockerfile(tmpDir, 1, opts, true)).toThrow(
+      /manual Dockerfile edits detected/,
+    );
+  });
+
+  it("--force bypasses the detector even when foreign lines exist", () => {
+    writeFileSync(
+      join(tmpDir, ".sandcastle", "Dockerfile"),
+      'FROM scratch\nRUN echo "totally unrelated"\n',
+    );
+
+    expect(() =>
+      renderDockerfile(tmpDir, 1, { ...opts, force: true }, true),
+    ).not.toThrow();
   });
 });
