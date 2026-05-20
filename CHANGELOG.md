@@ -4,6 +4,19 @@ All notable changes to runway are documented here. Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); breaking
 changes bump the major.
 
+## 0.14.3 — 2026-05-20
+
+Patch release. One PR — the 0.14.2 dashboard image (which moved the base to Node 26 / SQLite 3.45+) crash-looped on boot against any `runway-dashboard-data` volume that had been touched by an earlier dashboard build, repeating `[runway dashboard] fatal: error in view evaluator_aggregates_v1: no such table: main.drains` with exponential backoff between Docker restarts. Fresh installs were unaffected. Anyone whose dashboard was running on 0.14.x and pulled 0.14.2 lost their dashboard until they nuked the volume; this release restores `runway dash upgrade` as a non-destructive operation across the 0.14 line.
+
+### Fixed
+
+- **Dashboard `createStorage` drops `evaluator_aggregates_v1` before the VA-455 legacy-DB table rebuild** ([PR #TBD](https://github.com/ValescoAgency/runway/pull/TBD), VA-469). Node 26 ships SQLite 3.45+, which validates view dependencies during DDL. On a persisted DB that had `evaluator_aggregates_v1` from an earlier boot AND a pre-VA-455 `drains` table (`end_time_unix_nano TEXT NOT NULL`), `relaxDrainsEndTimeNotNull`'s `ALTER TABLE drains_v2 RENAME TO drains` ran a view-compile pass that briefly couldn't resolve `drains` and rejected the whole transaction with the "no such table: main.drains" error. The fix runs `DROP VIEW IF EXISTS evaluator_aggregates_v1` before `relaxDrainsEndTimeNotNull`; `aggregatesViewDdl` unconditionally re-creates the view two lines later, so the fresh-install path is unchanged. New regression test in `src/dashboard/storage.test.ts` ("VA-469: opens cleanly against a legacy DB that has the view AND a NOT NULL drains.end_time_unix_nano") seeds a temp-file SQLite DB matching the legacy shape and asserts `createStorage` opens it cleanly; without the fix, the test fails with the exact production error verbatim. The bug only surfaced on 0.14.2 because the Node-24 image we shipped on 0.14.1 and earlier was on a SQLite version that didn't run the view-validation pass on RENAME.
+
+### Internal — release stats
+
+- **1 PR since 0.14.2** (1 fix).
+- 59 test files, 815 specs pass (+1 — the legacy-DB regression case).
+
 ## 0.14.2 — 2026-05-20
 
 Patch release. One PR — Docker Scout was reporting 17 high-severity CVEs against the published `runway-dashboard` image; investigation triaged them into 5 real (Debian `gnutls28` unpatched on `node:24-slim`'s bookworm base), 1 stale-index false positive (`picomatch` was already 4.0.4 in the image), and 11 BuildKit-provenance-attestation artifacts (no Go runtime in the container).

@@ -800,6 +800,15 @@ export function createStorage(
     }
   }
 
+  // VA-469: drop `evaluator_aggregates_v1` before the VA-455 rebuild.
+  // SQLite 3.45+ (bundled with Node 26) validates view dependencies
+  // during DDL, so `DROP TABLE drains` inside relaxDrainsEndTimeNotNull
+  // is rejected with `error in view evaluator_aggregates_v1: no such
+  // table: main.drains` when a legacy boot had already installed the
+  // view. The view is unconditionally recreated by `aggregatesViewDdl`
+  // below, so dropping it here is free on the fresh-install path too.
+  db.exec(`DROP VIEW IF EXISTS evaluator_aggregates_v1`);
+
   // VA-455: SQLite has no `ALTER COLUMN`, so relaxing the original
   // `end_time_unix_nano TEXT NOT NULL` constraint on legacy DBs
   // requires a table-rebuild. Only fire when PRAGMA reports the
