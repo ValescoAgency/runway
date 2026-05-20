@@ -168,6 +168,7 @@ describe("renderListView — Linear sync surfaces (VA-390)", () => {
       queuePosition: null,
       projectId: null,
       projectName: null,
+      statusType: "",
       ...over,
     };
   }
@@ -213,6 +214,27 @@ describe("renderListView — Linear sync surfaces (VA-390)", () => {
     expect(html).toContain("<th>Project</th>");
     expect(html).toContain("Runway");
     expect(html).toContain("e36f2b82-ed64-421c-91cb-955ef95a28ff");
+  });
+
+  // VA-453
+  it("renders a Status column with the workflow state name", () => {
+    const html = renderListView({
+      rows: [row()],
+      linearEnabled: true,
+      todoQueue: [
+        snapshot({
+          issueIdentifier: "VA-77",
+          status: "In Progress",
+          statusType: "started",
+          title: "doing the thing",
+          labels: [],
+          queuePosition: 0,
+        }),
+      ],
+      snapshotsByIdentifier: new Map(),
+    });
+    expect(html).toContain("<th>Status</th>");
+    expect(html).toContain("In Progress");
   });
 
   // VA-450

@@ -43,6 +43,16 @@ export interface LinearSnapshot {
   readonly labels: readonly string[];
   readonly projectId: string | null;
   readonly projectName: string | null;
+  /**
+   * VA-453: Linear's `WorkflowState.type` — one of `triage`, `backlog`,
+   * `unstarted`, `started`, `completed`, `canceled`. The sync poller
+   * uses this to drop `completed` / `canceled` rows from the Todo
+   * queue preview even when they still carry the `ready-for-agent`
+   * label. Filtering by type (not by display name) means a team
+   * renaming "Cancelled" to "Won't fix" doesn't silently disable the
+   * filter. Defaults to `""` when Linear didn't return a state.
+   */
+  readonly statusType: string;
 }
 
 /**
@@ -98,7 +108,10 @@ export function createLinearAdapter(opts: LinearAdapterOptions): LinearAdapter {
   async function snapshotFromIssue(raw: {
     identifier: string;
     title: string;
-    state?: Promise<{ name: string } | undefined>;
+    // VA-453: `state.type` is the canonical workflow-state category
+    // (triage / backlog / unstarted / started / completed / canceled).
+    // The sync poller uses it to filter the Todo queue preview.
+    state?: Promise<{ name: string; type: string } | undefined>;
     labels: () => Promise<{ nodes: ReadonlyArray<{ name: string }> }>;
     // VA-450: Linear SDK exposes `project` as a lazy Promise on Issue.
     // It resolves to `undefined` for unprojected issues; we normalise
@@ -115,6 +128,7 @@ export function createLinearAdapter(opts: LinearAdapterOptions): LinearAdapter {
       identifier: raw.identifier,
       title: raw.title,
       status: state?.name ?? "",
+      statusType: state?.type ?? "",
       labels: labels.nodes.map((l) => l.name),
       projectId: project?.id ?? null,
       projectName: project?.name ?? null,
@@ -244,18 +258,29 @@ export function startLinearSync(opts: LinearSyncOptions): LinearSyncHandle {
       // the preview.
       opts.storage.clearLinearQueuePositions();
       const at = new Date().toISOString();
-      queue.forEach((q, i) => {
+      // VA-453: issues whose Linear workflow-state type is `completed`
+      // or `canceled` get saved without a queue position so they drop
+      // out of the Todo queue preview even when they still carry the
+      // `ready-for-agent` label. The snapshot row stays in
+      // linear_snapshots so per-row status badges on the
+      // issue-process list continue to resolve.
+      let position = 0;
+      queue.forEach((q) => {
         queuedIds.add(q.identifier);
+        const isInactive =
+          q.statusType === "completed" || q.statusType === "canceled";
         opts.storage.saveLinearSnapshot({
           issueIdentifier: q.identifier,
           snapshotAt: at,
           status: q.status,
+          statusType: q.statusType,
           title: q.title,
           labels: q.labels,
-          queuePosition: i,
+          queuePosition: isInactive ? null : position,
           projectId: q.projectId,
           projectName: q.projectName,
         });
+        if (!isInactive) position += 1;
       });
       log(
         "info",
@@ -281,6 +306,7 @@ export function startLinearSync(opts: LinearSyncOptions): LinearSyncHandle {
             issueIdentifier: r.identifier,
             snapshotAt: at,
             status: r.status,
+            statusType: r.statusType,
             title: r.title,
             labels: r.labels,
             queuePosition: null,
