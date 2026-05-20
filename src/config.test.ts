@@ -168,6 +168,42 @@ describe("VA-359 — Effect.Config + Redacted secrets", () => {
     ).toThrow(/positive integer/);
   });
 
+  it("VA-464: shepherdMaxIterations defaults to 3 and parses RUNWAY_SHEPHERD_MAX_ITERATIONS", () => {
+    expect(
+      loadConfig({ LINEAR_API_KEY: "lin_test" }).shepherdMaxIterations,
+    ).toBe(3);
+    expect(
+      loadConfig({
+        LINEAR_API_KEY: "lin_test",
+        RUNWAY_SHEPHERD_MAX_ITERATIONS: "5",
+      }).shepherdMaxIterations,
+    ).toBe(5);
+    expect(() =>
+      loadConfig({
+        LINEAR_API_KEY: "lin_test",
+        RUNWAY_SHEPHERD_MAX_ITERATIONS: "0",
+      }),
+    ).toThrow(/positive integer/);
+  });
+
+  it("VA-464: shepherdMaxWallSeconds defaults to 3600 and parses RUNWAY_SHEPHERD_MAX_WALL_SECONDS", () => {
+    expect(
+      loadConfig({ LINEAR_API_KEY: "lin_test" }).shepherdMaxWallSeconds,
+    ).toBe(3600);
+    expect(
+      loadConfig({
+        LINEAR_API_KEY: "lin_test",
+        RUNWAY_SHEPHERD_MAX_WALL_SECONDS: "900",
+      }).shepherdMaxWallSeconds,
+    ).toBe(900);
+    expect(() =>
+      loadConfig({
+        LINEAR_API_KEY: "lin_test",
+        RUNWAY_SHEPHERD_MAX_WALL_SECONDS: "-1",
+      }),
+    ).toThrow(/positive integer/);
+  });
+
   it("ConfigLive Layer provides the resolved config via ConfigTag", async () => {
     const ConfigLayer = makeConfigLive({ LINEAR_API_KEY: "lin_layer_test" });
     const program = Effect.gen(function* () {

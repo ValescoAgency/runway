@@ -102,8 +102,28 @@ export interface ShepherdDeps {
   readonly subscriptions?: readonly Subscription[];
   /** Override for tests; production reads `config.shepherdPollIntervalSeconds`. */
   readonly pollIntervalSeconds?: number;
-  /** Override for tests; production hardcodes 3 (becomes config in VA-464). */
-  readonly maxIterations?: number;
+  /**
+   * VA-460: max consecutive QUIET poll cycles before exiting `ready`.
+   * Quiet polls (no merge, no subscription fire) are the "PR is
+   * calm" signal — after `maxQuietPolls` of them in a row, the
+   * shepherd presumes the PR is ready for human merge and exits. This
+   * is NOT a budget — it's a natural-exit threshold.
+   * Default: 5. Tests override to drive fast `ready` outcomes.
+   */
+  readonly maxQuietPolls?: number;
+  /**
+   * VA-464: max FIX attempts the loop will make before escalating to
+   * HITL with the iteration-budget reason. Each `fix` signal that
+   * runs an action counts as one. Production reads
+   * `config.shepherdMaxIterations`. Override for tests.
+   */
+  readonly maxFixAttempts?: number;
+  /**
+   * VA-464: wall-clock cap (seconds) from the start of the
+   * runShepherdPass invocation. Production reads
+   * `config.shepherdMaxWallSeconds`. Override for tests.
+   */
+  readonly maxWallSeconds?: number;
 }
 
 export type ShepherdOutcome =
@@ -112,12 +132,12 @@ export type ShepherdOutcome =
   | { readonly kind: "hitl"; readonly reason: string };
 
 /**
- * VA-464 follow-up will read this from `config.shepherdMaxIterations`.
- * Hardcoded here so the scaffolding ships without a half-finished
- * config knob — the feature gate keeps the loop from running in
- * production until VA-461..463 land anyway.
+ * VA-460: "PR has been calm long enough — presume ready for human
+ * merge" default. Not a budget; just the natural-exit threshold for
+ * the loop when nothing is happening. Override via
+ * `ShepherdDeps.maxQuietPolls` for tests.
  */
-const DEFAULT_MAX_ITERATIONS = 3;
+const DEFAULT_MAX_QUIET_POLLS = 5;
 
 const DEFAULT_NO_OP_MERGE_CHECK: MergeCheck = () => Effect.succeed(false);
 
@@ -910,16 +930,43 @@ export const runShepherdPass = (
     const prNumber = parsePrNumber(prUrl);
     const isMerged = deps.isMerged ?? DEFAULT_NO_OP_MERGE_CHECK;
     const subscriptions = deps.subscriptions ?? DEFAULT_SUBSCRIPTIONS;
-    const maxIterations = deps.maxIterations ?? DEFAULT_MAX_ITERATIONS;
+    const maxQuietPolls = deps.maxQuietPolls ?? DEFAULT_MAX_QUIET_POLLS;
+    const maxFixAttempts =
+      deps.maxFixAttempts ?? deps.config.shepherdMaxIterations;
+    const maxWallSeconds =
+      deps.maxWallSeconds ?? deps.config.shepherdMaxWallSeconds;
     const pollSeconds =
       deps.pollIntervalSeconds ?? deps.config.shepherdPollIntervalSeconds;
 
+    const startMs = Date.now();
+    let fixCount = 0;
+    let quietStreak = 0;
+    let lastAction = "(none)";
+    let pollIndex = 0;
+
     yield* Effect.logInfo(
       `${issue.identifier}: shepherd.start pr=${prUrl} branch=${branch} ` +
-        `maxIterations=${maxIterations} pollSeconds=${pollSeconds}`,
+        `maxFixAttempts=${maxFixAttempts} maxWallSeconds=${maxWallSeconds} ` +
+        `maxQuietPolls=${maxQuietPolls} pollSeconds=${pollSeconds}`,
     );
 
-    for (let iteration = 1; iteration <= maxIterations; iteration++) {
+    while (true) {
+      pollIndex++;
+
+      // VA-464: wall-clock budget — checked at the top of every poll
+      // so a stuck subscription action that takes minutes can still
+      // be capped by it. Fires before merge / subscription work to
+      // avoid spending one more API call on an already-doomed loop.
+      const elapsedMs = Date.now() - startMs;
+      if (elapsedMs >= maxWallSeconds * 1000) {
+        const reason =
+          `Shepherd wall-clock budget exhausted (${maxWallSeconds}s) — last action: ${lastAction}`;
+        yield* Effect.logInfo(
+          `${issue.identifier}: shepherd.hitl.wall-clock poll=${pollIndex} ${reason}`,
+        );
+        return { kind: "hitl", reason } as const;
+      }
+
       const ctx: ShepherdContext = {
         issue,
         branch,
@@ -929,13 +976,13 @@ export const runShepherdPass = (
         baseBranch: deps.baseBranch,
         config: deps.config,
         github: deps.github,
-        iteration,
+        iteration: pollIndex,
       };
 
       const merged = yield* isMerged(ctx);
       if (merged) {
         yield* Effect.logInfo(
-          `${issue.identifier}: shepherd.merged pr=${prUrl} iteration=${iteration}`,
+          `${issue.identifier}: shepherd.merged pr=${prUrl} poll=${pollIndex}`,
         );
         return { kind: "merged" } as const;
       }
@@ -943,47 +990,76 @@ export const runShepherdPass = (
       // First non-quiet signal wins — A/B/C are checked in declaration
       // order, so callers control precedence by ordering the array.
       let firedFix = false;
-      for (const sub of subscriptions) {
+      let subscriptionName = "(unknown)";
+      for (let i = 0; i < subscriptions.length; i++) {
+        const sub = subscriptions[i]!;
         const signal = yield* sub(ctx);
         if (signal.kind === "hitl") {
           yield* Effect.logInfo(
-            `${issue.identifier}: shepherd.hitl iteration=${iteration} reason=${signal.reason}`,
+            `${issue.identifier}: shepherd.hitl poll=${pollIndex} sub=${i} reason=${signal.reason}`,
           );
           return { kind: "hitl", reason: signal.reason } as const;
         }
         if (signal.kind === "fix") {
+          // VA-464: each fix counts against `maxFixAttempts`. Check
+          // BEFORE running the action so the count and the exhaustion
+          // exit are deterministic. The Nth fix is the LAST one we
+          // run — the (N+1)th attempt becomes the budget-exhausted
+          // hitl.
+          subscriptionName = `subscription[${i}]`;
+          if (fixCount >= maxFixAttempts) {
+            const reason =
+              `Shepherd iteration budget exhausted (${maxFixAttempts}) — last action: ${lastAction}`;
+            yield* Effect.logInfo(
+              `${issue.identifier}: shepherd.hitl.budget poll=${pollIndex} ${reason}`,
+            );
+            return { kind: "hitl", reason } as const;
+          }
+          fixCount++;
+          lastAction = `${subscriptionName} on "${signal.description}"`;
           yield* Effect.logInfo(
-            `${issue.identifier}: shepherd.fix.start iteration=${iteration} description=${signal.description}`,
+            `${issue.identifier}: shepherd.fix.start poll=${pollIndex} attempt=${fixCount}/${maxFixAttempts} description=${signal.description}`,
           );
           const out = yield* signal.action;
           if (out.kind === "hitl") {
             yield* Effect.logInfo(
-              `${issue.identifier}: shepherd.fix.hitl iteration=${iteration} reason=${out.reason}`,
+              `${issue.identifier}: shepherd.fix.hitl poll=${pollIndex} reason=${out.reason}`,
             );
             return { kind: "hitl", reason: out.reason } as const;
           }
           yield* Effect.logInfo(
-            `${issue.identifier}: shepherd.fix.done iteration=${iteration} detail=${out.detail}`,
+            `${issue.identifier}: shepherd.fix.done poll=${pollIndex} detail=${out.detail}`,
           );
           firedFix = true;
-          break; // Next iteration re-checks merged + subscriptions.
+          break;
         }
       }
-      // Quiet vs. fired-fix distinction matters for the test that
-      // asserts "no fix → next iteration after sleep" vs. "fix fired
-      // → next iteration immediately."
-      void firedFix;
 
-      // Sleep between polls — but not after the final iteration,
-      // since the loop is about to exit `ready` anyway.
-      if (iteration < maxIterations) {
-        yield* Effect.sleep(Duration.seconds(pollSeconds));
+      if (firedFix) {
+        // A fix just landed — reset the quiet streak; the new commit
+        // may produce CI activity / mergeability changes shortly.
+        quietStreak = 0;
+      } else {
+        quietStreak++;
+        if (quietStreak >= maxQuietPolls) {
+          const reason =
+            `shepherd quiet for ${maxQuietPolls} consecutive poll${maxQuietPolls === 1 ? "" : "s"} ` +
+            `with no merge and no actionable signals — PR ready for human merge`;
+          yield* Effect.logInfo(
+            `${issue.identifier}: shepherd.ready ${reason}`,
+          );
+          return { kind: "ready", reason } as const;
+        }
+      }
+
+      // Sleep between polls. Cap the sleep against the wall-clock
+      // budget so the next poll runs at the right moment even when
+      // the budget is about to fire.
+      const remainingMs = maxWallSeconds * 1000 - (Date.now() - startMs);
+      if (remainingMs <= 0) continue; // Wall-clock check at top will fire.
+      const sleepMs = Math.min(pollSeconds * 1000, remainingMs);
+      if (sleepMs > 0) {
+        yield* Effect.sleep(Duration.millis(sleepMs));
       }
     }
-
-    const reason =
-      `shepherd completed ${maxIterations} poll${maxIterations === 1 ? "" : "s"} ` +
-      `with no merge and no actionable signals — PR ready for human merge`;
-    yield* Effect.logInfo(`${issue.identifier}: shepherd.ready ${reason}`);
-    return { kind: "ready", reason } as const;
   }).pipe(Effect.withSpan("shepherd"));

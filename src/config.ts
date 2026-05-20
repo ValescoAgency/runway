@@ -197,6 +197,22 @@ export interface RunwayConfig {
    * human-feedback path. Source: `RUNWAY_PR_REVIEWER_BOT_LOGIN`.
    */
   readonly prReviewerBotLogin?: string;
+  /**
+   * VA-464: max fix-attempts the shepherd loop will make per PR
+   * before escalating to HITL. Each time a subscription emits a
+   * `fix` signal counts as one iteration; quiet polls don't count.
+   * Default `3`. Source: `RUNWAY_SHEPHERD_MAX_ITERATIONS`.
+   */
+  readonly shepherdMaxIterations: number;
+  /**
+   * VA-464: wall-clock budget for the shepherd loop per PR, in
+   * seconds, measured from the start of `runShepherdPass`. On
+   * exhaustion, exit HITL with the elapsed-time reason. Default
+   * `3600` (1 hour) — enough for several CI cycles + rebase
+   * attempts but bounded so a stuck PR can't run all night. Source:
+   * `RUNWAY_SHEPHERD_MAX_WALL_SECONDS`.
+   */
+  readonly shepherdMaxWallSeconds: number;
 }
 
 // Back-compat alias — existing consumers (orchestrator, gateways)
@@ -296,6 +312,24 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
   prReviewerBotLogin: EConfig.option(
     EConfig.string("RUNWAY_PR_REVIEWER_BOT_LOGIN"),
   ),
+  shepherdMaxIterations: EConfig.integer(
+    "RUNWAY_SHEPHERD_MAX_ITERATIONS",
+  ).pipe(
+    EConfig.withDefault(3),
+    EConfig.validate({
+      message: "RUNWAY_SHEPHERD_MAX_ITERATIONS must be a positive integer",
+      validation: (n): n is number => n > 0,
+    }),
+  ),
+  shepherdMaxWallSeconds: EConfig.integer(
+    "RUNWAY_SHEPHERD_MAX_WALL_SECONDS",
+  ).pipe(
+    EConfig.withDefault(3600),
+    EConfig.validate({
+      message: "RUNWAY_SHEPHERD_MAX_WALL_SECONDS must be a positive integer",
+      validation: (n): n is number => n > 0,
+    }),
+  ),
 }).pipe(
   Effect.map(
     (raw): RunwayConfig => ({
@@ -326,6 +360,8 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
       shepherdEnabled: raw.shepherdEnabled,
       shepherdPollIntervalSeconds: raw.shepherdPollIntervalSeconds,
       prReviewerBotLogin: Option.getOrUndefined(raw.prReviewerBotLogin),
+      shepherdMaxIterations: raw.shepherdMaxIterations,
+      shepherdMaxWallSeconds: raw.shepherdMaxWallSeconds,
     }),
   ),
 );

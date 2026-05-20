@@ -133,7 +133,7 @@ describe("runShepherdPass — VA-460 scaffolding", () => {
           isMerged,
           subscriptions: [QUIET],
           pollIntervalSeconds: 0,
-          maxIterations: 3,
+          maxQuietPolls: 3,
         },
         "agent/va-460",
         PR_URL,
@@ -158,7 +158,7 @@ describe("runShepherdPass — VA-460 scaffolding", () => {
           isMerged,
           subscriptions: [QUIET, QUIET, QUIET],
           pollIntervalSeconds: 0,
-          maxIterations: 3,
+          maxQuietPolls: 3,
         },
         "agent/va-460",
         PR_URL,
@@ -167,7 +167,7 @@ describe("runShepherdPass — VA-460 scaffolding", () => {
 
     expect(outcome.kind).toBe("ready");
     if (outcome.kind === "ready") {
-      expect(outcome.reason).toMatch(/3 polls/);
+      expect(outcome.reason).toMatch(/3 consecutive polls/);
     }
     expect(isMerged).toHaveBeenCalledTimes(3);
   });
@@ -189,7 +189,7 @@ describe("runShepherdPass — VA-460 scaffolding", () => {
           isMerged,
           subscriptions: [trippingSubSpy, lateSub],
           pollIntervalSeconds: 0,
-          maxIterations: 3,
+          maxQuietPolls: 3,
         },
         "agent/va-460",
         PR_URL,
@@ -217,7 +217,7 @@ describe("runShepherdPass — VA-460 scaffolding", () => {
           baseBranch: "main",
           github: makeGithub(),
           pollIntervalSeconds: 0,
-          maxIterations: 2,
+          maxQuietPolls: 2,
         },
         "agent/va-460",
         PR_URL,
@@ -507,7 +507,7 @@ describe("runShepherdPass — VA-461 integration", () => {
             makeMergeabilityWatcher({ github, config: makeConfig() }),
           ],
           pollIntervalSeconds: 0,
-          maxIterations: 3,
+          maxQuietPolls: 3,
         },
         "agent/va-460",
         PR_URL,
@@ -566,7 +566,7 @@ describe("runShepherdPass — VA-461 integration", () => {
             makeMergeabilityWatcher({ github, config: makeConfig() }),
           ],
           pollIntervalSeconds: 0,
-          maxIterations: 3,
+          maxQuietPolls: 3,
         },
         "agent/va-460",
         PR_URL,
@@ -1202,5 +1202,166 @@ describe("makeReviewerWatcher (VA-463)", () => {
     );
     expect(t3.kind).toBe("quiet");
     expect(invokeReviewerResponseAgent).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// VA-464 — budget knobs (maxFixAttempts + maxWallSeconds)
+// ---------------------------------------------------------------------------
+
+describe("runShepherdPass — VA-464 budget knobs", () => {
+  function makeFixSub(description: string): Subscription {
+    // Always returns a fix that succeeds. Drives the iteration
+    // counter without ever resolving the loop.
+    return () =>
+      Effect.succeed({
+        kind: "fix",
+        description,
+        action: Effect.succeed({ kind: "fixed", detail: "did stuff" }),
+      });
+  }
+
+  it("iteration budget: exits hitl after exactly maxFixAttempts fix attempts; reason names the last action", async () => {
+    const isMerged = vi.fn().mockReturnValue(Effect.succeed(false));
+    const sub = vi.fn(makeFixSub("rebase agent/x"));
+
+    const outcome = await Effect.runPromise(
+      runShepherdPass(
+        ISSUE,
+        {
+          config: makeConfig(),
+          cwd: "/tmp/repo",
+          baseBranch: "main",
+          github: makeGithub(),
+          isMerged,
+          subscriptions: [sub],
+          pollIntervalSeconds: 0,
+          maxFixAttempts: 3,
+          // Wall-clock far enough out that the iteration budget wins.
+          maxWallSeconds: 60,
+          // Quiet-polls floor is irrelevant here — every poll fires a fix.
+          maxQuietPolls: 999,
+        },
+        "agent/va-460",
+        PR_URL,
+      ),
+    );
+
+    expect(outcome.kind).toBe("hitl");
+    if (outcome.kind !== "hitl") return;
+    expect(outcome.reason).toContain("Shepherd iteration budget exhausted (3)");
+    expect(outcome.reason).toContain("last action:");
+    expect(outcome.reason).toContain("rebase agent/x");
+    // Exactly 3 fixes ran; the 4th poll detected exhaustion.
+    expect(sub).toHaveBeenCalledTimes(4);
+  });
+
+  it("wall-clock budget: exits hitl within ±1s of maxWallSeconds when the loop never resolves", async () => {
+    const isMerged = vi.fn().mockReturnValue(Effect.succeed(false));
+    // Quiet subscriptions — never fire. Without wall-clock, this
+    // would exit `ready` after maxQuietPolls. We set maxQuietPolls
+    // far above the wall-clock-window's polls so the budget wins.
+    const sub: Subscription = () => Effect.succeed({ kind: "quiet" });
+
+    const t0 = Date.now();
+    const outcome = await Effect.runPromise(
+      runShepherdPass(
+        ISSUE,
+        {
+          config: makeConfig(),
+          cwd: "/tmp/repo",
+          baseBranch: "main",
+          github: makeGithub(),
+          isMerged,
+          subscriptions: [sub],
+          // 0.2s sleep between polls × ~10 polls = 2s window.
+          pollIntervalSeconds: 0.2,
+          maxFixAttempts: 999,
+          maxWallSeconds: 2,
+          maxQuietPolls: 999,
+        },
+        "agent/va-460",
+        PR_URL,
+      ),
+    );
+    const elapsedMs = Date.now() - t0;
+
+    expect(outcome.kind).toBe("hitl");
+    if (outcome.kind !== "hitl") return;
+    expect(outcome.reason).toContain("Shepherd wall-clock budget exhausted (2s)");
+    expect(outcome.reason).toContain("last action:");
+    // ±1s tolerance per the AC. Lower bound: we shouldn't exit
+    // BEFORE the budget elapses; upper bound: pollInterval + scheduling jitter.
+    expect(elapsedMs).toBeGreaterThanOrEqual(1500);
+    expect(elapsedMs).toBeLessThanOrEqual(3500);
+  });
+
+  it("iteration budget fires BEFORE wall-clock when both could trigger and iterations exhaust first", async () => {
+    const isMerged = vi.fn().mockReturnValue(Effect.succeed(false));
+    const sub = makeFixSub("ci-fix on pnpm test");
+
+    const outcome = await Effect.runPromise(
+      runShepherdPass(
+        ISSUE,
+        {
+          config: makeConfig(),
+          cwd: "/tmp/repo",
+          baseBranch: "main",
+          github: makeGithub(),
+          isMerged,
+          subscriptions: [sub],
+          pollIntervalSeconds: 0,
+          maxFixAttempts: 1,
+          // Wall-clock could fire too — but iteration cap is 1 and
+          // we burn it on the first fix; the 2nd poll detects
+          // iteration exhaustion before wall-clock has elapsed.
+          maxWallSeconds: 60,
+          maxQuietPolls: 999,
+        },
+        "agent/va-460",
+        PR_URL,
+      ),
+    );
+
+    expect(outcome.kind).toBe("hitl");
+    if (outcome.kind !== "hitl") return;
+    expect(outcome.reason).toContain("iteration budget exhausted");
+    expect(outcome.reason).not.toContain("wall-clock");
+  });
+
+  it("defaults: ShepherdDeps without overrides reads maxFixAttempts + maxWallSeconds from config", async () => {
+    // Drive the iteration budget by setting config.shepherdMaxIterations to 2
+    // and confirming hitl fires after exactly 2 fix attempts.
+    const cfg = {
+      ...makeConfig(),
+      shepherdMaxIterations: 2,
+      shepherdMaxWallSeconds: 60,
+    } as unknown as Config;
+    const isMerged = vi.fn().mockReturnValue(Effect.succeed(false));
+    const sub = vi.fn(makeFixSub("act"));
+
+    const outcome = await Effect.runPromise(
+      runShepherdPass(
+        ISSUE,
+        {
+          config: cfg,
+          cwd: "/tmp/repo",
+          baseBranch: "main",
+          github: makeGithub(),
+          isMerged,
+          subscriptions: [sub],
+          pollIntervalSeconds: 0,
+          maxQuietPolls: 999,
+          // NO maxFixAttempts override — should read from config.
+        },
+        "agent/va-460",
+        PR_URL,
+      ),
+    );
+
+    expect(outcome.kind).toBe("hitl");
+    if (outcome.kind !== "hitl") return;
+    expect(outcome.reason).toContain("(2)");
+    expect(sub).toHaveBeenCalledTimes(3);
   });
 });

@@ -47,6 +47,8 @@ const config = {
   metaProjectName: "runway-meta",
   shepherdEnabled: false,
   shepherdPollIntervalSeconds: 15,
+  shepherdMaxIterations: 3,
+  shepherdMaxWallSeconds: 3600,
 } as const;
 
 beforeEach(() => {
