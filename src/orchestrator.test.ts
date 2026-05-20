@@ -349,6 +349,16 @@ describe("drainQueue impl marker behaviour (VA-350)", () => {
     expect(sandcastleRunMock.mock.calls[0]?.[0]).toMatchObject({
       completionSignal: ["IMPL: DONE", "IMPL: BLOCKED"],
     });
+    // VA-456: the reviewer must check out the impl agent's branch
+    // explicitly. A prior revision used `branchStrategy: { type: "head" }`
+    // and inherited whatever branch the operator happened to be on in
+    // the main checkout — the reviewer saw a working tree that didn't
+    // reconcile with the diff in its prompt and stalled silently for
+    // 10 min until sandcastle's idle timeout fired. Pin the contract:
+    // review.branchStrategy MUST name the impl branch.
+    expect(sandcastleRunMock.mock.calls[1]?.[0]).toMatchObject({
+      branchStrategy: { type: "branch", branch: "agent/va-312" },
+    });
     expect(github.openPullRequest).toHaveBeenCalled();
   });
 
