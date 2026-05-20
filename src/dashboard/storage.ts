@@ -1,11 +1,20 @@
 import { DatabaseSync } from "node:sqlite";
 import type {
+  ActiveDrainMarker,
   AgentIterationRow,
   DrainRow,
   IssueProcessRow,
   LogRecordRow,
   RawSpanRow,
 } from "./projector.js";
+
+/**
+ * VA-455: how stale a drain's last_seen can be before getActiveDrain
+ * treats it as crashed and hides it. Runway emits a heartbeat log
+ * every 30s while drainQueue is active; 90s gives 3× headroom so a
+ * single dropped heartbeat doesn't toggle the dashboard card.
+ */
+export const ACTIVE_DRAIN_STALENESS_NANOS = 90n * 1_000_000_000n;
 
 /**
  * VA-386 (dashboard slice 1): SQLite storage for the typed projections
@@ -175,6 +184,13 @@ export interface ActiveDrain {
 
 export interface Storage {
   saveDrain(d: DrainRow): void;
+  /**
+   * VA-455: record an in-flight drain ahead of its end span. Called
+   * for every `drain.started` log marker the projector surfaces. The
+   * insert is no-op once the drain has actually ended (end_time !=
+   * NULL) so late-arriving markers can't reanimate a closed drain.
+   */
+  markDrainActive(m: ActiveDrainMarker): void;
   saveIssueProcess(p: IssueProcessRow): void;
   saveAgentIteration(a: AgentIterationRow): void;
   saveRawSpan(r: RawSpanRow): void;
@@ -426,11 +442,17 @@ export interface StorageOptions {
 }
 
 const SCHEMA = `
+  -- VA-455: end_time_unix_nano is nullable so an "active drain" row
+  -- inserted by the drain.started log marker can exist before the
+  -- drainQueue span has actually ended. last_seen_unix_nano carries
+  -- the most recent log record's timestamp for the trace so the
+  -- dashboard's active-drain query can age out crashed drains.
   CREATE TABLE IF NOT EXISTS drains (
     trace_id TEXT NOT NULL,
     span_id TEXT NOT NULL,
     start_time_unix_nano TEXT NOT NULL,
-    end_time_unix_nano TEXT NOT NULL,
+    end_time_unix_nano TEXT,
+    last_seen_unix_nano TEXT,
     attempts INTEGER,
     opened INTEGER,
     hitl INTEGER,
@@ -570,6 +592,63 @@ const DEFAULT_AGGREGATE_WINDOW = 30;
  * of `hitl_escape_rate` — a review rejection routes to HITL, so both
  * rates count the same row.
  */
+/**
+ * VA-455: relax the `end_time_unix_nano TEXT NOT NULL` constraint on
+ * pre-VA-455 `drains` tables so the log-driven active-drain row can
+ * land with end_time = NULL. SQLite has no `ALTER COLUMN`, so the
+ * idiomatic move is a rebuild — guarded by PRAGMA so fresh installs
+ * (which already created the new schema) skip the work.
+ */
+function relaxDrainsEndTimeNotNull(db: DatabaseSync): void {
+  const cols = db
+    .prepare("PRAGMA table_info('drains')")
+    .all() as unknown as ReadonlyArray<{ name: string; notnull: number }>;
+  const endTime = cols.find((c) => c.name === "end_time_unix_nano");
+  if (!endTime || endTime.notnull === 0) return;
+
+  // Single transaction so the `drains` name is never absent from the
+  // schema between DROP and RENAME — concurrent readers (none today,
+  // but cheap insurance) keep seeing the old table until COMMIT.
+  db.prepare("BEGIN").run();
+  try {
+    db.prepare(
+      `CREATE TABLE drains_v2 (
+        trace_id TEXT NOT NULL,
+        span_id TEXT NOT NULL,
+        start_time_unix_nano TEXT NOT NULL,
+        end_time_unix_nano TEXT,
+        last_seen_unix_nano TEXT,
+        attempts INTEGER,
+        opened INTEGER,
+        hitl INTEGER,
+        errored INTEGER,
+        status_code INTEGER,
+        status_message TEXT,
+        inserted_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (trace_id, span_id)
+      )`,
+    ).run();
+    db.prepare(
+      `INSERT INTO drains_v2 (
+        trace_id, span_id, start_time_unix_nano, end_time_unix_nano,
+        last_seen_unix_nano, attempts, opened, hitl, errored,
+        status_code, status_message, inserted_at
+      )
+      SELECT
+        trace_id, span_id, start_time_unix_nano, end_time_unix_nano,
+        last_seen_unix_nano, attempts, opened, hitl, errored,
+        status_code, status_message, inserted_at
+      FROM drains`,
+    ).run();
+    db.prepare("DROP TABLE drains").run();
+    db.prepare("ALTER TABLE drains_v2 RENAME TO drains").run();
+    db.prepare("COMMIT").run();
+  } catch (err) {
+    db.prepare("ROLLBACK").run();
+    throw err;
+  }
+}
+
 function aggregatesViewDdl(windowDrains: number): string {
   // windowDrains is the only spot we interpolate rather than
   // parameter-bind (CREATE VIEW can't take params). Coerce to a
@@ -708,6 +787,10 @@ export function createStorage(
     // filtering. Old rows decode to "" — the poller only filters on
     // known type values so pre-migration rows behave unchanged.
     `ALTER TABLE linear_snapshots ADD COLUMN status_type TEXT`,
+    // VA-455: per-trace heartbeat timestamp for the log-driven active
+    // drain query (see SCHEMA above for semantics). Older DBs need
+    // the column added in-place.
+    `ALTER TABLE drains ADD COLUMN last_seen_unix_nano TEXT`,
   ]) {
     try {
       db.exec(sql);
@@ -716,6 +799,14 @@ export function createStorage(
       // dashboard boot ran the same migration.
     }
   }
+
+  // VA-455: SQLite has no `ALTER COLUMN`, so relaxing the original
+  // `end_time_unix_nano TEXT NOT NULL` constraint on legacy DBs
+  // requires a table-rebuild. Only fire when PRAGMA reports the
+  // column is still NOT NULL — fresh installs go through the new
+  // SCHEMA above and skip this branch.
+  relaxDrainsEndTimeNotNull(db);
+
   // VA-399: install the evaluator-facing read-model view after the
   // base tables exist (and after VA-387's column migrations above),
   // but before any prepared statement is created — a
@@ -726,17 +817,60 @@ export function createStorage(
   const insertDrain = db.prepare(`
     INSERT INTO drains (
       trace_id, span_id, start_time_unix_nano, end_time_unix_nano,
+      last_seen_unix_nano,
       attempts, opened, hitl, errored, status_code, status_message
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (trace_id, span_id) DO UPDATE SET
       start_time_unix_nano = excluded.start_time_unix_nano,
       end_time_unix_nano = excluded.end_time_unix_nano,
+      last_seen_unix_nano = excluded.last_seen_unix_nano,
       attempts = excluded.attempts,
       opened = excluded.opened,
       hitl = excluded.hitl,
       errored = excluded.errored,
       status_code = excluded.status_code,
       status_message = excluded.status_message
+  `);
+
+  // VA-455: insert (or refresh last_seen on) the active-drain row
+  // when runway emits its `drain.started` log marker. ON CONFLICT
+  // guards against two cases:
+  //   1. The drainQueue span has already ended (end_time NOT NULL)
+  //      — a late-arriving marker can't reanimate a closed drain,
+  //      so we leave the row untouched.
+  //   2. Repeated markers (shouldn't happen, but if they do we just
+  //      bump last_seen forward; monotonic via the MAX comparison).
+  const markActiveDrainStmt = db.prepare(`
+    INSERT INTO drains (
+      trace_id, span_id, start_time_unix_nano,
+      end_time_unix_nano, last_seen_unix_nano,
+      attempts, opened, hitl, errored,
+      status_code, status_message
+    ) VALUES (?, ?, ?, NULL, ?, 0, 0, 0, 0, NULL, NULL)
+    ON CONFLICT (trace_id, span_id) DO UPDATE SET
+      last_seen_unix_nano = excluded.last_seen_unix_nano
+    WHERE drains.end_time_unix_nano IS NULL
+      AND (
+        drains.last_seen_unix_nano IS NULL
+        OR CAST(drains.last_seen_unix_nano AS INTEGER)
+           < CAST(excluded.last_seen_unix_nano AS INTEGER)
+      )
+  `);
+
+  // VA-455: every log record carrying a trace_id pushes that
+  // trace's active drain's last_seen forward, so the active-drain
+  // query can age out crashed drains. UPDATE-only (never inserts)
+  // so a stray log record from a trace without a `drain.started`
+  // marker doesn't fabricate an active drain.
+  const bumpDrainLastSeenStmt = db.prepare(`
+    UPDATE drains
+    SET last_seen_unix_nano = ?
+    WHERE trace_id = ?
+      AND end_time_unix_nano IS NULL
+      AND (
+        last_seen_unix_nano IS NULL
+        OR CAST(last_seen_unix_nano AS INTEGER) < CAST(? AS INTEGER)
+      )
   `);
 
   const insertIssueProcess = db.prepare(`
@@ -865,33 +999,64 @@ export function createStorage(
     FROM linear_snapshots
   `);
 
-  // VA-391: "active drain" = a trace_id with one or more
-  // issue_processes rows but no row in `drains`. The drain span
-  // hasn't been emitted yet (BatchSpanProcessor flushes on end), so
-  // we infer in-flight by the absence of the parent. Earliest
-  // start_time across the trace's issue_processes is the drain
-  // start; the counters slice by outcome_kind. LIMIT 1 picks the
-  // most-recently-started in-flight drain — v1 only runs one drain
-  // at a time but the SQL is robust to a future parallel mode.
+  // VA-391 + VA-455: "active drain" comes from two paths today.
+  //
+  //  (a) VA-455 log-driven: a `drains` row with end_time NULL and a
+  //      fresh `last_seen_unix_nano` (within the staleness window).
+  //      runway emits `Effect.logInfo("drain.started")` at the top
+  //      of the drainQueue span; the projector recognises that body
+  //      and inserts the row via `markDrainActive`. Subsequent log
+  //      records bump last_seen.
+  //
+  //  (b) VA-391 legacy fallback: a trace_id with issue_processes
+  //      rows but no `drains` row at all. Kept so dashboards running
+  //      against pre-VA-455 runway binaries still light up — once
+  //      the first processIssue ends.
+  //
+  // The two paths are mutually exclusive by construction (path (a)
+  // writes a `drains` row, which excludes the trace from path (b)).
+  // Among candidates, most-recently-started wins; v1 only runs one
+  // drain at a time but the SQL is robust to a future parallel mode.
+  //
+  // Bind param: the staleness floor in unix-nanos as a TEXT-encoded
+  // integer. Pass `String(BigInt(Date.now()) * 1_000_000n - staleness)`
+  // at call time so the query stays a static prepared statement.
   const getActiveDrainStmt = db.prepare(`
-    WITH active AS (
-      SELECT trace_id
+    WITH active_candidates AS (
+      SELECT
+        trace_id,
+        start_time_unix_nano AS started_at_unix_nano
+      FROM drains
+      WHERE end_time_unix_nano IS NULL
+        AND last_seen_unix_nano IS NOT NULL
+        AND CAST(last_seen_unix_nano AS INTEGER) > CAST(? AS INTEGER)
+
+      UNION ALL
+
+      SELECT
+        trace_id,
+        CAST(MIN(CAST(start_time_unix_nano AS INTEGER)) AS TEXT)
+          AS started_at_unix_nano
       FROM issue_processes
       WHERE trace_id NOT IN (SELECT trace_id FROM drains)
       GROUP BY trace_id
-      ORDER BY MIN(CAST(start_time_unix_nano AS INTEGER)) DESC
+    ),
+    chosen AS (
+      SELECT trace_id, started_at_unix_nano
+      FROM active_candidates
+      ORDER BY CAST(started_at_unix_nano AS INTEGER) DESC
       LIMIT 1
     )
     SELECT
-      ip.trace_id,
-      MIN(ip.start_time_unix_nano) AS started_at_unix_nano,
-      COUNT(*) AS issue_count,
-      SUM(CASE WHEN ip.outcome_kind = 'opened'  THEN 1 ELSE 0 END) AS opened_count,
-      SUM(CASE WHEN ip.outcome_kind = 'hitl'    THEN 1 ELSE 0 END) AS hitl_count,
-      SUM(CASE WHEN ip.outcome_kind = 'errored' THEN 1 ELSE 0 END) AS errored_count
-    FROM issue_processes ip
-    WHERE ip.trace_id = (SELECT trace_id FROM active)
-    GROUP BY ip.trace_id
+      c.trace_id,
+      c.started_at_unix_nano,
+      COUNT(ip.span_id) AS issue_count,
+      COALESCE(SUM(CASE WHEN ip.outcome_kind = 'opened'  THEN 1 ELSE 0 END), 0) AS opened_count,
+      COALESCE(SUM(CASE WHEN ip.outcome_kind = 'hitl'    THEN 1 ELSE 0 END), 0) AS hitl_count,
+      COALESCE(SUM(CASE WHEN ip.outcome_kind = 'errored' THEN 1 ELSE 0 END), 0) AS errored_count
+    FROM chosen c
+    LEFT JOIN issue_processes ip ON ip.trace_id = c.trace_id
+    GROUP BY c.trace_id, c.started_at_unix_nano
   `);
 
   const insertLogRecord = db.prepare(`
@@ -942,12 +1107,27 @@ export function createStorage(
       d.spanId,
       d.startTimeUnixNano,
       d.endTimeUnixNano,
+      d.lastSeenUnixNano,
       asInt(d.attempts),
       asInt(d.opened),
       asInt(d.hitl),
       asInt(d.errored),
       asInt(d.statusCode),
       d.statusMessage,
+    );
+  };
+
+  // VA-455: log-marker-driven insert for in-flight drains. Called
+  // from server.ts when `projectLogs` surfaces a `drain.started`
+  // record (see `extractActiveDrainMarkers`). The first call lands
+  // the row with end_time NULL; subsequent calls (or any log on the
+  // trace flowing through `appendLogRecord`) push last_seen forward.
+  const markDrainActive = (m: ActiveDrainMarker): void => {
+    markActiveDrainStmt.run(
+      m.traceId,
+      m.spanId,
+      m.startTimeUnixNano,
+      m.lastSeenUnixNano,
     );
   };
 
@@ -1161,13 +1341,30 @@ export function createStorage(
         ? null
         : JSON.stringify(r.attributes),
     );
+    // VA-455: piggy-back on every log record to keep the trace's
+    // active-drain row "alive" — drives the staleness TTL in
+    // getActiveDrain. No-op when no active drain exists for the
+    // trace (UPDATE matches zero rows).
+    bumpDrainLastSeenStmt.run(
+      r.timestampUnixNano,
+      r.traceId,
+      r.timestampUnixNano,
+    );
   };
 
   const streamLogsFor = (traceId: string): readonly StoredLogRecord[] =>
     listLogsByTrace.all(traceId).map(rowToLogRecord);
 
   const getActiveDrain = (): ActiveDrain | null => {
-    const row = getActiveDrainStmt.get() as Record<string, unknown> | undefined;
+    // VA-455: staleness floor — drains whose most recent log record
+    // is older than this no longer count as active. Matches the 30s
+    // heartbeat cadence on the runway side with a 3× safety margin
+    // so a single dropped heartbeat doesn't toggle the card to Idle.
+    const stalenessFloorNanos =
+      BigInt(Date.now()) * 1_000_000n - ACTIVE_DRAIN_STALENESS_NANOS;
+    const row = getActiveDrainStmt.get(String(stalenessFloorNanos)) as
+      | Record<string, unknown>
+      | undefined;
     if (!row || row.trace_id == null) return null;
     return {
       traceId: String(row.trace_id ?? ""),
@@ -1303,6 +1500,7 @@ export function createStorage(
 
   return {
     saveDrain,
+    markDrainActive,
     saveIssueProcess,
     saveAgentIteration,
     saveRawSpan,

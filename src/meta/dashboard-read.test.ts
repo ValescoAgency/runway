@@ -66,6 +66,7 @@ function seedDrain(traceId: string, startNano: string): void {
     spanId: traceId.slice(0, 16),
     startTimeUnixNano: startNano,
     endTimeUnixNano: startNano,
+    lastSeenUnixNano: startNano,
     attempts: 1,
     opened: 0,
     hitl: 0,

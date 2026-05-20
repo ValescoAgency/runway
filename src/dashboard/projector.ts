@@ -26,13 +26,40 @@ export interface DrainRow {
   readonly traceId: string;
   readonly spanId: string;
   readonly startTimeUnixNano: string;
-  readonly endTimeUnixNano: string;
+  /**
+   * VA-455: nullable so the dashboard can persist an in-flight drain
+   * inserted by the `drain.started` log marker before the drainQueue
+   * span has ended. The trace exporter fills this in when the span
+   * lands; up until then, `null` means "still running".
+   */
+  readonly endTimeUnixNano: string | null;
+  /**
+   * VA-455: most recent log-record timestamp for this drain's trace.
+   * Drives the staleness TTL in `getActiveDrain` — drains whose
+   * last_seen is older than the staleness floor are treated as
+   * crashed. `null` on rows that pre-date VA-455.
+   */
+  readonly lastSeenUnixNano: string | null;
   readonly attempts: number | null;
   readonly opened: number | null;
   readonly hitl: number | null;
   readonly errored: number | null;
   readonly statusCode: number | null;
   readonly statusMessage: string | null;
+}
+
+/**
+ * VA-455: one "drain.started" log record translated into the fields
+ * `storage.markDrainActive` needs. `startTimeUnixNano` and
+ * `lastSeenUnixNano` both come from the log record's timestamp —
+ * runway emits the marker at the very top of the drainQueue span, so
+ * it's the earliest signal we have for "this drain began".
+ */
+export interface ActiveDrainMarker {
+  readonly traceId: string;
+  readonly spanId: string;
+  readonly startTimeUnixNano: string;
+  readonly lastSeenUnixNano: string;
 }
 
 export interface IssueProcessRow {
@@ -198,6 +225,10 @@ function projectDrain(span: OtlpSpan): DrainRow {
     spanId: span.spanId,
     startTimeUnixNano: span.startTimeUnixNano,
     endTimeUnixNano: span.endTimeUnixNano,
+    // VA-455: an ended drain's "last activity" is its end time —
+    // the storage layer keeps last_seen monotonic, so setting it
+    // here ensures the value never regresses below the real end.
+    lastSeenUnixNano: span.endTimeUnixNano,
     attempts: numAttr(m["runway.drain.attempts"]),
     opened: numAttr(m["runway.drain.opened"]),
     hitl: numAttr(m["runway.drain.hitl"]),
@@ -290,6 +321,53 @@ function strArrayAttr(
   v: string | number | boolean | readonly string[] | undefined,
 ): readonly string[] {
   return Array.isArray(v) ? (v as readonly string[]) : [];
+}
+
+/**
+ * VA-455: the canonical body string runway emits at the top of the
+ * `drainQueue` span. The projector matches on this exact value to
+ * decide which log records become active-drain markers — keep them
+ * in lock-step with `orchestrator.ts`.
+ */
+export const DRAIN_STARTED_LOG = "drain.started";
+
+/**
+ * VA-455: scan an OTLP logs payload for `drain.started` markers.
+ * Each match becomes an `ActiveDrainMarker` carrying the drain's
+ * trace_id, the drainQueue span_id, and the log timestamp. The
+ * storage layer's `markDrainActive` upserts a `drains` row on each
+ * marker so the dashboard's active-drain card lights up within ~1s
+ * of `runway run` starting, instead of waiting for the first
+ * `processIssue` span to end.
+ *
+ * Records missing trace_id, span_id, or a timestamp are dropped —
+ * we won't fabricate any of those, and a drain.started marker
+ * without them has nothing useful to bind.
+ */
+export function extractActiveDrainMarkers(
+  payload: OtlpLogsPayload,
+): readonly ActiveDrainMarker[] {
+  const out: ActiveDrainMarker[] = [];
+  for (const rl of payload.resourceLogs ?? []) {
+    for (const sl of rl.scopeLogs ?? []) {
+      for (const rec of sl.logRecords ?? []) {
+        if (rec.body?.stringValue !== DRAIN_STARTED_LOG) continue;
+        const traceId = rec.traceId?.trim();
+        if (!traceId) continue;
+        const spanId = rec.spanId?.trim();
+        if (!spanId) continue;
+        const ts = rec.timeUnixNano ?? rec.observedTimeUnixNano;
+        if (!ts) continue;
+        out.push({
+          traceId,
+          spanId,
+          startTimeUnixNano: ts,
+          lastSeenUnixNano: ts,
+        });
+      }
+    }
+  }
+  return out;
 }
 
 /**
