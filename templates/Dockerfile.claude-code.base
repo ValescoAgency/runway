@@ -49,19 +49,29 @@ ENV HOME=/home/agent
 ENV XDG_CACHE_HOME=/home/agent/.cache
 ENV TURBO_CACHE_DIR=/tmp/turbo-cache
 ENV pnpm_config_cache=/home/agent/.cache/pnpm
+# VA-457: pin corepack's data dir under the agent's cache. `corepack
+# prepare` below runs as root (before the USER switch), so without
+# COREPACK_HOME it would write the cached pnpm tarball to /root's
+# default and the agent UID couldn't read it. Anything that resolves
+# `pnpm` through the corepack shim after `USER` — git hooks invoked
+# by lefthook in particular — then fails or hangs trying to refetch.
+ENV COREPACK_HOME=/home/agent/.cache/corepack
 
 # Pre-create cache dirs with agent ownership so the first pnpm/turbo
 # run doesn't have to chown them. Both are inside paths the agent owns
 # anyway; this just makes them exist.
-RUN mkdir -p /home/agent/.cache /home/agent/.cache/pnpm /tmp/turbo-cache \
+RUN mkdir -p /home/agent/.cache /home/agent/.cache/pnpm /home/agent/.cache/corepack /tmp/turbo-cache \
  && chown -R $AGENT_UID:$AGENT_GID /home/agent/.cache /tmp/turbo-cache
 
 # Bake pnpm via corepack at build time so `pnpm` is on PATH inside the
 # container before any agent command runs. Pin a default; target repos
 # can override at runtime via `packageManager` in package.json +
-# `corepack use`.
+# `corepack use`. COREPACK_HOME is set above so the data dir lands
+# under /home/agent/.cache/corepack; the trailing chown re-asserts
+# agent ownership over the files root just wrote there.
 RUN corepack enable \
- && corepack prepare pnpm@11.1.1 --activate
+ && corepack prepare pnpm@11.1.1 --activate \
+ && chown -R $AGENT_UID:$AGENT_GID /home/agent/.cache/corepack
 
 USER ${AGENT_UID}:${AGENT_GID}
 
