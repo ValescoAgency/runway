@@ -467,7 +467,7 @@ function renderTodoQueue(
 ): string {
   const body =
     queue.length === 0
-      ? `<tr><td colspan="4" class="empty">Linear Todo queue is empty.</td></tr>`
+      ? `<tr><td colspan="5" class="empty">Linear Todo queue is empty.</td></tr>`
       : queue.map((s) => renderQueueRow(s, linearWorkspace)).join("");
   return `<h2>Todo queue (next up)</h2>
   <table>
@@ -476,6 +476,7 @@ function renderTodoQueue(
         <th>Issue</th>
         <th>Title</th>
         <th>Labels</th>
+        <th>Status</th>
         <th>Project</th>
       </tr>
     </thead>
@@ -498,10 +499,17 @@ function renderQueueRow(
         (s.projectId == null
           ? ""
           : `<span class="project-uuid">${escapeHtml(s.projectId)}</span>`);
+  // VA-453: workflow status display name. Empty → em-dash so the
+  // column is never visually empty.
+  const status =
+    s.status === ""
+      ? `<span class="muted">—</span>`
+      : escapeHtml(s.status);
   return `<tr>
     <td class="id">${escapeHtml(s.issueIdentifier)}${linearIssueLink(s.issueIdentifier, linearWorkspace)}</td>
     <td class="detail">${escapeHtml(s.title)}</td>
     <td class="muted">${escapeHtml(labels)}</td>
+    <td class="detail">${status}</td>
     <td class="detail">${project}</td>
   </tr>`;
 }

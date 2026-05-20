@@ -527,6 +527,26 @@ export function createLinearGateway(
               const labels = await fetchIssueLabelNames(raw);
               if (!labels.includes(config.readyLabel)) continue;
               if (labels.includes(config.hitlLabel)) continue;
+              // VA-453: skip issues whose workflow state is already
+              // terminal (`completed` / `canceled`). Operators sometimes
+              // mark an issue Done but forget to strip
+              // `ready-for-agent`; without this check the drain would
+              // pick up a Done ticket and waste a sandcastle run.
+              // Filtering by `state.type` (not display name) is robust
+              // to teams renaming "Cancelled" to "Won't fix" or
+              // similar. Missing/undecodable state falls through
+              // (treated as non-terminal) — matches the
+              // `hasActiveBlocker` posture for the same edge case.
+              try {
+                const state = await (raw as { state?: Promise<unknown> }).state;
+                if (state) {
+                  const stateType = decodeWorkflowStateTypeNode(state).type;
+                  if (isTerminalStateType(stateType)) continue;
+                }
+              } catch {
+                // Schema drift or transient SDK error — fall through
+                // to the existing checks rather than blocking the drain.
+              }
               if (await hasActiveBlocker(raw)) continue;
               if (await hasChildIssues(raw)) {
                 console.debug(

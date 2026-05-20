@@ -80,6 +80,11 @@ interface FakeIssueArgs {
   // VA-425: number of child sub-issues on this candidate. Default 0
   // so existing tests stay on the "leaf issue" path.
   readonly childCount?: number;
+  // VA-453: Linear workflow state `type`. Default `"unstarted"` so
+  // existing tests keep exercising the non-terminal path; tests that
+  // want to assert on the cancelled/done filter pass `"completed"` or
+  // `"canceled"` explicitly.
+  readonly stateType?: string;
 }
 
 function fakeIssue(args: FakeIssueArgs) {
@@ -117,6 +122,8 @@ function fakeIssue(args: FakeIssueArgs) {
           id: `child-${args.id}-${i}`,
         })),
       }),
+    // VA-453: drain skips terminal-state issues (see fetchReady).
+    state: Promise.resolve({ type: args.stateType ?? "unstarted" }),
   };
 }
 
@@ -196,6 +203,38 @@ describe("VA-394 / VA-423 — fetchReady eligibility filters", () => {
     const result = await Effect.runPromise(gateway.fetchReady());
 
     expect(result.map((i) => i.identifier)).toEqual(["VA-5"]);
+  });
+
+  // VA-453
+  it("VA-453: skips issues whose workflow state type is completed or canceled even when they still carry `ready-for-agent`", async () => {
+    stubTeam();
+    issuesMock.mockResolvedValueOnce({
+      nodes: [
+        fakeIssue({
+          id: "issue-done",
+          identifier: "VA-DONE",
+          title: "marked Done but label not stripped",
+          stateType: "completed",
+        }),
+        fakeIssue({
+          id: "issue-cancelled",
+          identifier: "VA-CAN",
+          title: "marked Cancelled but label not stripped",
+          stateType: "canceled",
+        }),
+        fakeIssue({
+          id: "issue-active",
+          identifier: "VA-LIVE",
+          title: "actually drainable",
+          stateType: "unstarted",
+        }),
+      ],
+    });
+
+    const gateway = createLinearGateway(baseConfig);
+    const result = await Effect.runPromise(gateway.fetchReady());
+
+    expect(result.map((i) => i.identifier)).toEqual(["VA-LIVE"]);
   });
 
   it("VA-423 AC: skips an issue carrying neither label (defensive — covers eventual consistency between GraphQL filter and per-candidate read)", async () => {
