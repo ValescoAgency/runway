@@ -182,6 +182,55 @@ export interface ActiveDrain {
   readonly erroredCount: number;
 }
 
+/**
+ * VA-465: per-PR shepherding state, surfaced as a sub-card under the
+ * active-drain card. One row per (trace_id, pr_number).
+ *
+ *   acting — a fix action is currently running
+ *   ready  — loop exited cleanly; PR awaits human merge
+ *   merged — PR landed (terminal)
+ *   hitl   — loop escalated to HITL (terminal)
+ */
+export type ShepherdingState = "acting" | "ready" | "merged" | "hitl";
+
+export interface ShepherdingPr {
+  readonly traceId: string;
+  readonly prNumber: number;
+  readonly subscription: string | null;
+  readonly iteration: number | null;
+  readonly maxIterations: number | null;
+  readonly state: ShepherdingState;
+  readonly description: string | null;
+  readonly startedUnixNano: string;
+  readonly lastSeenUnixNano: string;
+  readonly endedUnixNano: string | null;
+}
+
+export interface ShepherdIterationStartMarker {
+  readonly traceId: string;
+  readonly prNumber: number;
+  readonly subscription: string;
+  readonly iteration: number;
+  readonly maxIterations: number | null;
+  readonly description: string;
+  readonly timestampUnixNano: string;
+}
+
+export interface ShepherdIterationEndMarker {
+  readonly traceId: string;
+  readonly prNumber: number;
+  readonly outcome: "fixed" | "hitl";
+  readonly detail: string;
+  readonly timestampUnixNano: string;
+}
+
+export interface ShepherdEndedMarker {
+  readonly traceId: string;
+  readonly prNumber: number;
+  readonly outcome: "merged" | "ready" | "hitl";
+  readonly timestampUnixNano: string;
+}
+
 export interface Storage {
   saveDrain(d: DrainRow): void;
   /**
@@ -303,6 +352,34 @@ export interface Storage {
    * started one wins.
    */
   getActiveDrain(): ActiveDrain | null;
+  /**
+   * VA-465: upsert a shepherding row when an iteration begins. Sets
+   * state to `acting`, refreshes subscription/iteration/description,
+   * bumps last_seen. Idempotent across out-of-order marker arrival —
+   * older timestamps don't clobber newer state.
+   */
+  markShepherdIterationStart(m: ShepherdIterationStartMarker): void;
+  /**
+   * VA-465: update last_seen + description on a shepherding row when
+   * an iteration completes. `outcome=hitl` does NOT terminate the
+   * row (that's `markShepherdEnded`'s job); it only refreshes the
+   * sub-card with the last action's verdict.
+   */
+  markShepherdIterationEnd(m: ShepherdIterationEndMarker): void;
+  /**
+   * VA-465: terminate a shepherding row (merged / ready / hitl). Sets
+   * state to the terminal value, fills ended_unix_nano. Subsequent
+   * markers on the same (trace, pr) are ignored when state is
+   * already terminal.
+   */
+  markShepherdEnded(m: ShepherdEndedMarker): void;
+  /**
+   * VA-465: return active (non-terminal) shepherding rows for the
+   * given trace. The sub-card renders one per row. Sorted by
+   * started_unix_nano ascending so the operator sees PRs in the
+   * order the drain opened them.
+   */
+  getActiveShepherding(traceId: string): readonly ShepherdingPr[];
   /**
    * VA-402: upsert one row in `meta_reviews`. The IRA's three passes
    * (Run Review, Drain Review, Weekly Review) all write through this
@@ -571,6 +648,31 @@ const SCHEMA = `
 
   CREATE INDEX IF NOT EXISTS idx_meta_reviews_kind_created
     ON meta_reviews(kind, created_at DESC);
+
+  -- VA-465: per-PR shepherding state surfaced as a sub-card under the
+  -- active-drain card. One row per (trace_id, pr_number); the watcher
+  -- loop may iterate multiple times per PR before exiting. State
+  -- transitions acting -> ready/merged/hitl; the latter three are
+  -- terminal and set ended_unix_nano. The projector's three
+  -- shepherd.* log markers feed this table; the list view reads
+  -- getActiveShepherding(traceId) (non-terminal rows only).
+  CREATE TABLE IF NOT EXISTS shepherding_prs (
+    trace_id TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    subscription TEXT,
+    iteration INTEGER,
+    max_iterations INTEGER,
+    state TEXT NOT NULL,
+    description TEXT,
+    started_unix_nano TEXT NOT NULL,
+    last_seen_unix_nano TEXT NOT NULL,
+    ended_unix_nano TEXT,
+    inserted_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (trace_id, pr_number)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_shepherding_prs_trace_active
+    ON shepherding_prs(trace_id, ended_unix_nano);
 `;
 
 const DEFAULT_AGGREGATE_WINDOW = 30;
@@ -1140,6 +1242,137 @@ export function createStorage(
     );
   };
 
+  // VA-465: shepherd-state prepared statements.
+  //
+  // `markShepherdIterationStartStmt` inserts on first iteration or
+  // updates an existing row to bump the iteration / subscription /
+  // description / last_seen. The CONFLICT branch only overwrites
+  // when (a) the row isn't already terminated AND (b) the incoming
+  // timestamp is newer than the stored last_seen — protects against
+  // out-of-order batch arrival.
+  const markShepherdIterationStartStmt = db.prepare(`
+    INSERT INTO shepherding_prs (
+      trace_id, pr_number, subscription, iteration, max_iterations,
+      state, description, started_unix_nano, last_seen_unix_nano
+    ) VALUES (?, ?, ?, ?, ?, 'acting', ?, ?, ?)
+    ON CONFLICT (trace_id, pr_number) DO UPDATE SET
+      subscription = excluded.subscription,
+      iteration = excluded.iteration,
+      max_iterations = COALESCE(excluded.max_iterations, shepherding_prs.max_iterations),
+      state = 'acting',
+      description = excluded.description,
+      last_seen_unix_nano = excluded.last_seen_unix_nano
+    WHERE shepherding_prs.ended_unix_nano IS NULL
+      AND CAST(shepherding_prs.last_seen_unix_nano AS INTEGER)
+        < CAST(excluded.last_seen_unix_nano AS INTEGER)
+  `);
+  // `markShepherdIterationEndStmt` bumps last_seen + description on
+  // a row that exists. UPDATE-only (no INSERT) — an end without a
+  // start is dropped silently.
+  const markShepherdIterationEndStmt = db.prepare(`
+    UPDATE shepherding_prs
+    SET description = ?, last_seen_unix_nano = ?
+    WHERE trace_id = ? AND pr_number = ?
+      AND ended_unix_nano IS NULL
+      AND CAST(last_seen_unix_nano AS INTEGER) < CAST(? AS INTEGER)
+  `);
+  // `markShepherdEndedStmt` terminates the row. The CASE WHEN guard
+  // protects against a stale end-marker arriving after a fresher
+  // start (which can happen with batched OTLP flushes).
+  const markShepherdEndedStmt = db.prepare(`
+    INSERT INTO shepherding_prs (
+      trace_id, pr_number, state, started_unix_nano,
+      last_seen_unix_nano, ended_unix_nano
+    ) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT (trace_id, pr_number) DO UPDATE SET
+      state = excluded.state,
+      last_seen_unix_nano = excluded.last_seen_unix_nano,
+      ended_unix_nano = excluded.ended_unix_nano
+    WHERE shepherding_prs.ended_unix_nano IS NULL
+      OR CAST(shepherding_prs.ended_unix_nano AS INTEGER)
+        < CAST(excluded.ended_unix_nano AS INTEGER)
+  `);
+  const getActiveShepherdingStmt = db.prepare(`
+    SELECT
+      trace_id, pr_number, subscription, iteration, max_iterations,
+      state, description, started_unix_nano, last_seen_unix_nano,
+      ended_unix_nano
+    FROM shepherding_prs
+    WHERE trace_id = ? AND ended_unix_nano IS NULL
+    ORDER BY CAST(started_unix_nano AS INTEGER) ASC
+  `);
+
+  const markShepherdIterationStart = (
+    m: ShepherdIterationStartMarker,
+  ): void => {
+    markShepherdIterationStartStmt.run(
+      m.traceId,
+      m.prNumber,
+      m.subscription,
+      m.iteration,
+      m.maxIterations,
+      m.description,
+      m.timestampUnixNano,
+      m.timestampUnixNano,
+    );
+  };
+  const markShepherdIterationEnd = (m: ShepherdIterationEndMarker): void => {
+    markShepherdIterationEndStmt.run(
+      m.detail,
+      m.timestampUnixNano,
+      m.traceId,
+      m.prNumber,
+      m.timestampUnixNano,
+    );
+  };
+  const markShepherdEnded = (m: ShepherdEndedMarker): void => {
+    // VA-465: only `merged` terminates the row (sets ended_unix_nano
+    // → excluded from getActiveShepherding). `ready` and `hitl`
+    // leave ended_unix_nano NULL so the sub-strip continues to
+    // render them as "ready, awaiting human merge" / "HITL — needs
+    // human attention" rows while the drain is still active. The
+    // rows naturally disappear when the drain ends, since the list
+    // view only queries getActiveShepherding when activeDrain is
+    // non-null.
+    const endedNano = m.outcome === "merged" ? m.timestampUnixNano : null;
+    markShepherdEndedStmt.run(
+      m.traceId,
+      m.prNumber,
+      m.outcome,
+      m.timestampUnixNano,
+      m.timestampUnixNano,
+      endedNano,
+    );
+  };
+  const getActiveShepherding = (
+    traceId: string,
+  ): readonly ShepherdingPr[] => {
+    const rows = getActiveShepherdingStmt.all(traceId) as unknown as ReadonlyArray<{
+      trace_id: string;
+      pr_number: number;
+      subscription: string | null;
+      iteration: number | null;
+      max_iterations: number | null;
+      state: ShepherdingState;
+      description: string | null;
+      started_unix_nano: string;
+      last_seen_unix_nano: string;
+      ended_unix_nano: string | null;
+    }>;
+    return rows.map((r) => ({
+      traceId: r.trace_id,
+      prNumber: r.pr_number,
+      subscription: r.subscription,
+      iteration: r.iteration,
+      maxIterations: r.max_iterations,
+      state: r.state,
+      description: r.description,
+      startedUnixNano: r.started_unix_nano,
+      lastSeenUnixNano: r.last_seen_unix_nano,
+      endedUnixNano: r.ended_unix_nano,
+    }));
+  };
+
   const saveIssueProcess = (p: IssueProcessRow): void => {
     insertIssueProcess.run(
       p.traceId,
@@ -1527,6 +1760,10 @@ export function createStorage(
     appendLogRecord,
     streamLogsFor,
     getActiveDrain,
+    markShepherdIterationStart,
+    markShepherdIterationEnd,
+    markShepherdEnded,
+    getActiveShepherding,
     saveMetaReview,
     listMetaReviews,
     countMetaReviews,

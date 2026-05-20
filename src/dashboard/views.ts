@@ -5,6 +5,7 @@ import type {
   OutcomeFilterKind,
   PhaseSpan,
   RecentDrain,
+  ShepherdingPr,
   StoredAgentIteration,
   StoredIssueProcess,
   StoredLogRecord,
@@ -101,6 +102,14 @@ export interface ListViewModel {
    */
   readonly activeDrain?: ActiveDrain | null;
   /**
+   * VA-465: per-PR shepherding state for the active drain. Empty
+   * list (default) means no shepherd sub-strip renders. The drain
+   * strip and the shepherd sub-strip share an "is something
+   * happening?" signal — the operator never sees a stray sub-strip
+   * without a drain context above it.
+   */
+  readonly activeShepherding?: readonly ShepherdingPr[];
+  /**
    * VA-392: filter chip state. The view renders chip groups for
    * outcome / drain / date range; each chip's "active" class reflects
    * whether the chip's value is in `filterState`. Pre-VA-392 callers
@@ -151,7 +160,12 @@ export function renderListView(input: ListViewModel | readonly StoredIssueProces
     : "";
   // VA-391: drain summary strip renders ABOVE the queue + run list
   // so the operator sees in-flight progress at the top of the page.
-  const drainStrip = renderDrainStrip(vm.activeDrain ?? null);
+  // VA-465: when the drain is active AND has shepherding PRs, a
+  // sub-strip lists each PR's current state below the drain strip.
+  const activeShepherding = vm.activeShepherding ?? [];
+  const drainStrip =
+    renderDrainStrip(vm.activeDrain ?? null) +
+    renderShepherdSubStrip(vm.activeDrain ?? null, activeShepherding);
   // VA-392: filter chips render between the drain strip and the table
   // so the operator can narrow the run list without leaving the page.
   const filterChips = renderFilterChips(filterState, recentDrains);
@@ -184,6 +198,20 @@ export function renderListView(input: ListViewModel | readonly StoredIssueProces
     .drain-strip .strip-counter strong { color: #e5e5e5; }
     .drain-strip .counter-hitl   strong { color: #facc15; }
     .drain-strip .counter-err    strong { color: #f87171; }
+    /* VA-465: shepherd sub-strip — one row per PR being shepherded. */
+    .shepherd-strip { margin: -10px 0 16px; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+    .shepherd-row { padding: 6px 12px; border: 1px solid #2a2a30;
+                    border-top: none; border-radius: 0 0 4px 4px;
+                    background: #0a0f1c; display: flex; gap: 12px;
+                    align-items: center; font-size: 0.9em; }
+    .shepherd-row .strip-label { color: #9ca3af; }
+    .shepherd-row .shepherd-pr { color: #93c5fd; font-weight: 600; }
+    .shepherd-row .shepherd-iter { color: #d4d4d8; }
+    .shepherd-row .shepherd-state { color: #e5e5e5; }
+    .shepherd-state-ready  { border-color: #4ade80; }
+    .shepherd-state-merged { border-color: #4ade80; opacity: 0.7; }
+    .shepherd-state-hitl   { border-color: #facc15; }
+    .shepherd-state-acting { border-color: #60a5fa; }
     .filters { margin: 0 0 16px; display: flex; flex-direction: column;
                gap: 6px; font-size: 12px; }
     .filter-row { display: flex; align-items: center; gap: 8px;
@@ -251,6 +279,58 @@ export function renderListView(input: ListViewModel | readonly StoredIssueProces
  * when one is active; otherwise emits the explicit "Idle" indicator
  * so the operator can tell at a glance that no drain is running.
  */
+/**
+ * VA-465: sub-strip under the active-drain card showing per-PR
+ * shepherding state. One row per PR. Empty when no drain is active
+ * or no shepherding rows exist — returns an empty string so the
+ * markup has no orphan container.
+ */
+function renderShepherdSubStrip(
+  active: ActiveDrain | null,
+  shepherding: readonly ShepherdingPr[],
+): string {
+  if (!active || shepherding.length === 0) return "";
+  const lines = shepherding
+    .map((s) => {
+      const stateLabel = shepherdStateLabel(s);
+      return `<div class="shepherd-row shepherd-state-${s.state}">
+        <span class="strip-label">Shepherding</span>
+        <span class="shepherd-pr">PR #${s.prNumber}</span>
+        ${
+          s.iteration !== null
+            ? `<span class="shepherd-iter">iter ${s.iteration}${
+                s.maxIterations !== null ? `/${s.maxIterations}` : ""
+              }</span>`
+            : ""
+        }
+        <span class="shepherd-state">${escapeHtml(stateLabel)}</span>
+      </div>`;
+    })
+    .join("");
+  return `<div class="shepherd-strip">${lines}</div>`;
+}
+
+function shepherdStateLabel(s: ShepherdingPr): string {
+  switch (s.state) {
+    case "acting":
+      // The subscription + description tell the operator WHAT is
+      // happening — a rebase, a CI re-impl, a reviewer-feedback fix.
+      // Both are best-effort; missing ones collapse to the bare verb.
+      if (s.description) return s.description;
+      return s.subscription
+        ? `acting on ${s.subscription}`
+        : "acting";
+    case "ready":
+      return "ready, awaiting human merge";
+    case "merged":
+      return "merged";
+    case "hitl":
+      return "HITL — needs human attention";
+    default:
+      return s.state;
+  }
+}
+
 function renderDrainStrip(active: ActiveDrain | null): string {
   if (!active) {
     return `<div class="drain-strip idle">Idle — no active drain</div>`;

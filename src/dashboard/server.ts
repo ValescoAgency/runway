@@ -7,6 +7,7 @@ import {
 import { createEventBus, type EventBus } from "./events.js";
 import {
   extractActiveDrainMarkers,
+  extractShepherdMarkers,
   projectLogs,
   projectPayload,
 } from "./projector.js";
@@ -416,6 +417,38 @@ async function handleOtlpLogs(
     storage.markDrainActive(m);
   }
 
+  // VA-465: shepherd lifecycle markers drive the per-PR sub-card.
+  // Three log bodies map to three storage methods — see
+  // `extractShepherdMarkers` for the body strings.
+  for (const m of extractShepherdMarkers(payload)) {
+    if (m.kind === "iteration.start") {
+      storage.markShepherdIterationStart({
+        traceId: m.traceId,
+        prNumber: m.prNumber,
+        subscription: m.subscription,
+        iteration: m.iteration,
+        maxIterations: m.maxIterations,
+        description: m.description,
+        timestampUnixNano: m.timestampUnixNano,
+      });
+    } else if (m.kind === "iteration.end") {
+      storage.markShepherdIterationEnd({
+        traceId: m.traceId,
+        prNumber: m.prNumber,
+        outcome: m.outcome,
+        detail: m.detail,
+        timestampUnixNano: m.timestampUnixNano,
+      });
+    } else {
+      storage.markShepherdEnded({
+        traceId: m.traceId,
+        prNumber: m.prNumber,
+        outcome: m.outcome,
+        timestampUnixNano: m.timestampUnixNano,
+      });
+    }
+  }
+
   for (const r of projectLogs(payload)) {
     storage.appendLogRecord(r);
     // VA-391: the SSE detail-pane stream live-tails the Logs section
@@ -585,12 +618,19 @@ function handleListView(
   // `drains` row). `null` becomes the "Idle — no active drain"
   // state in views.
   const activeDrain = storage.getActiveDrain();
+  // VA-465: when a drain is active, surface its in-flight shepherding
+  // PRs as a sub-strip under the drain strip. Idle drain → no
+  // shepherd rows to query.
+  const activeShepherding = activeDrain
+    ? storage.getActiveShepherding(activeDrain.traceId)
+    : [];
   const html = renderListView({
     rows,
     linearEnabled,
     todoQueue,
     snapshotsByIdentifier,
     activeDrain,
+    activeShepherding,
     filterState,
     recentDrains,
     isFiltered: isFilteredState(filterState),
