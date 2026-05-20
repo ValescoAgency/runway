@@ -75,6 +75,23 @@ export async function renderReviewPrompt(args: {
   return renderPrompt(template, reviewVars(args));
 }
 
+/**
+ * VA-461: render the shepherd-rebase prompt. The agent receives the
+ * branch / base / mergeable_state and an optional list of files
+ * `getConflictFiles` pre-detected — it executes the rebase inside
+ * sandcastle and signals IMPL: DONE or IMPL: BLOCKED.
+ */
+export async function renderShepherdRebasePrompt(args: {
+  issue: RunwayIssue;
+  branch: string;
+  baseBranch: string;
+  mergeableState: string;
+  conflictFiles: readonly string[];
+}): Promise<string> {
+  const template = await loadShepherdRebasePrompt();
+  return renderPrompt(template, shepherdRebaseVars(args));
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -85,6 +102,10 @@ async function loadImplementPrompt(): Promise<string> {
 
 async function loadReviewPrompt(): Promise<string> {
   return readFile(join(PROMPT_DIR, "review.md"), "utf8");
+}
+
+async function loadShepherdRebasePrompt(): Promise<string> {
+  return readFile(join(PROMPT_DIR, "shepherd-rebase.md"), "utf8");
 }
 
 /**
@@ -140,6 +161,34 @@ function reviewVars(args: {
     ISSUE_DESCRIPTION: args.issue.description || "(no description)",
     DIFF: args.diff || "(empty diff)",
     COMMITS: args.commits || "(no commits)",
+  };
+}
+
+function shepherdRebaseVars(args: {
+  issue: RunwayIssue;
+  branch: string;
+  baseBranch: string;
+  mergeableState: string;
+  conflictFiles: readonly string[];
+}): Record<string, string> {
+  // The conflict-files block is one of two shapes: a bulleted list
+  // (when `getConflictFiles` returned hits) or a single line saying
+  // the branch is "behind" with no expected conflicts. The template
+  // substitutes the whole block via `{{CONFLICT_FILES_BLOCK}}` so
+  // either shape renders cleanly without dangling headers.
+  const filesBlock =
+    args.conflictFiles.length > 0
+      ? `Pre-detected conflicting files:\n${args.conflictFiles
+          .map((f) => `  - ${f}`)
+          .join("\n")}`
+      : `No conflicts pre-detected — the branch is behind base, expect a clean fast-forward rebase`;
+  return {
+    ISSUE_IDENTIFIER: args.issue.identifier,
+    ISSUE_TITLE: args.issue.title,
+    BRANCH: args.branch,
+    BASE_BRANCH: args.baseBranch,
+    MERGEABLE_STATE: args.mergeableState,
+    CONFLICT_FILES_BLOCK: filesBlock,
   };
 }
 
