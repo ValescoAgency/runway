@@ -4,6 +4,21 @@ All notable changes to runway are documented here. Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); breaking
 changes bump the major.
 
+## 0.13.0 — 2026-05-20
+
+Minor release. Three PRs since 0.12.0 — all dashboard ergonomics: a one-shot `runway dash upgrade` verb so operators don't have to learn the docker-rm dance on every release; clickable Linear identifiers from the dashboard out to the source issue; and a Todo queue that no longer lists `completed`/`canceled` issues (with the same filter applied to the drain itself, so a stale `ready-for-agent` label on a Done ticket no longer burns a sandcastle run).
+
+### Added
+
+- **`runway dash upgrade` — one-shot pull + replace preserving the SQLite volume** ([PR #148](https://github.com/ValescoAgency/runway/pull/148), VA-451). Before this release, `runway dash up` only pulled when the container didn't exist (running → no-op, stopped → `docker start` against the baked image), so picking up a freshly-published image required `runway dash stop && docker rm runway-dashboard && runway dash up` — easy to fat-finger `--purge` and nuke the SQLite history. The new verb runs the pull FIRST so a failed pull (network, auth, manifest mismatch) leaves the existing container untouched, then stops + removes the old container and starts a new one against the same named volume (`runway-dashboard-data`). The storage layer's idempotent `ALTER TABLE ADD COLUMN` migration pattern (the same one VA-450/VA-453 used for the project/status_type columns) handles schema changes on the new container's first boot — no manual intervention. When no container is present, `upgrade` collapses to the same pull + create that `up` does, so it's safe to run on a clean machine.
+- **Dashboard identifiers link out to Linear via `↗` glyph** ([PR #150](https://github.com/ValescoAgency/runway/pull/150), VA-452). Every Linear identifier on the dashboard (Todo queue rows, issue-process list rows, detail view header) gains a small `↗` that opens the issue in Linear in a new tab. The existing issue-process list link to the local detail view (`/issue-processes/<spanId>`) is preserved; the `↗` sits alongside it so neither nav path breaks. Workspace slug is read from a new `RUNWAY_LINEAR_WORKSPACE` env var, forwarded into the dashboard container by `runway dash up` / `runway dash upgrade` automatically. When the env var is unset, the dashboard renders identifiers exactly as before — no broken affordance, no half-empty link.
+- **Todo queue filters out cancelled/done states and shows Linear workflow status** ([PR #152](https://github.com/ValescoAgency/runway/pull/152), VA-453). Issues whose Linear `WorkflowState.type` is `completed` or `canceled` are saved without a queue position, so they drop from the "Todo queue (next up)" preview even when they still carry `ready-for-agent`. The snapshot row stays in `linear_snapshots` so per-row Linear status badges on the issue-process list continue to resolve. The same `isTerminalStateType` check (reused from VA-394's blocker-relation filter) is also applied to `src/linear.ts:fetchReady` — the drain itself now skips terminal-state candidates, so a forgotten label on a Done ticket no longer burns a sandcastle run. Filtering by type (not display name) means a team renaming "Cancelled" to "Won't fix" doesn't silently disable the filter. The queue table also gains a new Status column between Labels and Project showing the workflow state display name, so the operator can spot stale-label issues without leaving the dashboard.
+
+### Internal — release stats
+
+- **3 PRs since 0.12.0** (3 feat).
+- 58 test files, 788 specs pass (+10 — coverage for the new dash upgrade verb, the Linear-link affordance at all three render sites, the queue filter behavior with both `completed` and `canceled` workflow types, the new Status column, the drain-side `fetchReady` filter, and the storage round-trip for the new `status_type` column).
+
 ## 0.12.0 — 2026-05-20
 
 Minor release. Three PRs since 0.11.1: one dashboard feature (Linear project Name + UUID in the Todo queue), one telemetry startup fix that blocked any `runway run` with OTLP enabled, and one CI fix that makes the published dashboard image run on Apple Silicon out of the box.
