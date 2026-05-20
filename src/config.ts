@@ -171,6 +171,22 @@ export interface RunwayConfig {
    * `RUNWAY_META_WEEKLY_MODEL`.
    */
   readonly metaWeeklyModel?: string;
+  /**
+   * VA-460: feature gate for the post-PR shepherd phase. When `false`
+   * (default) the orchestrator returns immediately after `finalize`
+   * opens the PR — the historical behavior. When `true` the shepherd
+   * loop runs against the open PR until merged / ready / HITL.
+   * Source: `RUNWAY_SHEPHERD_ENABLED` ("1" / "true" accepted).
+   */
+  readonly shepherdEnabled: boolean;
+  /**
+   * VA-460: how often the shepherd loop polls the three subscriptions
+   * (mergeability / CI / reviewer). Default `15` seconds — picked to
+   * keep GitHub API calls under the unauthenticated 60/hour limit
+   * even with several PRs in flight. Source:
+   * `RUNWAY_SHEPHERD_POLL_INTERVAL_SECONDS`.
+   */
+  readonly shepherdPollIntervalSeconds: number;
 }
 
 // Back-compat alias — existing consumers (orchestrator, gateways)
@@ -251,6 +267,22 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
     EConfig.string("RUNWAY_REPO_PROJECT_NAME"),
   ),
   metaWeeklyModel: EConfig.option(EConfig.string("RUNWAY_META_WEEKLY_MODEL")),
+  // VA-460: feature gate; default `false` for the first ship so the
+  // composer's post-finalize behavior is unchanged until VA-461..463
+  // wire the subscriptions.
+  shepherdEnabled: EConfig.boolean("RUNWAY_SHEPHERD_ENABLED").pipe(
+    EConfig.withDefault(false),
+  ),
+  shepherdPollIntervalSeconds: EConfig.integer(
+    "RUNWAY_SHEPHERD_POLL_INTERVAL_SECONDS",
+  ).pipe(
+    EConfig.withDefault(15),
+    EConfig.validate({
+      message:
+        "RUNWAY_SHEPHERD_POLL_INTERVAL_SECONDS must be a positive integer",
+      validation: (n): n is number => n > 0,
+    }),
+  ),
 }).pipe(
   Effect.map(
     (raw): RunwayConfig => ({
@@ -278,6 +310,8 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
       ),
       runwayRepoProjectName: Option.getOrUndefined(raw.runwayRepoProjectName),
       metaWeeklyModel: Option.getOrUndefined(raw.metaWeeklyModel),
+      shepherdEnabled: raw.shepherdEnabled,
+      shepherdPollIntervalSeconds: raw.shepherdPollIntervalSeconds,
     }),
   ),
 );

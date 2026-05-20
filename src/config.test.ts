@@ -140,6 +140,34 @@ describe("VA-359 — Effect.Config + Redacted secrets", () => {
     expect(cfg.opServiceAccountToken).toBeUndefined();
   });
 
+  it("VA-460: shepherdEnabled defaults to false and parses RUNWAY_SHEPHERD_ENABLED", () => {
+    expect(loadConfig({ LINEAR_API_KEY: "lin_test" }).shepherdEnabled).toBe(
+      false,
+    );
+    expect(
+      loadConfig({ LINEAR_API_KEY: "lin_test", RUNWAY_SHEPHERD_ENABLED: "true" })
+        .shepherdEnabled,
+    ).toBe(true);
+  });
+
+  it("VA-460: shepherdPollIntervalSeconds defaults to 15 and parses positive integers", () => {
+    expect(
+      loadConfig({ LINEAR_API_KEY: "lin_test" }).shepherdPollIntervalSeconds,
+    ).toBe(15);
+    expect(
+      loadConfig({
+        LINEAR_API_KEY: "lin_test",
+        RUNWAY_SHEPHERD_POLL_INTERVAL_SECONDS: "30",
+      }).shepherdPollIntervalSeconds,
+    ).toBe(30);
+    expect(() =>
+      loadConfig({
+        LINEAR_API_KEY: "lin_test",
+        RUNWAY_SHEPHERD_POLL_INTERVAL_SECONDS: "0",
+      }),
+    ).toThrow(/positive integer/);
+  });
+
   it("ConfigLive Layer provides the resolved config via ConfigTag", async () => {
     const ConfigLayer = makeConfigLive({ LINEAR_API_KEY: "lin_layer_test" });
     const program = Effect.gen(function* () {

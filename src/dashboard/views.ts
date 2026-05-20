@@ -563,7 +563,7 @@ export interface DetailViewModel {
 }
 
 interface PhaseRow {
-  readonly name: "implement" | "review" | "finalize";
+  readonly name: "implement" | "review" | "finalize" | "shepherd";
   readonly startNs: bigint;
   readonly endNs: bigint;
 }
@@ -625,6 +625,8 @@ export function renderDetailView(vm: DetailViewModel): string {
     .timeline .phase-implement { background: #60a5fa; }
     .timeline .phase-review    { background: #facc15; }
     .timeline .phase-finalize  { background: #4ade80; }
+    /* VA-460: shepherd phase (post-finalize PR loop). */
+    .timeline .phase-shepherd  { background: #a78bfa; }
     .timeline-legend { font-size: 11px; color: #9ca3af; margin-bottom: 16px; }
     .iter-row td { background: #16161a; padding-left: 32px; }
     .iter-status { font-weight: 600; }
@@ -749,6 +751,18 @@ function computePhases(vm: DetailViewModel): readonly PhaseRow[] {
     const startNs = minBigInt(finalize.map((p) => parseNs(p.startTimeUnixNano)));
     const endNs = maxBigInt(finalize.map((p) => parseNs(p.endTimeUnixNano)));
     phases.push({ name: "finalize", startNs, endNs });
+  }
+
+  // VA-460: shepherd phase runs after finalize when the feature gate
+  // is on. Only present for drains with `shepherdEnabled=true`; pre-
+  // gate issue processes show the original three phases unchanged.
+  const shepherd = vm.phaseSpans.find((p) => p.name === "shepherd");
+  if (shepherd) {
+    phases.push({
+      name: "shepherd",
+      startNs: parseNs(shepherd.startTimeUnixNano),
+      endNs: parseNs(shepherd.endTimeUnixNano),
+    });
   }
 
   return phases;

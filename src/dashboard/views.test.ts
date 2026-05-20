@@ -429,6 +429,33 @@ describe("renderDetailView (VA-389)", () => {
     expect(html).toContain("finalize");
   });
 
+  it("VA-460: renders a shepherd phase row when the shepherd span is present", () => {
+    const html = renderDetailView(
+      detailVm({
+        iterations: [iter()],
+        phaseSpans: [
+          phase({
+            name: "review",
+            startTimeUnixNano: "1715000010000000000",
+            endTimeUnixNano: "1715000015000000000",
+          }),
+          phase({
+            name: "openPullRequest",
+            startTimeUnixNano: "1715000016000000000",
+            endTimeUnixNano: "1715000017000000000",
+          }),
+          phase({
+            name: "shepherd",
+            startTimeUnixNano: "1715000018000000000",
+            endTimeUnixNano: "1715000022000000000",
+          }),
+        ],
+      }),
+    );
+    expect(html).toContain("shepherd");
+    expect(html).toContain("phase-shepherd");
+  });
+
   it("expands implement to show one row per iteration with index, duration, and exit status", () => {
     const html = renderDetailView(
       detailVm({
