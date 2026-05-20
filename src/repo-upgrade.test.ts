@@ -392,4 +392,29 @@ describe("renderDockerfile manual-edit detector (VA-466)", () => {
       renderDockerfile(tmpDir, 1, { ...opts, force: true }, true),
     ).not.toThrow();
   });
+
+  it("tier-2: 0.13.0 base + standard varlock splice (the FFL manager reproducer) does NOT flag", () => {
+    // The exact shape the FFL manager hit on 0.13.0 → 0.14.0: a
+    // local Dockerfile composed of the v0.13.0 canonical base with
+    // the tier-2 varlock+1Password splice spliced in immediately
+    // before the ENTRYPOINT line. The detector must accept this
+    // because (a) the base content is in the history union and (b)
+    // the splice content matches the current snippet (which lives
+    // in `after` via the same splice logic renderDockerfile uses).
+    const v013Base = readFileSync(
+      join(TEMPLATES_DIR, "history", "Dockerfile.claude-code.base.v0.13.0"),
+      "utf8",
+    );
+    const snippet = readFileSync(
+      join(TEMPLATES_DIR, "dockerfile-varlock.snippet"),
+      "utf8",
+    );
+    const spliced = v013Base.replace(
+      /^ENTRYPOINT \["sleep", "infinity"\]$/m,
+      `${snippet.trimEnd()}\n\nENTRYPOINT ["sleep", "infinity"]`,
+    );
+    writeFileSync(join(tmpDir, ".sandcastle", "Dockerfile"), spliced);
+
+    expect(() => renderDockerfile(tmpDir, 2, opts, true)).not.toThrow();
+  });
 });

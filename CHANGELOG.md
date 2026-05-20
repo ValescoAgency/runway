@@ -4,6 +4,19 @@ All notable changes to runway are documented here. Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); breaking
 changes bump the major.
 
+## 0.14.1 — 2026-05-20
+
+Patch release. One PR — `runway upgrade-repo`'s manual-edit detector was reporting "manual Dockerfile edits detected" on target repos whose `.sandcastle/Dockerfile` was vendored by an older runway, forcing operators to pass `--force` and lose the detector's real signal. Surfaced on the FFL manager during the 0.13.0 → 0.14.0 upgrade.
+
+### Fixed
+
+- **`upgrade-repo`'s manual-edit detector no longer flags prior-version canonical template lines** ([PR #172](https://github.com/ValescoAgency/runway/pull/172), VA-466). The detector at `src/repo-upgrade.ts` built `expectedLines` from the current canonical template only, so any cross-version delta (e.g. VA-457's corepack-home additions between 0.13.0 and 0.14.0) looked like a hand edit. The fix adds `templates/history/` as a snapshot directory and unions lines from every file under `templates/history/Dockerfile.claude-code.base*` into `expectedLines` alongside the current template + tier-2 splice. A true manual edit (a line absent from both current and every historical snapshot) still trips the detector — four new tests in `src/repo-upgrade.test.ts` cover the tier-1 historical pass, the tier-2 historical-plus-varlock-splice pass (the exact shape that bit the FFL manager), the genuine-manual-edit trip, and the `--force` bypass. `renderDockerfile` is exported so the detector is unit-testable directly. Going forward, each release that mutates a template snapshots the prior version into `templates/history/` BEFORE the edit lands; this release back-fills the v0.13.0 snapshot retroactively.
+
+### Internal — release stats
+
+- **1 PR since 0.14.0** (1 fix).
+- 59 test files, 814 specs pass (+4 — coverage for the history union, the tier-2 FFL-manager-shape regression case, defense-in-depth for true manual edits, and the `--force` bypass).
+
 ## 0.14.0 — 2026-05-20
 
 Minor release. Four PRs since 0.13.0 — two sandbox-side fixes that materially unblock autonomous drains (reviewer was launching against the wrong branch and idling out; lefthook inside the sandbox couldn't find pnpm), a dashboard observability addition that lights up the active-drain card within ~1s of `runway run` instead of waiting 5–15 minutes for the first issue to complete, and a sandcastle error-message improvement that surfaces the log-file tail inline.
