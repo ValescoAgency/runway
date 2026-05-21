@@ -5,8 +5,8 @@ import type { PlannerReadClient, ReadyForAgentRow } from "./planner-storage.js";
 /**
  * VA-476: queue-selection capability. Each planner tick, picks the
  * top-of-queue ready issue and emits a `planner.recommendation.proposed`
- * marker — unless the same target already has an open recommendation
- * (proposed / accepted) or an in-flight action.
+ * marker — unless the same target already has any recommendation row
+ * (proposed / accepted / rejected) or an in-flight action.
  *
  * v1 ordering: `queue_position ASC` then `issue_identifier ASC` as
  * a deterministic tiebreaker. Linear priority is deferred — it isn't
