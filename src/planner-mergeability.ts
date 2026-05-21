@@ -6,6 +6,10 @@ import {
   PLANNER_ACTION_STARTED_LOG,
   PLANNER_RECOMMENDATION_PROPOSED_LOG,
 } from "./dashboard/projector.js";
+import {
+  autoAcceptIfEligible,
+  resolveCapabilityMode,
+} from "./planner-capability-mode.js";
 import type { GithubGateway } from "./github.js";
 import type { RunwayIssue } from "./linear.js";
 import type {
@@ -199,6 +203,10 @@ export const evaluateMergeability = (
   ctx: MergeabilityCapabilityContext,
 ): Effect.Effect<MergeabilityEvalResult> =>
   Effect.gen(function* () {
+    // VA-481: manual → silent capability.
+    const mode = resolveCapabilityMode(ctx.readClient, MERGEABILITY_CAPABILITY);
+    if (mode === "manual") return EMPTY;
+
     const prs = ctx.readClient.listOpenShepherdedPrs();
     if (prs.length === 0) return EMPTY;
 
@@ -217,6 +225,7 @@ export const evaluateMergeability = (
         ctx,
         row,
         watcher,
+        mode,
         proposed,
         actionsCompleted,
         actionsFailed,
@@ -243,6 +252,7 @@ interface EvaluateOnePrArgs {
   readonly ctx: MergeabilityCapabilityContext;
   readonly row: OpenShepherdedPrRow;
   readonly watcher: Subscription;
+  readonly mode: import("./dashboard/storage.js").PlannerCapabilityMode;
   readonly proposed: string[];
   readonly actionsCompleted: string[];
   readonly actionsFailed: string[];
@@ -305,11 +315,21 @@ const evaluateOnePr = (
     }
 
     if (!existing) {
+      // VA-481: mergeability fixes are mechanical (rebase against
+      // base). Auto-approve-eligible.
+      const autoApproveEligible = true;
       yield* emitProposed({
         recommendationId,
         prNumber: row.prNumber,
         description: signal.description,
         nowNano: ctx.now(),
+        autoApproveEligible,
+      });
+      yield* autoAcceptIfEligible({
+        mode: args.mode,
+        recommendationId,
+        autoApproveEligible,
+        now: ctx.now,
       });
       args.proposed.push(recommendationId);
       return;
@@ -332,6 +352,7 @@ interface EmitProposedArgs {
   readonly prNumber: number;
   readonly description: string;
   readonly nowNano: string;
+  readonly autoApproveEligible: boolean;
 }
 
 const emitProposed = (args: EmitProposedArgs): Effect.Effect<void> => {
@@ -345,7 +366,7 @@ const emitProposed = (args: EmitProposedArgs): Effect.Effect<void> => {
       target: `PR-${args.prNumber}`,
       summary: args.description,
       evidence: JSON.stringify(evidence),
-      autoApproveEligible: "false",
+      autoApproveEligible: String(args.autoApproveEligible),
       timestampUnixNano: args.nowNano,
     }),
   );

@@ -499,7 +499,7 @@ describe("evaluateCi — capability dispatcher (VA-478)", () => {
         recommendationId: expectedId,
         capability: CI_CAPABILITY,
         target: "PR-777",
-        autoApproveEligible: "false",
+        autoApproveEligible: "true",
       });
       expect(String(proposed?.attrs.summary)).toMatch(/Re-impl after CI failure/);
       const evidence = JSON.parse(String(proposed?.attrs.evidence));

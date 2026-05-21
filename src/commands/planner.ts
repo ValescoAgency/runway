@@ -11,6 +11,7 @@ import {
   type PlannerCapabilities,
 } from "../planner.js";
 import {
+  PLANNER_CAPABILITY_MODE_CHANGED_LOG,
   PLANNER_RECOMMENDATION_ACCEPTED_LOG,
   PLANNER_RECOMMENDATION_REJECTED_LOG,
 } from "../dashboard/projector.js";
@@ -52,13 +53,15 @@ VERBS
 OPTIONS
   --help, -h    Show this help.
 
-ENDPOINTS (VA-475)
+ENDPOINTS (VA-475 / VA-481)
   GET  /planner/health                                liveness probe
   GET  /planner/recommendations[?status=&limit=N]     list (status: proposed|accepted|rejected|all)
   GET  /planner/recommendations/:id                   single
   POST /planner/recommendations/:id/accept            emits accepted
   POST /planner/recommendations/:id/reject            emits rejected (requires { reason })
   GET  /planner/actions[?status=]                     list (status: started|completed|failed|all)
+  GET  /planner/capabilities                          per-capability modes (VA-481)
+  PUT  /planner/capabilities/:capability              body { mode: "manual"|"suggest"|"auto" }
 
   Auth is network-layer (Tailscale ACLs). Same-origin-only CORS —
   browsers at a different origin are rejected; route through the
@@ -290,6 +293,23 @@ export function makeDecisionEmitter(
             recommendationId,
             source,
             reason,
+            timestampUnixNano,
+          }),
+        ),
+      );
+    },
+    emitCapabilityModeChanged: ({
+      capability,
+      mode,
+      updatedBy,
+      timestampUnixNano,
+    }) => {
+      runFork(
+        Effect.logInfo(PLANNER_CAPABILITY_MODE_CHANGED_LOG).pipe(
+          Effect.annotateLogs({
+            capability,
+            mode,
+            updatedBy,
             timestampUnixNano,
           }),
         ),

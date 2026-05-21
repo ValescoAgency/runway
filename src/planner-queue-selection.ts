@@ -1,5 +1,9 @@
 import { Effect } from "effect";
 import { PLANNER_RECOMMENDATION_PROPOSED_LOG } from "./dashboard/projector.js";
+import {
+  autoAcceptIfEligible,
+  resolveCapabilityMode,
+} from "./planner-capability-mode.js";
 import type { PlannerReadClient, ReadyForAgentRow } from "./planner-storage.js";
 
 /**
@@ -56,6 +60,15 @@ export const evaluateQueueSelection = (
   ctx: QueueSelectionContext,
 ): Effect.Effect<QueueSelectionResult> =>
   Effect.gen(function* () {
+    // VA-481: manual mode → capability stays silent.
+    const mode = resolveCapabilityMode(
+      ctx.readClient,
+      QUEUE_SELECTION_CAPABILITY,
+    );
+    if (mode === "manual") {
+      return { kind: "no-ready" as const, target: null };
+    }
+
     const ready = ctx.readClient.listReadyForAgent({
       readyLabel: ctx.readyLabel,
     });
@@ -89,6 +102,12 @@ export const evaluateQueueSelection = (
       projectName: pick.projectName,
     };
 
+    // VA-481: queue-selection picks are auto-approve-eligible (FIFO
+    // pickup is purely mechanical), so when the capability is in
+    // `auto` mode the operator-accept step is bypassed and the
+    // drain-spawn capability picks up the issue on the next tick.
+    const autoApproveEligible = true;
+
     yield* Effect.logInfo(PLANNER_RECOMMENDATION_PROPOSED_LOG).pipe(
       Effect.annotateLogs({
         recommendationId,
@@ -96,10 +115,17 @@ export const evaluateQueueSelection = (
         target: pick.issueIdentifier,
         summary,
         evidence: JSON.stringify(evidence),
-        autoApproveEligible: "false",
+        autoApproveEligible: String(autoApproveEligible),
         timestampUnixNano: ctx.now(),
       }),
     );
+
+    yield* autoAcceptIfEligible({
+      mode,
+      recommendationId,
+      autoApproveEligible,
+      now: ctx.now,
+    });
 
     return { kind: "emitted" as const, target: pick.issueIdentifier };
   });

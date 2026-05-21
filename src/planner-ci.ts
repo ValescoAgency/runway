@@ -8,6 +8,10 @@ import {
   PLANNER_ACTION_STARTED_LOG,
   PLANNER_RECOMMENDATION_PROPOSED_LOG,
 } from "./dashboard/projector.js";
+import {
+  autoAcceptIfEligible,
+  resolveCapabilityMode,
+} from "./planner-capability-mode.js";
 import type { CheckRun, GithubGateway } from "./github.js";
 import type { RunwayIssue } from "./linear.js";
 import type {
@@ -370,6 +374,9 @@ export const evaluateCi = (
   ctx: CiCapabilityContext,
 ): Effect.Effect<CiEvalResult> =>
   Effect.gen(function* () {
+    const mode = resolveCapabilityMode(ctx.readClient, CI_CAPABILITY);
+    if (mode === "manual") return EMPTY;
+
     const prs = ctx.readClient.listOpenShepherdedPrs();
     if (prs.length === 0) return EMPTY;
 
@@ -381,6 +388,7 @@ export const evaluateCi = (
       yield* evaluateOnePr({
         ctx,
         row,
+        mode,
         proposed,
         actionsCompleted,
         actionsFailed,
@@ -403,6 +411,7 @@ export const evaluateCi = (
 interface EvaluateOnePrArgs {
   readonly ctx: CiCapabilityContext;
   readonly row: OpenShepherdedPrRow;
+  readonly mode: import("./dashboard/storage.js").PlannerCapabilityMode;
   readonly proposed: string[];
   readonly actionsCompleted: string[];
   readonly actionsFailed: string[];
@@ -491,7 +500,11 @@ const evaluateOnePr = (
       return;
     }
 
-    // No existing recommendation — emit one.
+    // No existing recommendation — emit one. CI fixes are auto-
+    // approve-eligible: the failing required check + log-tail hash
+    // uniquely identify the fix flavor, so the planner can
+    // fast-forward to accept under `auto` mode.
+    const autoApproveEligible = true;
     yield* emitProposed({
       recommendationId,
       prNumber: row.prNumber,
@@ -499,6 +512,13 @@ const evaluateOnePr = (
       headSha: pr.headSha,
       logTail,
       nowNano: ctx.now(),
+      autoApproveEligible,
+    });
+    yield* autoAcceptIfEligible({
+      mode: args.mode,
+      recommendationId,
+      autoApproveEligible,
+      now: ctx.now,
     });
     args.proposed.push(recommendationId);
   });
@@ -510,6 +530,7 @@ interface EmitProposedArgs {
   readonly headSha: string;
   readonly logTail: string;
   readonly nowNano: string;
+  readonly autoApproveEligible: boolean;
 }
 
 const emitProposed = (args: EmitProposedArgs): Effect.Effect<void> => {
@@ -526,7 +547,7 @@ const emitProposed = (args: EmitProposedArgs): Effect.Effect<void> => {
       target: `PR-${args.prNumber}`,
       summary: `Re-impl after CI failure in \`${args.checkName}\``,
       evidence: JSON.stringify(evidence),
-      autoApproveEligible: "false",
+      autoApproveEligible: String(args.autoApproveEligible),
       timestampUnixNano: args.nowNano,
     }),
   );

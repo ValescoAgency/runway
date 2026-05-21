@@ -126,7 +126,7 @@ describe("evaluateQueueSelection — VA-476", () => {
       recommendationId: "queue-selection:VA-101",
       capability: QUEUE_SELECTION_CAPABILITY,
       target: "VA-101",
-      autoApproveEligible: "false",
+      autoApproveEligible: "true",
       timestampUnixNano: "1715000010000000000",
     });
     expect(String(emit?.attrs.summary)).toContain("VA-101");
@@ -301,5 +301,50 @@ describe("evaluateQueueSelection — VA-476", () => {
       target: string;
     };
     expect(result.target).toBe("VA-200");
+  });
+
+  // VA-481 — capability-mode gating
+  it("manual mode → capability stays silent (no emissions, no dedup hit)", async () => {
+    seedSnapshot({ identifier: "VA-900", queuePosition: 0 });
+    writer.recordPlannerCapabilityModeChange({
+      capability: "queue-selection",
+      mode: "manual",
+      updatedBy: "operator",
+      timestampUnixNano: "1715000000000000000",
+    });
+
+    const result = (await runProgram(evaluateQueueSelection(ctx))) as {
+      kind: string;
+      target: string | null;
+    };
+    expect(result.kind).toBe("no-ready");
+    expect(sink.filter((l) => l.message === PLANNER_RECOMMENDATION_PROPOSED_LOG)).toHaveLength(0);
+  });
+
+  it("auto mode → emits both recommendation.proposed AND recommendation.accepted (source=auto)", async () => {
+    seedSnapshot({ identifier: "VA-901", queuePosition: 0 });
+    writer.recordPlannerCapabilityModeChange({
+      capability: "queue-selection",
+      mode: "auto",
+      updatedBy: "operator",
+      timestampUnixNano: "1715000000000000000",
+    });
+
+    const result = (await runProgram(evaluateQueueSelection(ctx))) as {
+      kind: string;
+      target: string;
+    };
+    expect(result.target).toBe("VA-901");
+
+    const proposed = sink.find(
+      (l) => l.message === PLANNER_RECOMMENDATION_PROPOSED_LOG,
+    );
+    expect(proposed?.attrs.autoApproveEligible).toBe("true");
+    const accepted = sink.find(
+      (l) => l.message === "planner.recommendation.accepted",
+    );
+    expect(accepted).toBeDefined();
+    expect(accepted?.attrs.source).toBe("auto");
+    expect(accepted?.attrs.recommendationId).toBe("queue-selection:VA-901");
   });
 });

@@ -21,10 +21,15 @@ let writer: Storage;
 let readClient: PlannerReadClient;
 let running: RunningPlannerHttpServer;
 let base: string;
-let emit: { accepted: Array<unknown>; rejected: Array<unknown> };
+let emit: {
+  accepted: Array<unknown>;
+  rejected: Array<unknown>;
+  capabilityModeChanged: Array<unknown>;
+};
 const emitter: DecisionEmitter = {
   emitAccepted: (m) => emit.accepted.push(m),
   emitRejected: (m) => emit.rejected.push(m),
+  emitCapabilityModeChanged: (m) => emit.capabilityModeChanged.push(m),
 };
 
 const health = () => ({
@@ -35,7 +40,7 @@ const health = () => ({
 });
 
 beforeEach(async () => {
-  emit = { accepted: [], rejected: [] };
+  emit = { accepted: [], rejected: [], capabilityModeChanged: [] };
   dir = mkdtempSync(join(tmpdir(), "planner-http-"));
   dbPath = join(dir, "runway.sqlite");
   writer = createStorage(dbPath);
@@ -393,7 +398,11 @@ describe("planner HTTP — DecisionEmitter is wired through correctly", () => {
       port: 0,
       readClient,
       getHealth: health,
-      emitter: { emitAccepted: accSpy, emitRejected: vi.fn() },
+      emitter: {
+        emitAccepted: accSpy,
+        emitRejected: vi.fn(),
+        emitCapabilityModeChanged: vi.fn(),
+      },
     });
     try {
       await fetch(`http://127.0.0.1:${stubRunning.port}/planner/recommendations/rec-once/accept`, {
@@ -458,6 +467,7 @@ describe("planner HTTP — end-to-end accept lifecycle (VA-475 acceptance)", () 
           reason: m.reason,
           timestampUnixNano: m.timestampUnixNano,
         }),
+      emitCapabilityModeChanged: vi.fn(),
     };
     const e2eServer = await startPlannerHttpServer({
       host: "127.0.0.1",
@@ -596,5 +606,83 @@ describe("planner HTTP — same-origin CORS (VA-475)", () => {
       headers: { Origin: "http://other.host" },
     });
     expect(blocked.status).toBe(403);
+  });
+
+  // -------------------------------------------------------------------------
+  // VA-481 — capability mode endpoints
+  // -------------------------------------------------------------------------
+
+  it("GET /planner/capabilities returns suggest defaults for never-set capabilities", async () => {
+    const res = await fetch(`${base}/planner/capabilities`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      capabilities: ReadonlyArray<{ capability: string; mode: string }>;
+    };
+    const map = new Map(body.capabilities.map((c) => [c.capability, c.mode]));
+    expect(map.get("queue-selection")).toBe("suggest");
+    expect(map.get("shepherd-mergeability")).toBe("suggest");
+    expect(map.get("shepherd-ci")).toBe("suggest");
+    expect(map.get("shepherd-reviewer")).toBe("suggest");
+  });
+
+  it("GET /planner/capabilities reflects explicit DB rows", async () => {
+    writer.recordPlannerCapabilityModeChange({
+      capability: "queue-selection",
+      mode: "auto",
+      updatedBy: "operator",
+      timestampUnixNano: "1715000010000000000",
+    });
+    const res = await fetch(`${base}/planner/capabilities`);
+    const body = (await res.json()) as {
+      capabilities: ReadonlyArray<{ capability: string; mode: string }>;
+    };
+    const map = new Map(body.capabilities.map((c) => [c.capability, c.mode]));
+    expect(map.get("queue-selection")).toBe("auto");
+    expect(map.get("shepherd-ci")).toBe("suggest");
+  });
+
+  it("PUT /planner/capabilities/:capability emits mode_changed", async () => {
+    const res = await fetch(`${base}/planner/capabilities/queue-selection`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "auto" }),
+    });
+    expect(res.status).toBe(202);
+    const body = (await res.json()) as { capability: string; mode: string };
+    expect(body).toEqual({ capability: "queue-selection", mode: "auto" });
+    expect(emit.capabilityModeChanged).toHaveLength(1);
+    expect(emit.capabilityModeChanged[0]).toMatchObject({
+      capability: "queue-selection",
+      mode: "auto",
+      updatedBy: "operator",
+    });
+  });
+
+  it("PUT /planner/capabilities rejects unknown capability with 404", async () => {
+    const res = await fetch(`${base}/planner/capabilities/not-a-real-cap`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "auto" }),
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it("PUT /planner/capabilities rejects invalid mode with 400", async () => {
+    const res = await fetch(`${base}/planner/capabilities/queue-selection`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "yolo" }),
+    });
+    expect(res.status).toBe(400);
+    expect(emit.capabilityModeChanged).toHaveLength(0);
+  });
+
+  it("PUT /planner/capabilities rejects non-JSON body with 415", async () => {
+    const res = await fetch(`${base}/planner/capabilities/queue-selection`, {
+      method: "PUT",
+      headers: { "Content-Type": "text/plain" },
+      body: "mode=auto",
+    });
+    expect(res.status).toBe(415);
   });
 });

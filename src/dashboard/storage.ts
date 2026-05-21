@@ -316,6 +316,22 @@ export interface PlannerActionFailedMarker {
   readonly timestampUnixNano: string;
 }
 
+export type PlannerCapabilityMode = "manual" | "suggest" | "auto";
+
+export interface PlannerCapabilityModeRow {
+  readonly capability: PlannerCapability;
+  readonly mode: PlannerCapabilityMode;
+  readonly updatedUnixNano: string;
+  readonly updatedBy: string;
+}
+
+export interface PlannerCapabilityModeChangedMarker {
+  readonly capability: PlannerCapability;
+  readonly mode: PlannerCapabilityMode;
+  readonly updatedBy: string;
+  readonly timestampUnixNano: string;
+}
+
 export interface Storage {
   saveDrain(d: DrainRow): void;
   /**
@@ -521,6 +537,22 @@ export interface Storage {
    * to avoid double-spawning on the same target.
    */
   getActivePlannerActions(): readonly PlannerActionRow[];
+  /**
+   * VA-481: upsert a capability mode. Idempotent UPSERT keyed on
+   * `capability`. The CASE-guard only overwrites when the incoming
+   * timestamp is newer than the stored one — protects against
+   * out-of-order OTLP batch arrival.
+   */
+  recordPlannerCapabilityModeChange(
+    m: PlannerCapabilityModeChangedMarker,
+  ): void;
+  /**
+   * VA-481: read all capability modes. Missing capabilities default
+   * to `suggest` on the read side (the planner's cache helper does
+   * the defaulting); this method returns only rows that have been
+   * explicitly set.
+   */
+  listPlannerCapabilityModes(): readonly PlannerCapabilityModeRow[];
   /**
    * VA-402: upsert one row in `meta_reviews`. The IRA's three passes
    * (Run Review, Drain Review, Weekly Review) all write through this
@@ -860,6 +892,17 @@ const SCHEMA = `
 
   CREATE INDEX IF NOT EXISTS idx_planner_actions_status
     ON planner_actions(status, started_unix_nano);
+
+  -- VA-481: per-capability mode (manual / suggest / auto). One row
+  -- per capability; defaults to 'suggest' on first observation. The
+  -- planner reads this table on every tick to decide whether to
+  -- propose, auto-accept, or stay silent for a given capability.
+  CREATE TABLE IF NOT EXISTS planner_capability_modes (
+    capability TEXT PRIMARY KEY,
+    mode TEXT NOT NULL,
+    updated_unix_nano TEXT NOT NULL,
+    updated_by TEXT NOT NULL
+  );
 `;
 
 const DEFAULT_AGGREGATE_WINDOW = 30;
@@ -1646,6 +1689,44 @@ export function createStorage(
       m.actionId,
     );
   };
+  // VA-481: capability-mode upsert. The WHERE clause ensures a stale
+  // marker doesn't clobber a newer mode change.
+  const upsertCapabilityModeStmt = db.prepare(`
+    INSERT INTO planner_capability_modes
+      (capability, mode, updated_unix_nano, updated_by)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT (capability) DO UPDATE SET
+      mode = excluded.mode,
+      updated_unix_nano = excluded.updated_unix_nano,
+      updated_by = excluded.updated_by
+    WHERE CAST(planner_capability_modes.updated_unix_nano AS INTEGER)
+      < CAST(excluded.updated_unix_nano AS INTEGER)
+  `);
+  const listCapabilityModesStmt = db.prepare(`
+    SELECT capability, mode, updated_unix_nano, updated_by
+    FROM planner_capability_modes
+  `);
+  const recordPlannerCapabilityModeChange = (
+    m: PlannerCapabilityModeChangedMarker,
+  ): void => {
+    upsertCapabilityModeStmt.run(
+      m.capability,
+      m.mode,
+      m.timestampUnixNano,
+      m.updatedBy,
+    );
+  };
+  const listPlannerCapabilityModes = (): readonly PlannerCapabilityModeRow[] => {
+    const rows = listCapabilityModesStmt.all() as unknown as ReadonlyArray<
+      Record<string, unknown>
+    >;
+    return rows.map((r) => ({
+      capability: String(r.capability ?? "") as PlannerCapability,
+      mode: String(r.mode ?? "suggest") as PlannerCapabilityMode,
+      updatedUnixNano: String(r.updated_unix_nano ?? ""),
+      updatedBy: String(r.updated_by ?? "operator"),
+    }));
+  };
   const getRecentPlannerRecommendations = (
     limit = 50,
   ): readonly PlannerRecommendationRow[] => {
@@ -2094,6 +2175,8 @@ export function createStorage(
     recordPlannerActionStarted,
     recordPlannerActionCompleted,
     recordPlannerActionFailed,
+    recordPlannerCapabilityModeChange,
+    listPlannerCapabilityModes,
     getRecentPlannerRecommendations,
     getPlannerRecommendation,
     getActivePlannerActions,

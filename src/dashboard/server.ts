@@ -30,6 +30,7 @@ import {
   renderLogsSection,
   renderMetaReviewDetailView,
   renderMetaReviewListView,
+  renderPlannerPanel,
   type ListFilterState,
   type MetaReviewListFilterState,
 } from "./views.js";
@@ -287,6 +288,12 @@ async function handle(
     return;
   }
 
+  // VA-481: planner panel — recommendations + capability modes.
+  if (method === "GET" && (url === "/planner" || url.startsWith("/planner?"))) {
+    handlePlannerPanel(res, storage);
+    return;
+  }
+
   if (method === "GET" && url === "/healthz") {
     res.writeHead(200, { "content-type": "text/plain" });
     res.end("ok");
@@ -498,6 +505,14 @@ async function handleOtlpLogs(
         storage.recordPlannerActionFailed({
           actionId: m.actionId,
           error: m.error,
+          timestampUnixNano: m.timestampUnixNano,
+        });
+        break;
+      case "capability.mode_changed":
+        storage.recordPlannerCapabilityModeChange({
+          capability: m.capability,
+          mode: m.mode,
+          updatedBy: m.updatedBy,
           timestampUnixNano: m.timestampUnixNano,
         });
         break;
@@ -886,6 +901,57 @@ function handleAggregates(res: ServerResponse, storage: Storage): void {
   const rows = storage.listAggregates();
   res.writeHead(200, { "content-type": "application/json" });
   res.end(JSON.stringify({ view: "evaluator_aggregates_v1", rows }));
+}
+
+const KNOWN_PLANNER_CAPABILITIES: ReadonlyArray<{
+  capability: string;
+}> = [
+  { capability: "queue-selection" },
+  { capability: "shepherd-mergeability" },
+  { capability: "shepherd-ci" },
+  { capability: "shepherd-reviewer" },
+];
+
+function handlePlannerPanel(res: ServerResponse, storage: Storage): void {
+  const explicit = storage.listPlannerCapabilityModes();
+  const byCap = new Map(explicit.map((r) => [r.capability, r]));
+  const capabilities = KNOWN_PLANNER_CAPABILITIES.map((c) => {
+    const row = byCap.get(c.capability as Parameters<typeof byCap.get>[0]);
+    return row
+      ? {
+          capability: row.capability,
+          mode: row.mode,
+          updatedUnixNano: row.updatedUnixNano,
+          updatedBy: row.updatedBy,
+        }
+      : {
+          capability: c.capability,
+          mode: "suggest" as const,
+          updatedUnixNano: null,
+          updatedBy: null,
+        };
+  });
+  const recommendations = storage
+    .getRecentPlannerRecommendations(20)
+    .map((r) => ({
+      recommendationId: r.recommendationId,
+      capability: r.capability,
+      target: r.target,
+      summary: r.summary,
+      status: r.status,
+      autoApproveEligible: r.autoApproveEligible,
+      proposedUnixNano: r.proposedUnixNano,
+      decidedBy: r.decidedBy,
+    }));
+  const plannerBaseUrl =
+    process.env.RUNWAY_PLANNER_BASE_URL ?? "http://127.0.0.1:3002";
+  const html = renderPlannerPanel({
+    capabilities,
+    recommendations,
+    plannerBaseUrl,
+  });
+  res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+  res.end(html);
 }
 
 /**

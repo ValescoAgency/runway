@@ -361,7 +361,7 @@ describe("evaluateMergeability — capability dispatcher (VA-477)", () => {
         recommendationId: `${MERGEABILITY_CAPABILITY}:PR-777`,
         capability: MERGEABILITY_CAPABILITY,
         target: "PR-777",
-        autoApproveEligible: "false",
+        autoApproveEligible: "true",
         timestampUnixNano: "1715000005000000000",
       });
       expect(String(proposed?.attrs.summary)).toMatch(

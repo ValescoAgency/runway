@@ -1663,3 +1663,118 @@ function renderExternalAnchor(rawUrl: unknown, label: string): string {
   if (safe === null) return escapeHtml(label);
   return `<a href="${escapeHtml(safe)}" rel="noopener noreferrer" target="_blank">${escapeHtml(label)}</a>`;
 }
+
+// ---------------------------------------------------------------------------
+// VA-481 — Planner panel
+// ---------------------------------------------------------------------------
+
+/**
+ * VA-481: capability + recommendation panel. Renders the per-capability
+ * mode chips (manual / suggest / auto) and the most-recent
+ * recommendations + their decision status. Buttons are intentionally
+ * not wired in this slice — the planner's HTTP API is reachable via
+ * Tailscale and operates under same-origin CORS, so any
+ * cross-process button click would need either a dashboard-side
+ * proxy or an explicit CORS allowlist for the dashboard's origin.
+ * The view ships with copy-paste curl snippets so operators can
+ * exercise the API immediately; the interactive UI is a follow-up.
+ */
+
+export interface PlannerPanelViewModel {
+  readonly capabilities: ReadonlyArray<{
+    readonly capability: string;
+    readonly mode: "manual" | "suggest" | "auto";
+    readonly updatedUnixNano: string | null;
+    readonly updatedBy: string | null;
+  }>;
+  readonly recommendations: ReadonlyArray<{
+    readonly recommendationId: string;
+    readonly capability: string;
+    readonly target: string;
+    readonly summary: string;
+    readonly status: "proposed" | "accepted" | "rejected";
+    readonly autoApproveEligible: boolean;
+    readonly proposedUnixNano: string;
+    readonly decidedBy: string | null;
+  }>;
+  readonly plannerBaseUrl: string;
+}
+
+export function renderPlannerPanel(vm: PlannerPanelViewModel): string {
+  const capabilityChips = vm.capabilities
+    .map((c) => {
+      const cls = `cap-mode cap-mode-${escapeHtml(c.mode)}`;
+      return `<span class="${cls}" title="updated by ${escapeHtml(c.updatedBy ?? "default")}">${escapeHtml(c.capability)}: <strong>${escapeHtml(c.mode)}</strong></span>`;
+    })
+    .join(" ");
+
+  const recommendationRows =
+    vm.recommendations.length === 0
+      ? `<tr><td colspan="5" class="muted">No recommendations yet.</td></tr>`
+      : vm.recommendations
+          .map((r) => {
+            const statusCls = `rec-status rec-status-${escapeHtml(r.status)}`;
+            const eligibility = r.autoApproveEligible
+              ? `<span class="rec-eligible">auto-eligible</span>`
+              : `<span class="rec-eligible muted">manual-only</span>`;
+            return `<tr>
+  <td><code>${escapeHtml(r.recommendationId)}</code></td>
+  <td>${escapeHtml(r.capability)}</td>
+  <td>${escapeHtml(r.target)}</td>
+  <td>${escapeHtml(r.summary)}</td>
+  <td><span class="${statusCls}">${escapeHtml(r.status)}</span>${r.decidedBy ? ` <span class="muted">(${escapeHtml(r.decidedBy)})</span>` : ""} ${eligibility}</td>
+</tr>`;
+          })
+          .join("");
+
+  const baseUrl = escapeHtml(vm.plannerBaseUrl);
+  const exampleId = vm.recommendations[0]?.recommendationId ?? "<recommendationId>";
+  const exampleCap = "queue-selection";
+  const curlBlock = `# Accept a recommendation
+curl -X POST '${baseUrl}/planner/recommendations/${escapeHtml(exampleId)}/accept' -H 'Content-Type: application/json' -d '{}'
+
+# Reject a recommendation (reason required)
+curl -X POST '${baseUrl}/planner/recommendations/${escapeHtml(exampleId)}/reject' -H 'Content-Type: application/json' -d '{"reason":"out of scope"}'
+
+# Promote a capability to auto
+curl -X PUT  '${baseUrl}/planner/capabilities/${exampleCap}' -H 'Content-Type: application/json' -d '{"mode":"auto"}'`;
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Planner — runway dashboard</title>
+<style>${SHARED_STYLE}
+  .cap-mode { display: inline-block; padding: 2px 8px; border-radius: 4px; margin-right: 6px; border: 1px solid #ccc; font-size: 0.9em; }
+  .cap-mode-manual { background: #fdd; border-color: #c66; }
+  .cap-mode-suggest { background: #eee; border-color: #999; }
+  .cap-mode-auto { background: #dfd; border-color: #393; }
+  .rec-status { padding: 2px 6px; border-radius: 3px; font-size: 0.85em; }
+  .rec-status-proposed { background: #eef; border: 1px solid #99c; }
+  .rec-status-accepted { background: #dfd; border: 1px solid #393; }
+  .rec-status-rejected { background: #fdd; border: 1px solid #c66; }
+  .rec-eligible { font-size: 0.8em; margin-left: 6px; }
+  .planner-cmds { background: #f4f4f4; border-radius: 4px; padding: 8px 12px; overflow-x: auto; }
+</style>
+</head>
+<body>
+<main class="container">
+  <h1>Planner</h1>
+  <p><a href="/">← back to runway dashboard</a></p>
+
+  <h2>Capabilities</h2>
+  <p>${capabilityChips}</p>
+
+  <h2>Recent recommendations</h2>
+  <table>
+    <thead><tr><th>id</th><th>capability</th><th>target</th><th>summary</th><th>status</th></tr></thead>
+    <tbody>${recommendationRows}</tbody>
+  </table>
+
+  <h2>Operator commands</h2>
+  <p>The planner HTTP API runs separately (Tailscale-gated). Interact via:</p>
+  <pre class="planner-cmds"><code>${escapeHtml(curlBlock)}</code></pre>
+</main>
+</body>
+</html>`;
+}

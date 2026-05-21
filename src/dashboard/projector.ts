@@ -390,6 +390,22 @@ export const PLANNER_RECOMMENDATION_REJECTED_LOG =
 export const PLANNER_ACTION_STARTED_LOG = "planner.action.started";
 export const PLANNER_ACTION_COMPLETED_LOG = "planner.action.completed";
 export const PLANNER_ACTION_FAILED_LOG = "planner.action.failed";
+/**
+ * VA-481: emitted by the planner's HTTP PUT /planner/capabilities/:capability
+ * handler when an operator (or the planner's auto-promotion logic)
+ * changes a capability's mode (manual / suggest / auto). The dashboard
+ * projects each event into the `planner_capability_modes` table; the
+ * planner reads the table on every tick so toggles take effect on
+ * the next iteration without a daemon restart.
+ */
+export const PLANNER_CAPABILITY_MODE_CHANGED_LOG =
+  "planner.capability.mode_changed";
+
+export const PLANNER_CAPABILITY_MODES = new Set<string>([
+  "manual",
+  "suggest",
+  "auto",
+]);
 
 const PLANNER_CAPABILITIES = new Set<string>([
   "queue-selection",
@@ -449,12 +465,26 @@ export interface PlannerActionFailedLogMarker {
   readonly timestampUnixNano: string;
 }
 
+export interface PlannerCapabilityModeChangedLogMarker {
+  readonly kind: "capability.mode_changed";
+  readonly capability:
+    | "queue-selection"
+    | "shepherd-mergeability"
+    | "shepherd-ci"
+    | "shepherd-reviewer";
+  readonly mode: "manual" | "suggest" | "auto";
+  /** "operator" for HTTP PUT, "auto" for planner-initiated promotions. */
+  readonly updatedBy: string;
+  readonly timestampUnixNano: string;
+}
+
 export type PlannerLogMarker =
   | PlannerRecommendationProposedLogMarker
   | PlannerRecommendationDecisionLogMarker
   | PlannerActionStartedLogMarker
   | PlannerActionCompletedLogMarker
-  | PlannerActionFailedLogMarker;
+  | PlannerActionFailedLogMarker
+  | PlannerCapabilityModeChangedLogMarker;
 
 /**
  * VA-474: scan an OTLP logs payload for the six planner-event
@@ -584,6 +614,25 @@ export function extractPlannerMarkers(
             kind: "action.failed",
             actionId,
             error,
+            timestampUnixNano: ts,
+          });
+        } else if (body === PLANNER_CAPABILITY_MODE_CHANGED_LOG) {
+          const capability = attrs.capability;
+          const mode = attrs.mode;
+          if (
+            !capability ||
+            !PLANNER_CAPABILITIES.has(capability) ||
+            !mode ||
+            !PLANNER_CAPABILITY_MODES.has(mode)
+          ) {
+            continue;
+          }
+          out.push({
+            kind: "capability.mode_changed",
+            capability:
+              capability as PlannerCapabilityModeChangedLogMarker["capability"],
+            mode: mode as PlannerCapabilityModeChangedLogMarker["mode"],
+            updatedBy: attrs.updatedBy ?? "operator",
             timestampUnixNano: ts,
           });
         }

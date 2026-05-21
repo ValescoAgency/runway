@@ -1394,3 +1394,77 @@ describe("renderListView — VA-465 shepherd sub-strip", () => {
     expect(html).toContain("HITL — needs human attention");
   });
 });
+
+// VA-481 — planner panel view.
+describe("renderPlannerPanel (VA-481)", () => {
+  it("renders mode chips + recommendation rows + curl snippets", async () => {
+    const { renderPlannerPanel } = await import("./views.js");
+    const html = renderPlannerPanel({
+      capabilities: [
+        {
+          capability: "queue-selection",
+          mode: "auto",
+          updatedUnixNano: "1715000010000000000",
+          updatedBy: "operator",
+        },
+        {
+          capability: "shepherd-ci",
+          mode: "suggest",
+          updatedUnixNano: null,
+          updatedBy: null,
+        },
+      ],
+      recommendations: [
+        {
+          recommendationId: "queue-selection:VA-300",
+          capability: "queue-selection",
+          target: "VA-300",
+          summary: "Pick up VA-300 — refactor migration",
+          status: "proposed",
+          autoApproveEligible: true,
+          proposedUnixNano: "1715000005000000000",
+          decidedBy: null,
+        },
+        {
+          recommendationId: "shepherd-mergeability:PR-7",
+          capability: "shepherd-mergeability",
+          target: "PR-7",
+          summary: "Rebase agent/va-300 onto origin/main",
+          status: "accepted",
+          autoApproveEligible: true,
+          proposedUnixNano: "1715000004000000000",
+          decidedBy: "auto",
+        },
+      ],
+      plannerBaseUrl: "http://100.64.0.5:3002",
+    });
+    expect(html).toContain("queue-selection:");
+    expect(html).toContain("cap-mode-auto");
+    expect(html).toContain("cap-mode-suggest");
+    expect(html).toContain("Pick up VA-300");
+    expect(html).toContain("Rebase agent/va-300");
+    expect(html).toContain("rec-status-proposed");
+    expect(html).toContain("rec-status-accepted");
+    expect(html).toContain("auto-eligible");
+    expect(html).toContain("http://100.64.0.5:3002/planner/recommendations/queue-selection:VA-300/accept");
+    // No JavaScript buttons — operator pastes curl into a terminal.
+    expect(html).toContain("curl -X PUT");
+  });
+
+  it("renders empty state when there are no recommendations", async () => {
+    const { renderPlannerPanel } = await import("./views.js");
+    const html = renderPlannerPanel({
+      capabilities: [
+        {
+          capability: "queue-selection",
+          mode: "suggest",
+          updatedUnixNano: null,
+          updatedBy: null,
+        },
+      ],
+      recommendations: [],
+      plannerBaseUrl: "http://127.0.0.1:3002",
+    });
+    expect(html).toContain("No recommendations yet");
+  });
+});
