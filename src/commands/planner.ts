@@ -49,13 +49,30 @@ VERBS
 OPTIONS
   --help, -h    Show this help.
 
+ENDPOINTS (VA-475)
+  GET  /planner/health                                liveness probe
+  GET  /planner/recommendations[?status=&limit=N]     list (status: proposed|accepted|rejected|all)
+  GET  /planner/recommendations/:id                   single
+  POST /planner/recommendations/:id/accept            emits accepted
+  POST /planner/recommendations/:id/reject            emits rejected (requires { reason })
+  GET  /planner/actions[?status=]                     list (status: started|completed|failed|all)
+
+  Auth is network-layer (Tailscale ACLs). Same-origin-only CORS —
+  browsers at a different origin are rejected; route through the
+  dashboard's backend.
+
 ENVIRONMENT
   RUNWAY_PLANNER_TICK_SECONDS   default 30 — tick cadence.
-  RUNWAY_PLANNER_HOST           default 127.0.0.1 — HTTP bind host
-                                (consumed by the listener wired in
-                                VA-475). Set to a tailnet IP to expose
-                                the API across your Tailscale network.
+  RUNWAY_PLANNER_HOST           default 127.0.0.1 — HTTP bind host.
+                                Set to a tailnet IP to expose the API
+                                across your Tailscale network.
   RUNWAY_PLANNER_PORT           default 3002 — HTTP bind port.
+  RUNWAY_PLANNER_SQLITE_PATH    optional — path to the dashboard's
+                                SQLite file (the planner opens it
+                                read-only). When unset, GET endpoints
+                                return 503; POST endpoints still emit
+                                OTLP (the dashboard validates on
+                                receive).
 
   LINEAR_API_KEY                required (planner reads the queue).
   OTEL_EXPORTER_OTLP_ENDPOINT   optional — when set, planner emissions

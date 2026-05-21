@@ -405,3 +405,196 @@ describe("planner HTTP — DecisionEmitter is wired through correctly", () => {
     }
   });
 });
+
+// VA-475 acceptance: the ticket calls for an end-to-end test of the
+// proposed → GET → POST /accept → dashboard projection → GET shows
+// accepted lifecycle. The OTLP exporter loop isn't wired in tests
+// (we'd need to boot a dashboard listener too), so we wire the
+// emitter's accepted callback directly to the writer's
+// recordPlannerRecommendationDecision — that's exactly what the
+// dashboard's VA-474 projector does on receive. The result is the
+// full lifecycle exercised through the planner's HTTP surface.
+describe("planner HTTP — end-to-end accept lifecycle (VA-475 acceptance)", () => {
+  it("proposed → GET → POST /accept → projection → GET shows accepted", async () => {
+    // 1. Seed a proposed recommendation (simulating the planner's
+    //    earlier emit + the dashboard's projection of it).
+    writer.recordPlannerRecommendationProposed({
+      recommendationId: "rec-e2e-life",
+      capability: "shepherd-mergeability",
+      target: "PR-42",
+      summary: "rebase against main",
+      evidence: { headSha: "abc123" },
+      autoApproveEligible: false,
+      timestampUnixNano: "1715000010000000000",
+    });
+
+    // Build a server whose emitter routes accepted/rejected back
+    // through the writer — closes the OTLP-projection loop the
+    // ticket asks the test to exercise.
+    const projectingEmitter = {
+      emitAccepted: (m: {
+        recommendationId: string;
+        source: "operator";
+        reason: string | null;
+        timestampUnixNano: string;
+      }) =>
+        writer.recordPlannerRecommendationDecision({
+          recommendationId: m.recommendationId,
+          status: "accepted",
+          source: m.source,
+          reason: m.reason,
+          timestampUnixNano: m.timestampUnixNano,
+        }),
+      emitRejected: (m: {
+        recommendationId: string;
+        source: "operator";
+        reason: string;
+        timestampUnixNano: string;
+      }) =>
+        writer.recordPlannerRecommendationDecision({
+          recommendationId: m.recommendationId,
+          status: "rejected",
+          source: m.source,
+          reason: m.reason,
+          timestampUnixNano: m.timestampUnixNano,
+        }),
+    };
+    const e2eServer = await startPlannerHttpServer({
+      host: "127.0.0.1",
+      port: 0,
+      readClient,
+      getHealth: health,
+      emitter: projectingEmitter,
+    });
+    const e2eBase = `http://127.0.0.1:${e2eServer.port}`;
+
+    try {
+      // 2. GET /planner/recommendations — proposed visible.
+      const list = (await (
+        await fetch(`${e2eBase}/planner/recommendations`)
+      ).json()) as {
+        recommendations: Array<{ recommendationId: string; status: string }>;
+      };
+      const proposed = list.recommendations.find(
+        (r) => r.recommendationId === "rec-e2e-life",
+      );
+      expect(proposed?.status).toBe("proposed");
+
+      // 3. POST /accept with an optional reason.
+      const acceptRes = await fetch(
+        `${e2eBase}/planner/recommendations/rec-e2e-life/accept`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ reason: "approved by operator" }),
+        },
+      );
+      expect(acceptRes.status).toBe(202);
+      const acceptBody = (await acceptRes.json()) as { status: string };
+      expect(acceptBody.status).toBe("accepted");
+
+      // 4. The projecting emitter has already round-tripped the
+      //    decision through the writer (synchronously). GET the
+      //    detail and confirm the new status.
+      const after = (await (
+        await fetch(`${e2eBase}/planner/recommendations/rec-e2e-life`)
+      ).json()) as {
+        status: string;
+        decidedBy: string | null;
+        decisionReason: string | null;
+        decidedUnixNano: string | null;
+      };
+      expect(after.status).toBe("accepted");
+      expect(after.decidedBy).toBe("operator");
+      expect(after.decisionReason).toBe("approved by operator");
+      expect(after.decidedUnixNano).not.toBeNull();
+
+      // 5. ?status=accepted filter surfaces it; ?status=proposed
+      //    no longer does.
+      const accepted = (await (
+        await fetch(`${e2eBase}/planner/recommendations?status=accepted`)
+      ).json()) as { recommendations: Array<{ recommendationId: string }> };
+      expect(
+        accepted.recommendations.map((r) => r.recommendationId),
+      ).toContain("rec-e2e-life");
+      const stillProposed = (await (
+        await fetch(`${e2eBase}/planner/recommendations?status=proposed`)
+      ).json()) as { recommendations: Array<{ recommendationId: string }> };
+      expect(
+        stillProposed.recommendations.map((r) => r.recommendationId),
+      ).not.toContain("rec-e2e-life");
+
+      // 6. A second POST /accept is 409 — the projection landed,
+      //    further accepts (e.g. a double-click) bounce off.
+      const dupRes = await fetch(
+        `${e2eBase}/planner/recommendations/rec-e2e-life/accept`,
+        { method: "POST" },
+      );
+      expect(dupRes.status).toBe(409);
+    } finally {
+      await e2eServer.close();
+    }
+  });
+});
+
+describe("planner HTTP — same-origin CORS (VA-475)", () => {
+  it("allows requests without an Origin header (curl, server-side)", async () => {
+    // The standard test setup omits Origin headers; covered by the
+    // existing test suite. This case just re-asserts via a single
+    // /planner/health probe.
+    const res = await fetch(`${base}/planner/health`);
+    expect(res.status).toBe(200);
+  });
+
+  it("allows requests whose Origin host matches the request Host", async () => {
+    const url = new URL(base);
+    const res = await fetch(`${base}/planner/health`, {
+      headers: { Origin: `http://${url.host}` },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it("blocks cross-origin requests with 403 cross_origin_blocked", async () => {
+    const res = await fetch(`${base}/planner/health`, {
+      headers: { Origin: "http://evil.example.com" },
+    });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("cross_origin_blocked");
+  });
+
+  it("blocks cross-origin POSTs too — no side-effect emission", async () => {
+    writer.recordPlannerRecommendationProposed({
+      recommendationId: "rec-cors",
+      capability: "shepherd-ci",
+      target: "PR-1",
+      summary: "x",
+      evidence: {},
+      autoApproveEligible: false,
+      timestampUnixNano: "1715000010000000000",
+    });
+    const res = await fetch(
+      `${base}/planner/recommendations/rec-cors/accept`,
+      {
+        method: "POST",
+        headers: { Origin: "http://attacker.invalid" },
+      },
+    );
+    expect(res.status).toBe(403);
+    expect(emit.accepted).toHaveLength(0);
+  });
+
+  it("OPTIONS preflight from same-origin returns 204; cross-origin 403", async () => {
+    const url = new URL(base);
+    const ok = await fetch(`${base}/planner/recommendations`, {
+      method: "OPTIONS",
+      headers: { Origin: `http://${url.host}` },
+    });
+    expect(ok.status).toBe(204);
+    const blocked = await fetch(`${base}/planner/recommendations`, {
+      method: "OPTIONS",
+      headers: { Origin: "http://other.host" },
+    });
+    expect(blocked.status).toBe(403);
+  });
+});

@@ -118,6 +118,31 @@ async function handle(
   const [pathRaw, queryRaw = ""] = url.split("?", 2);
   const path = pathRaw ?? "/";
 
+  // VA-475 § Scope: same-origin-only CORS. The planner has no
+  // browser UI of its own — the dashboard at a different origin
+  // proxies through its own backend to reach us. Cross-origin
+  // browser requests are rejected at the listener boundary so the
+  // Tailscale-ACL-gated surface stays tight. Non-browser callers
+  // (curl, the dashboard's backend) never send an Origin header
+  // and pass through unchanged.
+  if (!isSameOrigin(req)) {
+    writeError(
+      res,
+      403,
+      "cross_origin_blocked",
+      "planner API is same-origin only; cross-origin browser requests are not supported. Proxy through the dashboard's backend.",
+    );
+    return;
+  }
+  // Browser CORS preflight against the same origin is unusual but
+  // valid (e.g., custom headers). Respond 204; no Access-Control-*
+  // headers needed for same-origin.
+  if (method === "OPTIONS") {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
   if (method === "GET" && path === "/planner/health") {
     writeJson(res, 200, deps.getHealth());
     return;
@@ -381,6 +406,29 @@ function parseLimit(raw: string | null, fallback: number): number | "invalid" {
 
 function isPlannerActionStatus(s: string): s is PlannerActionStatus {
   return s === "started" || s === "completed" || s === "failed";
+}
+
+/**
+ * VA-475: same-origin check. Returns true when the request either
+ * has no `Origin` header (non-browser caller) or has an `Origin`
+ * whose host:port matches the request's `Host` header. Cross-origin
+ * browser requests fail closed. Comparison is case-insensitive and
+ * tolerates the standard browser quirks (no trailing slash on
+ * Origin, port-stripped Host on standard ports).
+ */
+function isSameOrigin(req: IncomingMessage): boolean {
+  const origin = req.headers.origin;
+  if (typeof origin !== "string" || origin.length === 0) return true;
+  const host = req.headers.host;
+  if (typeof host !== "string" || host.length === 0) return false;
+  let originHost: string;
+  try {
+    const url = new URL(origin);
+    originHost = url.host.toLowerCase();
+  } catch {
+    return false;
+  }
+  return originHost === host.toLowerCase();
 }
 
 function nowUnixNano(): string {
