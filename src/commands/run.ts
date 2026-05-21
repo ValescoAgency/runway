@@ -14,6 +14,16 @@ export interface RunOptions {
   readonly allowPaths?: readonly string[];
   readonly implTurns?: number;
   readonly reviewRetries?: number;
+  /**
+   * VA-480: restrict the drain to a single Linear issue identifier.
+   * When set, runway skips the FIFO queue head and claims this
+   * specific issue instead. Fails fast if the identifier isn't
+   * present in the ready-for-agent queue (the planner's
+   * `accept`-then-spawn path always operates on a freshly-confirmed
+   * accepted recommendation, so the issue should still be in the
+   * queue at spawn time).
+   */
+  readonly target?: string;
 }
 
 export function parseRunArgs(argv: readonly string[]): RunOptions {
@@ -23,6 +33,7 @@ export function parseRunArgs(argv: readonly string[]): RunOptions {
     allowPaths?: string[];
     implTurns?: number;
     reviewRetries?: number;
+    target?: string;
   } = {};
   const collectAllow = (raw: string): void => {
     const paths = raw
@@ -95,6 +106,24 @@ export function parseRunArgs(argv: readonly string[]): RunOptions {
         );
       }
       opts.reviewRetries = n;
+    } else if (a === "--target") {
+      const v = argv[i + 1];
+      if (!v) throw new Error("--target requires a Linear issue identifier");
+      if (!/^[A-Z]+-\d+$/.test(v)) {
+        throw new Error(
+          `--target must be a Linear issue identifier like VA-123, got "${v}"`,
+        );
+      }
+      opts.target = v;
+      i += 1;
+    } else if (a?.startsWith("--target=")) {
+      const v = a.slice("--target=".length);
+      if (!/^[A-Z]+-\d+$/.test(v)) {
+        throw new Error(
+          `--target must be a Linear issue identifier like VA-123, got "${v}"`,
+        );
+      }
+      opts.target = v;
     } else if (a === "--help" || a === "-h") {
       printRunUsage();
       process.exit(0);
@@ -137,6 +166,15 @@ OPTIONS
                   and re-runs review. N caps the extra impl+review
                   pairs per drain pickup. 0 disables retries entirely.
                   Overrides RUNWAY_REVIEW_RETRIES. Default: 1.
+  --target VA-NNN
+                  Restrict the drain to one Linear issue. Skips the
+                  FIFO pick and claims this identifier instead. Used
+                  by the planner daemon (VA-480) when accepting a
+                  queue-selection recommendation; manual operators
+                  can also use it to re-attempt a specific issue
+                  without picking up everything else in the queue.
+                  Fails fast if the issue isn't currently in the
+                  ready queue.
   --help, -h      Show this help.
 
 ENVIRONMENT
@@ -230,7 +268,7 @@ export async function runCommand(argv: readonly string[]): Promise<void> {
     const github = createGithubGateway();
     return yield* drainQueue(
       { config, linear, github, cwd },
-      { max: opts.max, allowPaths: opts.allowPaths },
+      { max: opts.max, allowPaths: opts.allowPaths, target: opts.target },
     );
   }).pipe(Effect.scoped, Effect.provide(MainLayer));
 
@@ -238,12 +276,18 @@ export async function runCommand(argv: readonly string[]): Promise<void> {
   console.log(
     `[runway] done — attempts=${result.attempts} opened=${result.opened} hitl=${result.hitl} errored=${result.errored} skipped=${result.skipped}`,
   );
+  // VA-480: when `--target` was specified but no issue was attempted,
+  // the target wasn't in the ready queue. Surface as a non-zero
+  // exit so the planner's drain-spawn dispatcher routes the action
+  // to `action.failed` instead of `action.completed`. The drainQueue
+  // Effect already logged the warning; this is the exit-code half.
+  const targetMissed = opts.target !== undefined && result.attempts === 0;
   // Single-line, parser-friendly completion marker. Background
   // watchers (Claude Code's `run_in_background` bash task, CI,
   // scripts) can grep for `[runway:exit]` instead of guessing
   // whether the drain is still in flight.
   console.log(
-    `[runway:exit] status=success attempts=${result.attempts} opened=${result.opened} hitl=${result.hitl} errored=${result.errored} skipped=${result.skipped}`,
+    `[runway:exit] status=${targetMissed ? "target_not_in_queue" : "success"} attempts=${result.attempts} opened=${result.opened} hitl=${result.hitl} errored=${result.errored} skipped=${result.skipped}`,
   );
   // Hard exit so any lingering handle (OTel BatchSpanProcessor's
   // interval when OTEL_EXPORTER_OTLP_ENDPOINT is set, a Docker
@@ -251,5 +295,5 @@ export async function runCommand(argv: readonly string[]): Promise<void> {
   // the background task that launched it — alive after the drain is
   // logically done. By this point `Effect.scoped` has already torn
   // down its finalizers.
-  process.exit(0);
+  process.exit(targetMissed ? 1 : 0);
 }

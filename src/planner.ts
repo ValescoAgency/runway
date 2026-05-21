@@ -13,6 +13,11 @@ import {
   type CiCapabilityContext,
 } from "./planner-ci.js";
 import {
+  DRAIN_CAPABILITY,
+  evaluateDrain,
+  type DrainCapabilityContext,
+} from "./planner-drain.js";
+import {
   evaluateMergeability,
   MERGEABILITY_CAPABILITY,
   type MergeabilityCapabilityContext,
@@ -107,6 +112,7 @@ export interface PlannerCapabilities {
   readonly mergeability?: MergeabilityCapabilityContext;
   readonly ci?: CiCapabilityContext;
   readonly reviewer?: ReviewerCapabilityContext;
+  readonly drain?: DrainCapabilityContext;
 }
 
 /**
@@ -198,6 +204,23 @@ export const makeOneTick = (
           Effect.logError("planner.capability.error").pipe(
             Effect.annotateLogs({
               capability: REVIEWER_CAPABILITY,
+              cause: cause.toString(),
+            }),
+          ),
+        ),
+      );
+    }
+
+    if (capabilities.drain) {
+      // VA-480: drain-spawn capability completes the queue-selection
+      // accept → action.started → spawn → action.completed lifecycle.
+      // Outer guard catches projection-side failures; the dispatcher
+      // already folds spawn failures into action.failed.
+      yield* evaluateDrain(capabilities.drain).pipe(
+        Effect.catchAllCause((cause) =>
+          Effect.logError("planner.capability.error").pipe(
+            Effect.annotateLogs({
+              capability: DRAIN_CAPABILITY,
               cause: cause.toString(),
             }),
           ),

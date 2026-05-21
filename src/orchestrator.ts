@@ -149,7 +149,17 @@ interface ResolvedDeps extends OrchestratorDeps {
  */
 export const drainQueue = (
   deps: OrchestratorDeps,
-  opts: { max?: number; allowPaths?: readonly string[] } = {},
+  opts: {
+    max?: number;
+    allowPaths?: readonly string[];
+    /**
+     * VA-480: restrict the drain to a single Linear issue identifier.
+     * When set, drainQueue filters the ready queue to just this
+     * identifier and exits as soon as it's been picked (or errors if
+     * the identifier isn't present in the queue).
+     */
+    target?: string;
+  } = {},
 ): Effect.Effect<OrchestratorResult, never, never> =>
   Effect.gen(function* () {
     const { config, linear } = deps;
@@ -258,7 +268,21 @@ export const drainQueue = (
         // same error.
         Effect.orDie,
       );
-      const issue = queue.find((i) => !seen.has(i.id));
+      // VA-480: when `opts.target` is set, filter the queue to that
+      // identifier. If the target isn't in the ready queue (already
+      // picked up, label removed, or wrong identifier), exit with a
+      // clear log line — the planner's drain-spawn path treats this
+      // as a `errored` outcome.
+      const filtered = opts.target
+        ? queue.filter((i) => i.identifier === opts.target)
+        : queue;
+      if (opts.target && filtered.length === 0) {
+        yield* Effect.logWarning(
+          `target ${opts.target} not present in ready queue — exiting`,
+        );
+        break;
+      }
+      const issue = filtered.find((i) => !seen.has(i.id));
       if (!issue) break;
       seen.add(issue.id);
       attempts += 1;

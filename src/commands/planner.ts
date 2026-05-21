@@ -194,6 +194,17 @@ export async function plannerCommand(argv: readonly string[]): Promise<void> {
             readyLabel: config.readyLabel,
             now: nowNano,
           },
+          // VA-480: drain spawn doesn't need baseBranch — it just
+          // shells out to `runway run --target` which resolves its
+          // own base branch. Wire it whenever the read client is
+          // available so queue-selection accepts can complete the
+          // recommendation → action lifecycle regardless of whether
+          // shepherd capabilities are configured.
+          drain: {
+            readClient,
+            cwd: process.cwd(),
+            now: nowNano,
+          },
           ...(config.baseBranch
             ? {
                 mergeability: {
