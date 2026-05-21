@@ -6,7 +6,11 @@ changes bump the major.
 
 ## Unreleased
 
-Begins the **VA-472 planner-daemon epic** (replatform shepherd onto a long-running host daemon per [ADR 0004](docs/adr/0004-planner-daemon-architecture.md)).
+## 0.16.0 — 2026-05-21
+
+Minor release. **Breaking** — four `RUNWAY_SHEPHERD_*` env vars are removed (see VA-482 below); operators upgrading from `0.15.0` who set any of them will see a Config validation error at boot. Remove the env vars to fix.
+
+Ships the **VA-472 planner-daemon epic** end-to-end: a long-running `runway planner` host daemon (per [ADR 0004](docs/adr/0004-planner-daemon-architecture.md)) now owns mergeability, CI-failure response, reviewer-comment response, queue selection, and drain spawning. The inline post-finalize shepherd loop is retired; `runway run` returns immediately after `finalize` opens the PR. Per-capability `manual` / `suggest` / `auto` modes (defaulting to `suggest`) are toggleable from the new `/planner` dashboard panel; auto mode auto-approves mechanically-deterministic recommendations (queue-selection / mergeability / CI fixes) while LLM-interpreted reviewer comments still require operator confirmation.
 
 - VA-473 — `runway planner run` foreground scaffold. Boots an Effect tick loop that emits a `planner.tick` OTLP heartbeat each `RUNWAY_PLANNER_TICK_SECONDS` (default 30s); SIGINT / SIGTERM resolves a shutdown deferred and the loop unwinds cleanly through telemetry-flush finalizers. No capabilities wired yet — those arrive in VA-474..VA-482 (event model, HTTP API, queue selection, shepherd-watcher ports, drain spawn, capability toggle, inline-shepherd retirement). Three new config keys (`RUNWAY_PLANNER_TICK_SECONDS`, `RUNWAY_PLANNER_HOST`, `RUNWAY_PLANNER_PORT`); `templates/com.valescoagency.runway-planner.plist` ships for launchd-supervised installs on a Mac mini host.
 - VA-474 — planner event model + SQLite projection. Six new OTLP log markers (`planner.recommendation.{proposed,accepted,rejected}`, `planner.action.{started,completed,failed}`) extracted by `extractPlannerMarkers` on the dashboard side and projected into two new SQLite tables (`planner_recommendations`, `planner_actions`). Five idempotent write methods and three read methods (`getRecentPlannerRecommendations`, `getPlannerRecommendation`, `getActivePlannerActions`) feed the HTTP API in VA-475 and the dashboard UI in VA-481. The dashboard remains the sole SQLite writer per ADR 0004 § Writer model; the planner emits OTLP only.
