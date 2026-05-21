@@ -8,7 +8,15 @@ import type {
 import {
   DRAIN_STARTED_LOG,
   extractActiveDrainMarkers,
+  extractPlannerMarkers,
   extractShepherdMarkers,
+  PLANNER_ACTION_COMPLETED_LOG,
+  PLANNER_ACTION_FAILED_LOG,
+  PLANNER_ACTION_STARTED_LOG,
+  PLANNER_RECOMMENDATION_ACCEPTED_LOG,
+  PLANNER_RECOMMENDATION_PROPOSED_LOG,
+  PLANNER_RECOMMENDATION_REJECTED_LOG,
+  type PlannerRecommendationProposedLogMarker,
   projectLogs,
   projectPayload,
   SHEPHERD_ENDED_LOG,
@@ -880,5 +888,258 @@ describe("extractShepherdMarkers — VA-465", () => {
       ]),
     );
     expect(markers[0]).toMatchObject({ kind: "ended", outcome: "hitl" });
+  });
+});
+
+describe("extractPlannerMarkers — VA-474", () => {
+  it("parses recommendation.proposed with evidence JSON + auto-approve flag", () => {
+    const markers = extractPlannerMarkers(
+      logsPayload([
+        logRecord({
+          body: { stringValue: PLANNER_RECOMMENDATION_PROPOSED_LOG },
+          attributes: [
+            { key: "recommendationId", value: { stringValue: "rec-1" } },
+            {
+              key: "capability",
+              value: { stringValue: "shepherd-mergeability" },
+            },
+            { key: "target", value: { stringValue: "PR-142" } },
+            {
+              key: "summary",
+              value: { stringValue: "rebase PR #142 — base moved" },
+            },
+            {
+              key: "evidence",
+              value: {
+                stringValue: JSON.stringify({
+                  files: ["src/foo.ts"],
+                  headSha: "abc",
+                }),
+              },
+            },
+            { key: "autoApproveEligible", value: { stringValue: "true" } },
+          ],
+        }),
+      ]),
+    );
+    expect(markers).toHaveLength(1);
+    expect(markers[0]).toMatchObject({
+      kind: "recommendation.proposed",
+      recommendationId: "rec-1",
+      capability: "shepherd-mergeability",
+      target: "PR-142",
+      summary: "rebase PR #142 — base moved",
+      autoApproveEligible: true,
+    });
+    expect((markers[0] as PlannerRecommendationProposedLogMarker).evidence).toEqual({
+      files: ["src/foo.ts"],
+      headSha: "abc",
+    });
+  });
+
+  it("evidence missing or malformed collapses to {} but the marker still emits", () => {
+    const markers = extractPlannerMarkers(
+      logsPayload([
+        logRecord({
+          body: { stringValue: PLANNER_RECOMMENDATION_PROPOSED_LOG },
+          attributes: [
+            { key: "recommendationId", value: { stringValue: "rec-2" } },
+            { key: "capability", value: { stringValue: "shepherd-ci" } },
+            { key: "target", value: { stringValue: "PR-2" } },
+            { key: "summary", value: { stringValue: "ci broke" } },
+            { key: "evidence", value: { stringValue: "{not json" } },
+          ],
+        }),
+      ]),
+    );
+    expect(markers).toHaveLength(1);
+    expect((markers[0] as PlannerRecommendationProposedLogMarker).evidence).toEqual({});
+  });
+
+  it("drops recommendation.proposed when required attrs missing or capability unknown", () => {
+    const markers = extractPlannerMarkers(
+      logsPayload([
+        // Missing recommendationId.
+        logRecord({
+          body: { stringValue: PLANNER_RECOMMENDATION_PROPOSED_LOG },
+          attributes: [
+            { key: "capability", value: { stringValue: "shepherd-ci" } },
+            { key: "target", value: { stringValue: "PR-1" } },
+            { key: "summary", value: { stringValue: "ok" } },
+          ],
+        }),
+        // Unknown capability.
+        logRecord({
+          body: { stringValue: PLANNER_RECOMMENDATION_PROPOSED_LOG },
+          attributes: [
+            { key: "recommendationId", value: { stringValue: "rec-bad" } },
+            { key: "capability", value: { stringValue: "unrecognised" } },
+            { key: "target", value: { stringValue: "PR-1" } },
+            { key: "summary", value: { stringValue: "ok" } },
+          ],
+        }),
+      ]),
+    );
+    expect(markers).toHaveLength(0);
+  });
+
+  it("parses recommendation.accepted with source=operator and optional reason", () => {
+    const markers = extractPlannerMarkers(
+      logsPayload([
+        logRecord({
+          body: { stringValue: PLANNER_RECOMMENDATION_ACCEPTED_LOG },
+          attributes: [
+            { key: "recommendationId", value: { stringValue: "rec-5" } },
+            { key: "source", value: { stringValue: "operator" } },
+          ],
+        }),
+        logRecord({
+          body: { stringValue: PLANNER_RECOMMENDATION_REJECTED_LOG },
+          attributes: [
+            { key: "recommendationId", value: { stringValue: "rec-6" } },
+            { key: "source", value: { stringValue: "operator" } },
+            { key: "reason", value: { stringValue: "not now" } },
+          ],
+        }),
+      ]),
+    );
+    expect(markers).toHaveLength(2);
+    expect(markers[0]).toMatchObject({
+      kind: "recommendation.accepted",
+      recommendationId: "rec-5",
+      source: "operator",
+      reason: null,
+    });
+    expect(markers[1]).toMatchObject({
+      kind: "recommendation.rejected",
+      recommendationId: "rec-6",
+      source: "operator",
+      reason: "not now",
+    });
+  });
+
+  it("drops recommendation decisions with missing recommendationId or invalid source", () => {
+    const markers = extractPlannerMarkers(
+      logsPayload([
+        logRecord({
+          body: { stringValue: PLANNER_RECOMMENDATION_ACCEPTED_LOG },
+          attributes: [{ key: "source", value: { stringValue: "operator" } }],
+        }),
+        logRecord({
+          body: { stringValue: PLANNER_RECOMMENDATION_ACCEPTED_LOG },
+          attributes: [
+            { key: "recommendationId", value: { stringValue: "rec-7" } },
+            { key: "source", value: { stringValue: "stranger" } },
+          ],
+        }),
+      ]),
+    );
+    expect(markers).toHaveLength(0);
+  });
+
+  it("parses action.started / action.completed / action.failed", () => {
+    const markers = extractPlannerMarkers(
+      logsPayload([
+        logRecord({
+          body: { stringValue: PLANNER_ACTION_STARTED_LOG },
+          attributes: [
+            { key: "actionId", value: { stringValue: "act-1" } },
+            { key: "recommendationId", value: { stringValue: "rec-1" } },
+            {
+              key: "capability",
+              value: { stringValue: "shepherd-mergeability" },
+            },
+            { key: "target", value: { stringValue: "PR-142" } },
+          ],
+        }),
+        logRecord({
+          body: { stringValue: PLANNER_ACTION_COMPLETED_LOG },
+          attributes: [
+            { key: "actionId", value: { stringValue: "act-1" } },
+            { key: "outcome", value: { stringValue: "rebased" } },
+          ],
+          timeUnixNano: "1715000099000000000",
+        }),
+        logRecord({
+          body: { stringValue: PLANNER_ACTION_FAILED_LOG },
+          attributes: [
+            { key: "actionId", value: { stringValue: "act-2" } },
+            { key: "error", value: { stringValue: "boom" } },
+          ],
+          timeUnixNano: "1715000100000000000",
+        }),
+      ]),
+    );
+    expect(markers).toHaveLength(3);
+    expect(markers[0]).toMatchObject({
+      kind: "action.started",
+      actionId: "act-1",
+      recommendationId: "rec-1",
+      capability: "shepherd-mergeability",
+      target: "PR-142",
+    });
+    expect(markers[1]).toMatchObject({
+      kind: "action.completed",
+      actionId: "act-1",
+      outcome: "rebased",
+    });
+    expect(markers[2]).toMatchObject({
+      kind: "action.failed",
+      actionId: "act-2",
+      error: "boom",
+    });
+  });
+
+  it("action.started without recommendationId attribute → recommendationId=null", () => {
+    const markers = extractPlannerMarkers(
+      logsPayload([
+        logRecord({
+          body: { stringValue: PLANNER_ACTION_STARTED_LOG },
+          attributes: [
+            { key: "actionId", value: { stringValue: "act-orphan" } },
+            { key: "capability", value: { stringValue: "queue-selection" } },
+            { key: "target", value: { stringValue: "VA-200" } },
+          ],
+        }),
+      ]),
+    );
+    expect(markers).toHaveLength(1);
+    expect(markers[0]).toMatchObject({
+      kind: "action.started",
+      recommendationId: null,
+    });
+  });
+
+  it("drops planner markers missing a timestamp", () => {
+    const markers = extractPlannerMarkers(
+      logsPayload([
+        logRecord({
+          body: { stringValue: PLANNER_RECOMMENDATION_PROPOSED_LOG },
+          attributes: [
+            { key: "recommendationId", value: { stringValue: "rec-x" } },
+            { key: "capability", value: { stringValue: "shepherd-ci" } },
+            { key: "target", value: { stringValue: "PR-1" } },
+            { key: "summary", value: { stringValue: "ok" } },
+          ],
+          timeUnixNano: undefined,
+          observedTimeUnixNano: undefined,
+        }),
+      ]),
+    );
+    expect(markers).toHaveLength(0);
+  });
+
+  it("ignores non-planner log bodies even when capability attrs are present", () => {
+    const markers = extractPlannerMarkers(
+      logsPayload([
+        logRecord({
+          body: { stringValue: "drain.started" },
+          attributes: [
+            { key: "capability", value: { stringValue: "shepherd-ci" } },
+          ],
+        }),
+      ]),
+    );
+    expect(markers).toHaveLength(0);
   });
 });

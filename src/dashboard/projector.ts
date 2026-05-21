@@ -376,6 +376,224 @@ export type ShepherdLogMarker =
   | ShepherdEndedLogMarker;
 
 /**
+ * VA-474: log body strings the planner daemon emits for its six
+ * event types (ADR 0004 § Writer model). Kept in lock-step with the
+ * planner's `Effect.logInfo` call sites — drift between projector
+ * and planner means events stop projecting into the read-model.
+ */
+export const PLANNER_RECOMMENDATION_PROPOSED_LOG =
+  "planner.recommendation.proposed";
+export const PLANNER_RECOMMENDATION_ACCEPTED_LOG =
+  "planner.recommendation.accepted";
+export const PLANNER_RECOMMENDATION_REJECTED_LOG =
+  "planner.recommendation.rejected";
+export const PLANNER_ACTION_STARTED_LOG = "planner.action.started";
+export const PLANNER_ACTION_COMPLETED_LOG = "planner.action.completed";
+export const PLANNER_ACTION_FAILED_LOG = "planner.action.failed";
+
+const PLANNER_CAPABILITIES = new Set<string>([
+  "queue-selection",
+  "shepherd-mergeability",
+  "shepherd-ci",
+  "shepherd-reviewer",
+]);
+
+export interface PlannerRecommendationProposedLogMarker {
+  readonly kind: "recommendation.proposed";
+  readonly recommendationId: string;
+  readonly capability:
+    | "queue-selection"
+    | "shepherd-mergeability"
+    | "shepherd-ci"
+    | "shepherd-reviewer";
+  readonly target: string;
+  readonly summary: string;
+  readonly evidence: Record<string, unknown>;
+  readonly autoApproveEligible: boolean;
+  readonly timestampUnixNano: string;
+}
+
+export interface PlannerRecommendationDecisionLogMarker {
+  readonly kind: "recommendation.accepted" | "recommendation.rejected";
+  readonly recommendationId: string;
+  readonly status: "accepted" | "rejected";
+  readonly source: "operator" | "auto";
+  readonly reason: string | null;
+  readonly timestampUnixNano: string;
+}
+
+export interface PlannerActionStartedLogMarker {
+  readonly kind: "action.started";
+  readonly actionId: string;
+  readonly recommendationId: string | null;
+  readonly capability:
+    | "queue-selection"
+    | "shepherd-mergeability"
+    | "shepherd-ci"
+    | "shepherd-reviewer";
+  readonly target: string;
+  readonly timestampUnixNano: string;
+}
+
+export interface PlannerActionCompletedLogMarker {
+  readonly kind: "action.completed";
+  readonly actionId: string;
+  readonly outcome: string;
+  readonly timestampUnixNano: string;
+}
+
+export interface PlannerActionFailedLogMarker {
+  readonly kind: "action.failed";
+  readonly actionId: string;
+  readonly error: string;
+  readonly timestampUnixNano: string;
+}
+
+export type PlannerLogMarker =
+  | PlannerRecommendationProposedLogMarker
+  | PlannerRecommendationDecisionLogMarker
+  | PlannerActionStartedLogMarker
+  | PlannerActionCompletedLogMarker
+  | PlannerActionFailedLogMarker;
+
+/**
+ * VA-474: scan an OTLP logs payload for the six planner-event
+ * markers. Records that fail validation (missing required
+ * attribute, unknown capability, unparseable `evidence`) are
+ * dropped — the projector never crashes on a bad payload, but it
+ * also never fabricates fields the emitter didn't send.
+ */
+export function extractPlannerMarkers(
+  payload: OtlpLogsPayload,
+): readonly PlannerLogMarker[] {
+  const out: PlannerLogMarker[] = [];
+  for (const rl of payload.resourceLogs ?? []) {
+    for (const sl of rl.scopeLogs ?? []) {
+      for (const rec of sl.logRecords ?? []) {
+        const body = rec.body?.stringValue;
+        if (!body || !body.startsWith("planner.")) continue;
+        const ts = rec.timeUnixNano ?? rec.observedTimeUnixNano;
+        if (!ts) continue;
+        const attrs = attributesToStringMap(rec.attributes);
+
+        if (body === PLANNER_RECOMMENDATION_PROPOSED_LOG) {
+          const recommendationId = attrs.recommendationId;
+          const capability = attrs.capability;
+          const target = attrs.target;
+          const summary = attrs.summary;
+          if (
+            !recommendationId ||
+            !capability ||
+            !PLANNER_CAPABILITIES.has(capability) ||
+            !target ||
+            !summary
+          ) {
+            continue;
+          }
+          let evidence: Record<string, unknown> = {};
+          const rawEvidence = attrs.evidence;
+          if (rawEvidence) {
+            try {
+              const parsed = JSON.parse(rawEvidence);
+              if (
+                parsed &&
+                typeof parsed === "object" &&
+                !Array.isArray(parsed)
+              ) {
+                evidence = parsed as Record<string, unknown>;
+              }
+            } catch {
+              // Malformed evidence JSON is non-fatal — emit with {}
+              // so the recommendation still lands.
+            }
+          }
+          out.push({
+            kind: "recommendation.proposed",
+            recommendationId,
+            capability:
+              capability as PlannerRecommendationProposedLogMarker["capability"],
+            target,
+            summary,
+            evidence,
+            autoApproveEligible: attrs.autoApproveEligible === "true",
+            timestampUnixNano: ts,
+          });
+        } else if (
+          body === PLANNER_RECOMMENDATION_ACCEPTED_LOG ||
+          body === PLANNER_RECOMMENDATION_REJECTED_LOG
+        ) {
+          const recommendationId = attrs.recommendationId;
+          const source = attrs.source;
+          if (
+            !recommendationId ||
+            (source !== "operator" && source !== "auto")
+          ) {
+            continue;
+          }
+          const status =
+            body === PLANNER_RECOMMENDATION_ACCEPTED_LOG
+              ? "accepted"
+              : "rejected";
+          out.push({
+            kind:
+              status === "accepted"
+                ? "recommendation.accepted"
+                : "recommendation.rejected",
+            recommendationId,
+            status,
+            source,
+            reason: attrs.reason ?? null,
+            timestampUnixNano: ts,
+          });
+        } else if (body === PLANNER_ACTION_STARTED_LOG) {
+          const actionId = attrs.actionId;
+          const capability = attrs.capability;
+          const target = attrs.target;
+          if (
+            !actionId ||
+            !capability ||
+            !PLANNER_CAPABILITIES.has(capability) ||
+            !target
+          ) {
+            continue;
+          }
+          out.push({
+            kind: "action.started",
+            actionId,
+            recommendationId: attrs.recommendationId ?? null,
+            capability:
+              capability as PlannerActionStartedLogMarker["capability"],
+            target,
+            timestampUnixNano: ts,
+          });
+        } else if (body === PLANNER_ACTION_COMPLETED_LOG) {
+          const actionId = attrs.actionId;
+          const outcome = attrs.outcome;
+          if (!actionId || !outcome) continue;
+          out.push({
+            kind: "action.completed",
+            actionId,
+            outcome,
+            timestampUnixNano: ts,
+          });
+        } else if (body === PLANNER_ACTION_FAILED_LOG) {
+          const actionId = attrs.actionId;
+          const error = attrs.error;
+          if (!actionId || !error) continue;
+          out.push({
+            kind: "action.failed",
+            actionId,
+            error,
+            timestampUnixNano: ts,
+          });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/**
  * VA-455: scan an OTLP logs payload for `drain.started` markers.
  * Each match becomes an `ActiveDrainMarker` carrying the drain's
  * trace_id, the drainQueue span_id, and the log timestamp. The

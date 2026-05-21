@@ -231,6 +231,91 @@ export interface ShepherdEndedMarker {
   readonly timestampUnixNano: string;
 }
 
+// VA-474: planner-daemon event model (ADR 0004). The planner emits
+// OTLP log markers for its decisions; this projector surfaces them
+// into two SQLite tables (recommendations + actions). The planner
+// itself never writes to SQLite — the dashboard remains the sole
+// writer, per ADR 0004 § Writer model.
+
+export type PlannerCapability =
+  | "queue-selection"
+  | "shepherd-mergeability"
+  | "shepherd-ci"
+  | "shepherd-reviewer";
+
+export type RecommendationStatus = "proposed" | "accepted" | "rejected";
+export type RecommendationSource = "operator" | "auto";
+export type PlannerActionStatus = "started" | "completed" | "failed";
+
+export interface PlannerRecommendationRow {
+  readonly recommendationId: string;
+  readonly capability: PlannerCapability;
+  readonly target: string;
+  readonly summary: string;
+  /**
+   * Free-form structured payload the capability that proposed this
+   * recommendation provides as evidence. Round-trips through SQLite
+   * as a JSON-encoded TEXT column.
+   */
+  readonly evidence: Record<string, unknown>;
+  readonly status: RecommendationStatus;
+  readonly proposedUnixNano: string;
+  readonly decidedUnixNano: string | null;
+  readonly decidedBy: RecommendationSource | null;
+  readonly decisionReason: string | null;
+  readonly autoApproveEligible: boolean;
+}
+
+export interface PlannerActionRow {
+  readonly actionId: string;
+  readonly recommendationId: string | null;
+  readonly capability: PlannerCapability;
+  readonly target: string;
+  readonly status: PlannerActionStatus;
+  readonly startedUnixNano: string;
+  readonly endedUnixNano: string | null;
+  readonly outcome: string | null;
+  readonly error: string | null;
+}
+
+export interface PlannerRecommendationProposedMarker {
+  readonly recommendationId: string;
+  readonly capability: PlannerCapability;
+  readonly target: string;
+  readonly summary: string;
+  readonly evidence: Record<string, unknown>;
+  readonly autoApproveEligible: boolean;
+  readonly timestampUnixNano: string;
+}
+
+export interface PlannerRecommendationDecisionMarker {
+  readonly recommendationId: string;
+  readonly status: "accepted" | "rejected";
+  readonly source: RecommendationSource;
+  readonly reason: string | null;
+  readonly timestampUnixNano: string;
+}
+
+export interface PlannerActionStartedMarker {
+  readonly actionId: string;
+  readonly recommendationId: string | null;
+  readonly capability: PlannerCapability;
+  readonly target: string;
+  readonly timestampUnixNano: string;
+}
+
+export interface PlannerActionCompletedMarker {
+  readonly actionId: string;
+  readonly outcome: string;
+  readonly timestampUnixNano: string;
+}
+
+export interface PlannerActionFailedMarker {
+  readonly actionId: string;
+  readonly error: string;
+  readonly timestampUnixNano: string;
+}
+
 export interface Storage {
   saveDrain(d: DrainRow): void;
   /**
@@ -380,6 +465,62 @@ export interface Storage {
    * order the drain opened them.
    */
   getActiveShepherding(traceId: string): readonly ShepherdingPr[];
+  /**
+   * VA-474: record a planner recommendation when it's first proposed.
+   * Idempotent on `recommendation_id` — a duplicated OTLP delivery
+   * (the planner restarts, the same evidence re-emits) is a no-op.
+   */
+  recordPlannerRecommendationProposed(
+    m: PlannerRecommendationProposedMarker,
+  ): void;
+  /**
+   * VA-474: record an operator (or auto-mode) decision on an existing
+   * recommendation. The UPDATE only fires when the row is still in
+   * `proposed` status — a second decision on an already-decided row
+   * is dropped, protecting against double-clicks and OTLP retries.
+   */
+  recordPlannerRecommendationDecision(
+    m: PlannerRecommendationDecisionMarker,
+  ): void;
+  /**
+   * VA-474: record an action firing in response to an accepted
+   * recommendation. Idempotent on `action_id`.
+   */
+  recordPlannerActionStarted(m: PlannerActionStartedMarker): void;
+  /**
+   * VA-474: terminate an in-flight action with a success outcome.
+   * UPDATE-only; a completed marker without a matching started row
+   * is dropped silently (same shape as `markShepherdIterationEnd`).
+   */
+  recordPlannerActionCompleted(m: PlannerActionCompletedMarker): void;
+  /**
+   * VA-474: terminate an in-flight action with a failure. Mirrors
+   * `recordPlannerActionCompleted` but stores the error message in
+   * the `error` column instead of an outcome.
+   */
+  recordPlannerActionFailed(m: PlannerActionFailedMarker): void;
+  /**
+   * VA-474: most-recent recommendations across all statuses, newest
+   * first. The HTTP API (VA-475) and dashboard UI (VA-481) read
+   * through this method.
+   */
+  getRecentPlannerRecommendations(
+    limit?: number,
+  ): readonly PlannerRecommendationRow[];
+  /**
+   * VA-474: single-recommendation lookup by id. Returns undefined
+   * when not yet known to the dashboard (typical when the planner
+   * emits and the UI fetches before the OTLP flush has landed).
+   */
+  getPlannerRecommendation(
+    recommendationId: string,
+  ): PlannerRecommendationRow | undefined;
+  /**
+   * VA-474: actions currently in `started` status. Used by the
+   * planner UI to render a "running now" panel and by capabilities
+   * to avoid double-spawning on the same target.
+   */
+  getActivePlannerActions(): readonly PlannerActionRow[];
   /**
    * VA-402: upsert one row in `meta_reviews`. The IRA's three passes
    * (Run Review, Drain Review, Weekly Review) all write through this
@@ -673,6 +814,52 @@ const SCHEMA = `
 
   CREATE INDEX IF NOT EXISTS idx_shepherding_prs_trace_active
     ON shepherding_prs(trace_id, ended_unix_nano);
+
+  -- VA-474: planner-daemon event projections (ADR 0004). Two
+  -- read-projections written exclusively by handleOtlpLogs, one
+  -- per top-level event class. The planner itself never writes
+  -- here — these tables exist on the dashboard side of the OTLP
+  -- boundary.
+  --
+  -- evidence_json round-trips JSON; auto_approve_eligible is a
+  -- 0/1 INTEGER. decided_* are NULL while status='proposed'.
+  CREATE TABLE IF NOT EXISTS planner_recommendations (
+    recommendation_id TEXT PRIMARY KEY,
+    capability TEXT NOT NULL,
+    target TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL,
+    proposed_unix_nano TEXT NOT NULL,
+    decided_unix_nano TEXT,
+    decided_by TEXT,
+    decision_reason TEXT,
+    auto_approve_eligible INTEGER NOT NULL DEFAULT 0,
+    inserted_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_planner_recommendations_status
+    ON planner_recommendations(status, proposed_unix_nano);
+
+  -- recommendation_id is nullable because an action could in
+  -- principle fire without a prior recommendation (e.g. operator-
+  -- triggered direct invocation in VA-475). v1 callers always set
+  -- it; the column shape leaves room for the looser case.
+  CREATE TABLE IF NOT EXISTS planner_actions (
+    action_id TEXT PRIMARY KEY,
+    recommendation_id TEXT,
+    capability TEXT NOT NULL,
+    target TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_unix_nano TEXT NOT NULL,
+    ended_unix_nano TEXT,
+    outcome TEXT,
+    error TEXT,
+    inserted_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_planner_actions_status
+    ON planner_actions(status, started_unix_nano);
 `;
 
 const DEFAULT_AGGREGATE_WINDOW = 30;
@@ -1344,6 +1531,144 @@ export function createStorage(
       endedNano,
     );
   };
+  // VA-474: planner-daemon event projections. Five write methods
+  // (proposed / decision / action-started / action-completed /
+  // action-failed) all guarded for idempotency so OTLP retries +
+  // planner restarts can't corrupt state.
+  const insertPlannerRecommendationStmt = db.prepare(`
+    INSERT INTO planner_recommendations (
+      recommendation_id, capability, target, summary, evidence_json,
+      status, proposed_unix_nano, auto_approve_eligible
+    ) VALUES (?, ?, ?, ?, ?, 'proposed', ?, ?)
+    ON CONFLICT (recommendation_id) DO NOTHING
+  `);
+  const updatePlannerRecommendationDecisionStmt = db.prepare(`
+    UPDATE planner_recommendations
+    SET status = ?,
+        decided_unix_nano = ?,
+        decided_by = ?,
+        decision_reason = ?
+    WHERE recommendation_id = ? AND status = 'proposed'
+  `);
+  const insertPlannerActionStmt = db.prepare(`
+    INSERT INTO planner_actions (
+      action_id, recommendation_id, capability, target, status,
+      started_unix_nano
+    ) VALUES (?, ?, ?, ?, 'started', ?)
+    ON CONFLICT (action_id) DO NOTHING
+  `);
+  const updatePlannerActionCompletedStmt = db.prepare(`
+    UPDATE planner_actions
+    SET status = 'completed',
+        ended_unix_nano = ?,
+        outcome = ?
+    WHERE action_id = ? AND status = 'started'
+  `);
+  const updatePlannerActionFailedStmt = db.prepare(`
+    UPDATE planner_actions
+    SET status = 'failed',
+        ended_unix_nano = ?,
+        error = ?
+    WHERE action_id = ? AND status = 'started'
+  `);
+  const getRecentPlannerRecommendationsStmt = db.prepare(`
+    SELECT
+      recommendation_id, capability, target, summary, evidence_json,
+      status, proposed_unix_nano, decided_unix_nano, decided_by,
+      decision_reason, auto_approve_eligible
+    FROM planner_recommendations
+    ORDER BY CAST(proposed_unix_nano AS INTEGER) DESC
+    LIMIT ?
+  `);
+  const getPlannerRecommendationStmt = db.prepare(`
+    SELECT
+      recommendation_id, capability, target, summary, evidence_json,
+      status, proposed_unix_nano, decided_unix_nano, decided_by,
+      decision_reason, auto_approve_eligible
+    FROM planner_recommendations
+    WHERE recommendation_id = ?
+  `);
+  const getActivePlannerActionsStmt = db.prepare(`
+    SELECT
+      action_id, recommendation_id, capability, target, status,
+      started_unix_nano, ended_unix_nano, outcome, error
+    FROM planner_actions
+    WHERE status = 'started'
+    ORDER BY CAST(started_unix_nano AS INTEGER) ASC
+  `);
+
+  const recordPlannerRecommendationProposed = (
+    m: PlannerRecommendationProposedMarker,
+  ): void => {
+    insertPlannerRecommendationStmt.run(
+      m.recommendationId,
+      m.capability,
+      m.target,
+      m.summary,
+      JSON.stringify(m.evidence ?? {}),
+      m.timestampUnixNano,
+      m.autoApproveEligible ? 1 : 0,
+    );
+  };
+  const recordPlannerRecommendationDecision = (
+    m: PlannerRecommendationDecisionMarker,
+  ): void => {
+    updatePlannerRecommendationDecisionStmt.run(
+      m.status,
+      m.timestampUnixNano,
+      m.source,
+      m.reason,
+      m.recommendationId,
+    );
+  };
+  const recordPlannerActionStarted = (m: PlannerActionStartedMarker): void => {
+    insertPlannerActionStmt.run(
+      m.actionId,
+      m.recommendationId,
+      m.capability,
+      m.target,
+      m.timestampUnixNano,
+    );
+  };
+  const recordPlannerActionCompleted = (
+    m: PlannerActionCompletedMarker,
+  ): void => {
+    updatePlannerActionCompletedStmt.run(
+      m.timestampUnixNano,
+      m.outcome,
+      m.actionId,
+    );
+  };
+  const recordPlannerActionFailed = (m: PlannerActionFailedMarker): void => {
+    updatePlannerActionFailedStmt.run(
+      m.timestampUnixNano,
+      m.error,
+      m.actionId,
+    );
+  };
+  const getRecentPlannerRecommendations = (
+    limit = 50,
+  ): readonly PlannerRecommendationRow[] => {
+    const rows = getRecentPlannerRecommendationsStmt.all(
+      limit,
+    ) as unknown as ReadonlyArray<Record<string, unknown>>;
+    return rows.map(rowToPlannerRecommendation);
+  };
+  const getPlannerRecommendation = (
+    recommendationId: string,
+  ): PlannerRecommendationRow | undefined => {
+    const row = getPlannerRecommendationStmt.get(
+      recommendationId,
+    ) as unknown as Record<string, unknown> | undefined;
+    return row ? rowToPlannerRecommendation(row) : undefined;
+  };
+  const getActivePlannerActions = (): readonly PlannerActionRow[] => {
+    const rows = getActivePlannerActionsStmt.all() as unknown as ReadonlyArray<
+      Record<string, unknown>
+    >;
+    return rows.map(rowToPlannerAction);
+  };
+
   const getActiveShepherding = (
     traceId: string,
   ): readonly ShepherdingPr[] => {
@@ -1764,6 +2089,14 @@ export function createStorage(
     markShepherdIterationEnd,
     markShepherdEnded,
     getActiveShepherding,
+    recordPlannerRecommendationProposed,
+    recordPlannerRecommendationDecision,
+    recordPlannerActionStarted,
+    recordPlannerActionCompleted,
+    recordPlannerActionFailed,
+    getRecentPlannerRecommendations,
+    getPlannerRecommendation,
+    getActivePlannerActions,
     saveMetaReview,
     listMetaReviews,
     countMetaReviews,
@@ -1778,6 +2111,54 @@ export function createStorage(
 // cleanly.
 function asInt(n: number | null | undefined): number | null {
   return n === null || n === undefined ? null : n;
+}
+
+// VA-474: planner_recommendations row → PlannerRecommendationRow.
+// `evidence_json` round-trips JSON; malformed JSON collapses to {}
+// rather than crashing the read path (an emitter bug shouldn't take
+// the dashboard down).
+function rowToPlannerRecommendation(
+  row: Record<string, unknown>,
+): PlannerRecommendationRow {
+  let evidence: Record<string, unknown> = {};
+  const raw = row.evidence_json;
+  if (typeof raw === "string" && raw.length > 0) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        evidence = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Drop to default {} on malformed JSON.
+    }
+  }
+  return {
+    recommendationId: String(row.recommendation_id ?? ""),
+    capability: String(row.capability ?? "") as PlannerCapability,
+    target: String(row.target ?? ""),
+    summary: String(row.summary ?? ""),
+    evidence,
+    status: String(row.status ?? "proposed") as RecommendationStatus,
+    proposedUnixNano: String(row.proposed_unix_nano ?? ""),
+    decidedUnixNano: nullableStr(row.decided_unix_nano),
+    decidedBy: nullableStr(row.decided_by) as RecommendationSource | null,
+    decisionReason: nullableStr(row.decision_reason),
+    autoApproveEligible: Number(row.auto_approve_eligible ?? 0) === 1,
+  };
+}
+
+function rowToPlannerAction(row: Record<string, unknown>): PlannerActionRow {
+  return {
+    actionId: String(row.action_id ?? ""),
+    recommendationId: nullableStr(row.recommendation_id),
+    capability: String(row.capability ?? "") as PlannerCapability,
+    target: String(row.target ?? ""),
+    status: String(row.status ?? "started") as PlannerActionStatus,
+    startedUnixNano: String(row.started_unix_nano ?? ""),
+    endedUnixNano: nullableStr(row.ended_unix_nano),
+    outcome: nullableStr(row.outcome),
+    error: nullableStr(row.error),
+  };
 }
 
 function rowToIssueProcess(row: unknown): StoredIssueProcess {

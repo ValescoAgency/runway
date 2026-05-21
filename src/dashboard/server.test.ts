@@ -557,6 +557,175 @@ describe("dashboard HTTP server — POST /v1/logs (VA-388)", () => {
   });
 });
 
+describe("dashboard HTTP server — POST /v1/logs planner markers (VA-474)", () => {
+  it("recommendation.proposed flows OTLP → storage; accept flips status", async () => {
+    const proposed = {
+      resourceLogs: [
+        {
+          resource: {
+            attributes: [
+              { key: "service.name", value: { stringValue: "runway-planner" } },
+            ],
+          },
+          scopeLogs: [
+            {
+              scope: { name: "@effect/opentelemetry" },
+              logRecords: [
+                {
+                  timeUnixNano: "1715000010000000000",
+                  severityText: "INFO",
+                  body: { stringValue: "planner.recommendation.proposed" },
+                  attributes: [
+                    { key: "recommendationId", value: { stringValue: "rec-e2e" } },
+                    {
+                      key: "capability",
+                      value: { stringValue: "shepherd-mergeability" },
+                    },
+                    { key: "target", value: { stringValue: "PR-7" } },
+                    {
+                      key: "summary",
+                      value: { stringValue: "rebase against main" },
+                    },
+                    {
+                      key: "evidence",
+                      value: {
+                        stringValue: JSON.stringify({ headSha: "abc" }),
+                      },
+                    },
+                    {
+                      key: "autoApproveEligible",
+                      value: { stringValue: "false" },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+
+    const res = await fetch(`${base}/v1/logs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(proposed),
+    });
+    expect(res.status).toBe(200);
+
+    let rec = storage.getPlannerRecommendation("rec-e2e");
+    expect(rec).toBeDefined();
+    expect(rec?.status).toBe("proposed");
+    expect(rec?.evidence).toEqual({ headSha: "abc" });
+
+    const accepted = {
+      resourceLogs: [
+        {
+          resource: {
+            attributes: [
+              { key: "service.name", value: { stringValue: "runway-planner" } },
+            ],
+          },
+          scopeLogs: [
+            {
+              scope: { name: "@effect/opentelemetry" },
+              logRecords: [
+                {
+                  timeUnixNano: "1715000020000000000",
+                  severityText: "INFO",
+                  body: { stringValue: "planner.recommendation.accepted" },
+                  attributes: [
+                    { key: "recommendationId", value: { stringValue: "rec-e2e" } },
+                    { key: "source", value: { stringValue: "operator" } },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+
+    const res2 = await fetch(`${base}/v1/logs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(accepted),
+    });
+    expect(res2.status).toBe(200);
+
+    rec = storage.getPlannerRecommendation("rec-e2e");
+    expect(rec?.status).toBe("accepted");
+    expect(rec?.decidedBy).toBe("operator");
+    expect(rec?.decidedUnixNano).toBe("1715000020000000000");
+  });
+
+  it("action.started → action.completed flows OTLP → storage", async () => {
+    const action = (
+      body: string,
+      attrs: ReadonlyArray<{ key: string; value: { stringValue: string } }>,
+      timeUnixNano: string,
+    ) => ({
+      resourceLogs: [
+        {
+          resource: {
+            attributes: [
+              { key: "service.name", value: { stringValue: "runway-planner" } },
+            ],
+          },
+          scopeLogs: [
+            {
+              scope: { name: "@effect/opentelemetry" },
+              logRecords: [
+                {
+                  timeUnixNano,
+                  severityText: "INFO",
+                  body: { stringValue: body },
+                  attributes: [...attrs],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    await fetch(`${base}/v1/logs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(
+        action(
+          "planner.action.started",
+          [
+            { key: "actionId", value: { stringValue: "act-e2e" } },
+            { key: "recommendationId", value: { stringValue: "rec-e2e" } },
+            { key: "capability", value: { stringValue: "shepherd-ci" } },
+            { key: "target", value: { stringValue: "PR-9" } },
+          ],
+          "1715000030000000000",
+        ),
+      ),
+    });
+
+    expect(storage.getActivePlannerActions()).toHaveLength(1);
+
+    await fetch(`${base}/v1/logs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(
+        action(
+          "planner.action.completed",
+          [
+            { key: "actionId", value: { stringValue: "act-e2e" } },
+            { key: "outcome", value: { stringValue: "rebased" } },
+          ],
+          "1715000040000000000",
+        ),
+      ),
+    });
+
+    expect(storage.getActivePlannerActions()).toHaveLength(0);
+  });
+});
+
 describe("dashboard HTTP server — list-view fragment & SSE (VA-391)", () => {
   it("GET /issue-processes returns just the tbody fragment (no <html>)", async () => {
     await fetch(`${base}/v1/traces`, {
