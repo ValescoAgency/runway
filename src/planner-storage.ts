@@ -9,6 +9,21 @@ import type {
 } from "./dashboard/storage.js";
 
 /**
+ * VA-476: a row from `linear_snapshots` filtered to "ready for the
+ * agent" — has the configured ready label, is in the Todo queue
+ * (`queue_position` non-null), and is not already in a started /
+ * completed / canceled `WorkflowState.type`. Drives the
+ * queue-selection capability's pick.
+ */
+export interface ReadyForAgentRow {
+  readonly issueIdentifier: string;
+  readonly title: string;
+  readonly queuePosition: number;
+  readonly projectId: string | null;
+  readonly projectName: string | null;
+}
+
+/**
  * VA-475: read-only SQLite client for the planner daemon. The planner
  * shares the dashboard's SQLite file but never writes to it — ADR
  * 0004 § Writer model establishes the dashboard as the sole writer.
@@ -31,6 +46,27 @@ export interface PlannerReadClient {
   readonly getActions: (
     opts?: { status?: PlannerActionStatus | "all" },
   ) => readonly PlannerActionRow[];
+  /**
+   * VA-476: ready-for-agent issues in queue-position order. The label
+   * + status_type filter happens in JS because labels round-trip as
+   * JSON in SQLite (no efficient indexed predicate). Rows are
+   * naturally bounded by Linear's queue size, so the filter is cheap.
+   */
+  readonly listReadyForAgent: (opts: {
+    readonly readyLabel: string;
+  }) => readonly ReadyForAgentRow[];
+  /**
+   * VA-476: targets currently carrying a recommendation in `proposed`
+   * or `accepted` status. Queue-selection skips these so the planner
+   * doesn't double-recommend the same issue tick after tick.
+   */
+  readonly listOpenRecommendationTargets: () => readonly string[];
+  /**
+   * VA-476: targets with an action currently in `started` status.
+   * Once VA-480 wires drain spawning, an `accept` flips the action
+   * to `started` for the duration of the drain.
+   */
+  readonly listInFlightActionTargets: () => readonly string[];
   readonly close: () => void;
 }
 
@@ -91,6 +127,38 @@ export function createPlannerReadClient(
     ORDER BY CAST(started_unix_nano AS INTEGER) DESC
     LIMIT 100
   `);
+  // VA-476: queue-selection-supporting queries.
+  //
+  // `linear_snapshots` stores labels as JSON, status_type as TEXT.
+  // The SQL pre-filters by `queue_position IS NOT NULL` (the dashboard
+  // populates this only for issues in the Todo queue) and a small
+  // allowlist of pre-pick status types; the JS-level filter then
+  // intersects labels with the configured readyLabel. Snapshot rows
+  // emit a stable `queue_position` ordering — newest sync's positions
+  // overwrite older ones via the PK upsert, so the planner naturally
+  // tracks the live queue.
+  const listReadyForAgentStmt = db.prepare(`
+    SELECT issue_identifier, snapshot_at, status, title, labels_json,
+           queue_position, project_id, project_name, status_type
+    FROM linear_snapshots
+    WHERE queue_position IS NOT NULL
+      AND (
+        status_type IS NULL
+        OR status_type = ''
+        OR status_type IN ('triage', 'backlog', 'unstarted')
+      )
+    ORDER BY queue_position ASC
+  `);
+  const listOpenRecommendationTargetsStmt = db.prepare(`
+    SELECT DISTINCT target
+    FROM planner_recommendations
+    WHERE status IN ('proposed', 'accepted')
+  `);
+  const listInFlightActionTargetsStmt = db.prepare(`
+    SELECT DISTINCT target
+    FROM planner_actions
+    WHERE status = 'started'
+  `);
 
   const getRecentRecommendations = (
     opts: { status?: RecommendationStatus | "all"; limit?: number } = {},
@@ -131,12 +199,73 @@ export function createPlannerReadClient(
     return rows.map(rowToAction);
   };
 
+  const listReadyForAgent = ({
+    readyLabel,
+  }: {
+    readyLabel: string;
+  }): readonly ReadyForAgentRow[] => {
+    const rows = listReadyForAgentStmt.all() as unknown as ReadonlyArray<
+      Record<string, unknown>
+    >;
+    const out: ReadyForAgentRow[] = [];
+    for (const r of rows) {
+      const labels = parseLabelsJson(r.labels_json);
+      if (!labels.includes(readyLabel)) continue;
+      const queuePosition = Number(r.queue_position);
+      if (!Number.isFinite(queuePosition)) continue;
+      out.push({
+        issueIdentifier: String(r.issue_identifier ?? ""),
+        title: String(r.title ?? ""),
+        queuePosition,
+        projectId:
+          r.project_id === null || r.project_id === undefined
+            ? null
+            : String(r.project_id),
+        projectName:
+          r.project_name === null || r.project_name === undefined
+            ? null
+            : String(r.project_name),
+      });
+    }
+    return out;
+  };
+  const listOpenRecommendationTargets = (): readonly string[] => {
+    const rows = listOpenRecommendationTargetsStmt.all() as unknown as ReadonlyArray<
+      Record<string, unknown>
+    >;
+    return rows.map((r) => String(r.target ?? "")).filter((t) => t.length > 0);
+  };
+  const listInFlightActionTargets = (): readonly string[] => {
+    const rows = listInFlightActionTargetsStmt.all() as unknown as ReadonlyArray<
+      Record<string, unknown>
+    >;
+    return rows.map((r) => String(r.target ?? "")).filter((t) => t.length > 0);
+  };
+
   return {
     getRecentRecommendations,
     getRecommendation,
     getActions,
+    listReadyForAgent,
+    listOpenRecommendationTargets,
+    listInFlightActionTargets,
     close: () => db.close(),
   };
+}
+
+// Tolerant labels-json decoder: malformed JSON or non-array payloads
+// collapse to []. The dashboard's writer never produces malformed
+// values, but a defensive read avoids crashing the planner on a
+// row inserted by a future / older / hand-edited writer.
+function parseLabelsJson(raw: unknown): readonly string[] {
+  if (typeof raw !== "string" || raw.length === 0) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((x): x is string => typeof x === "string");
+  } catch {
+    return [];
+  }
 }
 
 function rowToRecommendation(
