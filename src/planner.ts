@@ -17,6 +17,11 @@ import {
   MERGEABILITY_CAPABILITY,
   type MergeabilityCapabilityContext,
 } from "./planner-mergeability.js";
+import {
+  evaluateReviewer,
+  REVIEWER_CAPABILITY,
+  type ReviewerCapabilityContext,
+} from "./planner-reviewer.js";
 import type { PlannerHealth } from "./planner-http.js";
 import {
   evaluateQueueSelection,
@@ -101,6 +106,7 @@ export interface PlannerCapabilities {
   readonly queueSelection?: QueueSelectionContext;
   readonly mergeability?: MergeabilityCapabilityContext;
   readonly ci?: CiCapabilityContext;
+  readonly reviewer?: ReviewerCapabilityContext;
 }
 
 /**
@@ -177,6 +183,21 @@ export const makeOneTick = (
           Effect.logError("planner.capability.error").pipe(
             Effect.annotateLogs({
               capability: CI_CAPABILITY,
+              cause: cause.toString(),
+            }),
+          ),
+        ),
+      );
+    }
+
+    if (capabilities.reviewer) {
+      // VA-479: reviewer capability iterates PR comments; per-PR
+      // error containment is inside the dispatcher.
+      yield* evaluateReviewer(capabilities.reviewer).pipe(
+        Effect.catchAllCause((cause) =>
+          Effect.logError("planner.capability.error").pipe(
+            Effect.annotateLogs({
+              capability: REVIEWER_CAPABILITY,
               cause: cause.toString(),
             }),
           ),
