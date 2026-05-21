@@ -50,6 +50,18 @@ export interface DecisionEmitter {
     readonly reason: string;
     readonly timestampUnixNano: string;
   }) => void;
+  /**
+   * VA-481: emit a `planner.capability.mode_changed` OTLP event so
+   * the dashboard projects the new mode into
+   * `planner_capability_modes`. The planner reads the projected row
+   * on the next tick.
+   */
+  readonly emitCapabilityModeChanged: (input: {
+    readonly capability: string;
+    readonly mode: "manual" | "suggest" | "auto";
+    readonly updatedBy: string;
+    readonly timestampUnixNano: string;
+  }) => void;
 }
 
 export interface PlannerHttpDeps {
@@ -326,6 +338,105 @@ async function handle(
     }
     const rows = deps.readClient.getActions({ status });
     writeJson(res, 200, { actions: rows });
+    return;
+  }
+
+  // VA-481: GET /planner/capabilities — list current modes.
+  if (method === "GET" && path === "/planner/capabilities") {
+    if (!deps.readClient) {
+      writeError(
+        res,
+        503,
+        "planner_sqlite_not_configured",
+        "Set RUNWAY_PLANNER_SQLITE_PATH to read this resource.",
+      );
+      return;
+    }
+    const rows = deps.readClient.listCapabilityModes();
+    const known = ["queue-selection", "shepherd-mergeability", "shepherd-ci", "shepherd-reviewer"];
+    const byCap = new Map(rows.map((r) => [r.capability, r]));
+    const capabilities = known.map((cap) => {
+      const row = byCap.get(cap as typeof rows[number]["capability"]);
+      return row
+        ? {
+            capability: row.capability,
+            mode: row.mode,
+            updatedUnixNano: row.updatedUnixNano,
+            updatedBy: row.updatedBy,
+          }
+        : {
+            capability: cap,
+            mode: "suggest" as const,
+            updatedUnixNano: null,
+            updatedBy: null,
+          };
+    });
+    writeJson(res, 200, { capabilities });
+    return;
+  }
+
+  // VA-481: PUT /planner/capabilities/:capability — set mode.
+  const capModeMatch = path.match(
+    /^\/planner\/capabilities\/([a-z-]+)$/i,
+  );
+  if (method === "PUT" && capModeMatch) {
+    const capability = capModeMatch[1]!;
+    const known = new Set([
+      "queue-selection",
+      "shepherd-mergeability",
+      "shepherd-ci",
+      "shepherd-reviewer",
+    ]);
+    if (!known.has(capability)) {
+      writeError(
+        res,
+        404,
+        "not_found",
+        `unknown capability "${capability}"`,
+      );
+      return;
+    }
+    const ct = (req.headers["content-type"] ?? "")
+      .toString()
+      .toLowerCase();
+    if (!ct.includes("application/json")) {
+      writeError(
+        res,
+        415,
+        "unsupported_media_type",
+        "Content-Type must be application/json",
+      );
+      return;
+    }
+    const raw = await readBody(req);
+    if (raw === undefined) {
+      writeError(res, 413, "payload_too_large", "body too large");
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      writeError(res, 400, "invalid_json", asMessage(err));
+      return;
+    }
+    const mode = (parsed as { mode?: unknown })?.mode;
+    if (mode !== "manual" && mode !== "suggest" && mode !== "auto") {
+      writeError(
+        res,
+        400,
+        "invalid_body",
+        "mode must be one of manual|suggest|auto",
+      );
+      return;
+    }
+    deps.emitter.emitCapabilityModeChanged({
+      capability,
+      mode,
+      updatedBy: "operator",
+      timestampUnixNano: String(Date.now() * 1_000_000),
+    });
+    writeJson(res, 202, { capability, mode });
     return;
   }
 

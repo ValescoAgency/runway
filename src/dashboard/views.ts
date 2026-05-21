@@ -1663,3 +1663,154 @@ function renderExternalAnchor(rawUrl: unknown, label: string): string {
   if (safe === null) return escapeHtml(label);
   return `<a href="${escapeHtml(safe)}" rel="noopener noreferrer" target="_blank">${escapeHtml(label)}</a>`;
 }
+
+// ---------------------------------------------------------------------------
+// VA-481 — Planner panel
+// ---------------------------------------------------------------------------
+
+/**
+ * VA-481: capability + recommendation panel. Renders the per-
+ * capability mode chips (manual / suggest / auto) with a `mode`
+ * select + Update form per capability, the most-recent
+ * recommendations table, and Accept / Reject forms per `proposed`
+ * recommendation. All forms POST to `/planner-actions/*` on the
+ * dashboard origin, which proxies through to the Tailscale-gated
+ * planner HTTP API server-side (preserving the planner's same-
+ * origin CORS guard). Decided recommendations show a "decided"
+ * label instead of buttons. A collapsible `<details>` block at the
+ * bottom keeps the equivalent curl invocations one click away for
+ * operators who prefer the direct API.
+ */
+
+export interface PlannerPanelViewModel {
+  readonly capabilities: ReadonlyArray<{
+    readonly capability: string;
+    readonly mode: "manual" | "suggest" | "auto";
+    readonly updatedUnixNano: string | null;
+    readonly updatedBy: string | null;
+  }>;
+  readonly recommendations: ReadonlyArray<{
+    readonly recommendationId: string;
+    readonly capability: string;
+    readonly target: string;
+    readonly summary: string;
+    readonly status: "proposed" | "accepted" | "rejected";
+    readonly autoApproveEligible: boolean;
+    readonly proposedUnixNano: string;
+    readonly decidedBy: string | null;
+  }>;
+  readonly plannerBaseUrl: string;
+}
+
+export function renderPlannerPanel(vm: PlannerPanelViewModel): string {
+  const capabilityChips = vm.capabilities
+    .map((c) => {
+      const cls = `cap-mode cap-mode-${escapeHtml(c.mode)}`;
+      const modes: ReadonlyArray<"manual" | "suggest" | "auto"> = [
+        "manual",
+        "suggest",
+        "auto",
+      ];
+      const options = modes
+        .map(
+          (m) =>
+            `<option value="${escapeHtml(m)}"${m === c.mode ? " selected" : ""}>${escapeHtml(m)}</option>`,
+        )
+        .join("");
+      return `<form class="cap-mode-form" method="POST" action="/planner-actions/capabilities/${escapeHtml(c.capability)}">
+  <span class="${cls}" title="updated by ${escapeHtml(c.updatedBy ?? "default")}">${escapeHtml(c.capability)}</span>
+  <select name="mode">${options}</select>
+  <button type="submit">Update</button>
+</form>`;
+    })
+    .join("\n");
+
+  const recommendationRows =
+    vm.recommendations.length === 0
+      ? `<tr><td colspan="6" class="muted">No recommendations yet.</td></tr>`
+      : vm.recommendations
+          .map((r) => {
+            const statusCls = `rec-status rec-status-${escapeHtml(r.status)}`;
+            const eligibility = r.autoApproveEligible
+              ? `<span class="rec-eligible">auto-eligible</span>`
+              : `<span class="rec-eligible muted">manual-only</span>`;
+            // Accept/Reject controls only when still proposed. The
+            // planner's PATCH-style transition rejects re-decisions,
+            // so we hide the buttons after decision lands.
+            const controls =
+              r.status === "proposed"
+                ? `<div class="rec-controls">
+  <form method="POST" action="/planner-actions/recommendations/${escapeHtml(r.recommendationId)}/accept">
+    <button type="submit" class="btn-accept">Accept</button>
+  </form>
+  <form method="POST" action="/planner-actions/recommendations/${escapeHtml(r.recommendationId)}/reject" class="reject-form">
+    <input type="text" name="reason" placeholder="reason (required)" required maxlength="200" />
+    <button type="submit" class="btn-reject">Reject</button>
+  </form>
+</div>`
+                : `<span class="muted">decided</span>`;
+            return `<tr>
+  <td><code>${escapeHtml(r.recommendationId)}</code></td>
+  <td>${escapeHtml(r.capability)}</td>
+  <td>${escapeHtml(r.target)}</td>
+  <td>${escapeHtml(r.summary)}</td>
+  <td><span class="${statusCls}">${escapeHtml(r.status)}</span>${r.decidedBy ? ` <span class="muted">(${escapeHtml(r.decidedBy)})</span>` : ""} ${eligibility}</td>
+  <td>${controls}</td>
+</tr>`;
+          })
+          .join("");
+
+  const baseUrl = escapeHtml(vm.plannerBaseUrl);
+  const exampleId = vm.recommendations[0]?.recommendationId ?? "<recommendationId>";
+  const exampleCap = "queue-selection";
+  const curlBlock = `# Equivalent direct-to-planner calls (Tailscale-gated):
+curl -X POST '${baseUrl}/planner/recommendations/${escapeHtml(exampleId)}/accept' -H 'Content-Type: application/json' -d '{}'
+curl -X POST '${baseUrl}/planner/recommendations/${escapeHtml(exampleId)}/reject' -H 'Content-Type: application/json' -d '{"reason":"out of scope"}'
+curl -X PUT  '${baseUrl}/planner/capabilities/${exampleCap}' -H 'Content-Type: application/json' -d '{"mode":"auto"}'`;
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Planner — runway dashboard</title>
+<style>${SHARED_STYLE}
+  .cap-mode { display: inline-block; padding: 2px 8px; border-radius: 4px; margin-right: 6px; border: 1px solid #ccc; font-size: 0.9em; }
+  .cap-mode-manual { background: #fdd; border-color: #c66; }
+  .cap-mode-suggest { background: #eee; border-color: #999; }
+  .cap-mode-auto { background: #dfd; border-color: #393; }
+  .cap-mode-form { display: inline-flex; gap: 6px; align-items: center; margin: 4px 12px 4px 0; }
+  .rec-status { padding: 2px 6px; border-radius: 3px; font-size: 0.85em; }
+  .rec-status-proposed { background: #eef; border: 1px solid #99c; }
+  .rec-status-accepted { background: #dfd; border: 1px solid #393; }
+  .rec-status-rejected { background: #fdd; border: 1px solid #c66; }
+  .rec-eligible { font-size: 0.8em; margin-left: 6px; }
+  .rec-controls { display: flex; gap: 8px; align-items: center; }
+  .reject-form { display: flex; gap: 4px; align-items: center; }
+  .reject-form input { padding: 2px 4px; }
+  .btn-accept { background: #cfc; border: 1px solid #393; padding: 2px 8px; }
+  .btn-reject { background: #fcc; border: 1px solid #c66; padding: 2px 8px; }
+  .planner-cmds { background: #f4f4f4; border-radius: 4px; padding: 8px 12px; overflow-x: auto; }
+</style>
+</head>
+<body>
+<main class="container">
+  <h1>Planner</h1>
+  <p><a href="/">← back to runway dashboard</a></p>
+
+  <h2>Capabilities</h2>
+  <div class="capabilities">${capabilityChips}</div>
+
+  <h2>Recent recommendations</h2>
+  <table>
+    <thead><tr><th>id</th><th>capability</th><th>target</th><th>summary</th><th>status</th><th>actions</th></tr></thead>
+    <tbody>${recommendationRows}</tbody>
+  </table>
+
+  <details>
+    <summary>Direct-to-planner curl examples</summary>
+    <pre class="planner-cmds"><code>${escapeHtml(curlBlock)}</code></pre>
+  </details>
+</main>
+</body>
+</html>`;
+}

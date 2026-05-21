@@ -361,7 +361,7 @@ describe("evaluateMergeability — capability dispatcher (VA-477)", () => {
         recommendationId: `${MERGEABILITY_CAPABILITY}:PR-777`,
         capability: MERGEABILITY_CAPABILITY,
         target: "PR-777",
-        autoApproveEligible: "false",
+        autoApproveEligible: "true",
         timestampUnixNano: "1715000005000000000",
       });
       expect(String(proposed?.attrs.summary)).toMatch(
@@ -647,5 +647,106 @@ describe("capability emits markers extractPlannerMarkers accepts", () => {
     // extractPlannerMarkers exists and is a function — the import
     // succeeded.
     expect(typeof extractPlannerMarkers).toBe("function");
+  });
+});
+
+// VA-481 — mergeability mode gating.
+describe("evaluateMergeability — capability mode gating (VA-481)", () => {
+  let dir: string;
+  let dbPath: string;
+  let writer: Storage;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "planner-merge-mode-"));
+    dbPath = join(dir, "runway.sqlite");
+    writer = createStorage(dbPath);
+  });
+
+  afterEach(() => {
+    writer.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("manual mode → silent", async () => {
+    seedIssueProcess(writer, {
+      branch: "agent/va-481",
+      prUrl: "https://github.com/ValescoAgency/runway/pull/777",
+      identifier: "VA-481",
+      ts: "1715000000000000000",
+    });
+    writer.recordPlannerCapabilityModeChange({
+      capability: "shepherd-mergeability",
+      mode: "manual",
+      updatedBy: "operator",
+      timestampUnixNano: "1715000000000000000",
+    });
+    const github = makeGithub({ getPullRequest: vi.fn() });
+    const reader = createPlannerReadClient({ sqlitePath: dbPath });
+    try {
+      const result = await Effect.runPromise(
+        evaluateMergeability({
+          readClient: reader,
+          github,
+          config: makeConfig(),
+          cwd: "/tmp/repo",
+          baseBranch: "main",
+          now: () => "1715000010000000000",
+        }),
+      );
+      expect(result.proposed).toEqual([]);
+      expect(
+        (github.getPullRequest as ReturnType<typeof vi.fn>),
+      ).not.toHaveBeenCalled();
+    } finally {
+      reader.close();
+    }
+  });
+
+  it("auto mode → emits proposed AND accepted (source=auto) for an eligible rec", async () => {
+    seedIssueProcess(writer, {
+      branch: "agent/va-481",
+      prUrl: "https://github.com/ValescoAgency/runway/pull/777",
+      identifier: "VA-481",
+      ts: "1715000000000000000",
+    });
+    writer.recordPlannerCapabilityModeChange({
+      capability: "shepherd-mergeability",
+      mode: "auto",
+      updatedBy: "operator",
+      timestampUnixNano: "1715000000000000000",
+    });
+    const github = makeGithub({
+      getPullRequest: vi
+        .fn()
+        .mockReturnValue(Effect.succeed(makePr({ mergeableState: "dirty" }))),
+      getConflictFiles: vi.fn().mockReturnValue(Effect.succeed(["src/x.ts"])),
+    });
+    const sink: CapturedLog[] = [];
+    const reader = createPlannerReadClient({ sqlitePath: dbPath });
+    try {
+      await Effect.runPromise(
+        evaluateMergeability({
+          readClient: reader,
+          github,
+          config: makeConfig(),
+          cwd: "/tmp/repo",
+          baseBranch: "main",
+          now: () => "1715000010000000000",
+        }).pipe(
+          Effect.provide(captureLogger(sink)),
+          Logger.withMinimumLogLevel(LogLevel.Info),
+        ),
+      );
+      const proposed = sink.find(
+        (l) => l.message === PLANNER_RECOMMENDATION_PROPOSED_LOG,
+      );
+      const accepted = sink.find(
+        (l) => l.message === "planner.recommendation.accepted",
+      );
+      expect(proposed?.attrs.autoApproveEligible).toBe("true");
+      expect(accepted?.attrs.source).toBe("auto");
+    } finally {
+      reader.close();
+    }
   });
 });

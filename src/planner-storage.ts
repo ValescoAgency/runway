@@ -3,6 +3,8 @@ import type {
   PlannerActionRow,
   PlannerActionStatus,
   PlannerCapability,
+  PlannerCapabilityMode,
+  PlannerCapabilityModeRow,
   PlannerRecommendationRow,
   RecommendationSource,
   RecommendationStatus,
@@ -126,6 +128,16 @@ export interface PlannerReadClient {
   readonly listAcceptedRecommendationsWithoutAction: (
     capability: string,
   ) => readonly PlannerRecommendationRow[];
+  /**
+   * VA-481: capability mode lookup. Returns the explicit row when
+   * one exists, or `undefined` for never-set capabilities (the
+   * caller defaults missing rows to `suggest`).
+   */
+  readonly getCapabilityMode: (
+    capability: PlannerCapability,
+  ) => PlannerCapabilityModeRow | undefined;
+  /** VA-481: list every explicit capability-mode row. */
+  readonly listCapabilityModes: () => readonly PlannerCapabilityModeRow[];
   readonly close: () => void;
 }
 
@@ -265,6 +277,16 @@ export function createPlannerReadClient(
       AND a.action_id IS NULL
     ORDER BY CAST(r.proposed_unix_nano AS INTEGER) ASC
   `);
+  // VA-481: capability-mode reads.
+  const getCapabilityModeStmt = db.prepare(`
+    SELECT capability, mode, updated_unix_nano, updated_by
+    FROM planner_capability_modes
+    WHERE capability = ?
+  `);
+  const listCapabilityModesStmt = db.prepare(`
+    SELECT capability, mode, updated_unix_nano, updated_by
+    FROM planner_capability_modes
+  `);
 
   const getRecentRecommendations = (
     opts: { status?: RecommendationStatus | "all"; limit?: number } = {},
@@ -392,6 +414,21 @@ export function createPlannerReadClient(
     ) as unknown as ReadonlyArray<Record<string, unknown>>;
     return rows.map(rowToRecommendation);
   };
+  const getCapabilityMode = (
+    capability: PlannerCapability,
+  ): PlannerCapabilityModeRow | undefined => {
+    const row = getCapabilityModeStmt.get(capability) as unknown as
+      | Record<string, unknown>
+      | undefined;
+    if (!row) return undefined;
+    return rowToCapabilityMode(row);
+  };
+  const listCapabilityModes = (): readonly PlannerCapabilityModeRow[] => {
+    const rows = listCapabilityModesStmt.all() as unknown as ReadonlyArray<
+      Record<string, unknown>
+    >;
+    return rows.map(rowToCapabilityMode);
+  };
 
   return {
     getRecentRecommendations,
@@ -403,7 +440,20 @@ export function createPlannerReadClient(
     listOpenShepherdedPrs,
     getActionsForRecommendation,
     listAcceptedRecommendationsWithoutAction,
+    getCapabilityMode,
+    listCapabilityModes,
     close: () => db.close(),
+  };
+}
+
+function rowToCapabilityMode(
+  row: Record<string, unknown>,
+): PlannerCapabilityModeRow {
+  return {
+    capability: String(row.capability ?? "") as PlannerCapability,
+    mode: String(row.mode ?? "suggest") as PlannerCapabilityMode,
+    updatedUnixNano: String(row.updated_unix_nano ?? ""),
+    updatedBy: String(row.updated_by ?? "operator"),
   };
 }
 

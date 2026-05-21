@@ -1142,4 +1142,48 @@ describe("extractPlannerMarkers — VA-474", () => {
     );
     expect(markers).toHaveLength(0);
   });
+
+  // VA-481
+  it("extracts capability.mode_changed with capability + mode + updatedBy", () => {
+    const markers = extractPlannerMarkers(
+      logsPayload([
+        logRecord({
+          body: { stringValue: "planner.capability.mode_changed" },
+          attributes: [
+            {
+              key: "capability",
+              value: { stringValue: "queue-selection" },
+            },
+            { key: "mode", value: { stringValue: "auto" } },
+            { key: "updatedBy", value: { stringValue: "operator" } },
+          ],
+        }),
+      ]),
+    );
+    expect(markers).toHaveLength(1);
+    expect(markers[0]).toMatchObject({
+      kind: "capability.mode_changed",
+      capability: "queue-selection",
+      mode: "auto",
+      updatedBy: "operator",
+    });
+  });
+
+  it("drops capability.mode_changed with unknown mode value", () => {
+    const markers = extractPlannerMarkers(
+      logsPayload([
+        logRecord({
+          body: { stringValue: "planner.capability.mode_changed" },
+          attributes: [
+            {
+              key: "capability",
+              value: { stringValue: "queue-selection" },
+            },
+            { key: "mode", value: { stringValue: "yolo" } },
+          ],
+        }),
+      ]),
+    );
+    expect(markers).toHaveLength(0);
+  });
 });

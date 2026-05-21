@@ -9,6 +9,10 @@ import {
   PLANNER_ACTION_STARTED_LOG,
   PLANNER_RECOMMENDATION_PROPOSED_LOG,
 } from "./dashboard/projector.js";
+import {
+  autoAcceptIfEligible,
+  resolveCapabilityMode,
+} from "./planner-capability-mode.js";
 import type { GithubGateway, PrComment } from "./github.js";
 import type { RunwayIssue } from "./linear.js";
 import type {
@@ -473,6 +477,9 @@ export const evaluateReviewer = (
   ctx: ReviewerCapabilityContext,
 ): Effect.Effect<ReviewerEvalResult> =>
   Effect.gen(function* () {
+    const mode = resolveCapabilityMode(ctx.readClient, REVIEWER_CAPABILITY);
+    if (mode === "manual") return EMPTY;
+
     const prs = ctx.readClient.listOpenShepherdedPrs();
     if (prs.length === 0) return EMPTY;
 
@@ -484,6 +491,7 @@ export const evaluateReviewer = (
       yield* evaluateOnePr({
         ctx,
         row,
+        mode,
         proposed,
         actionsCompleted,
         actionsFailed,
@@ -506,6 +514,7 @@ export const evaluateReviewer = (
 interface EvaluateOnePrArgs {
   readonly ctx: ReviewerCapabilityContext;
   readonly row: OpenShepherdedPrRow;
+  readonly mode: import("./dashboard/storage.js").PlannerCapabilityMode;
   readonly proposed: string[];
   readonly actionsCompleted: string[];
   readonly actionsFailed: string[];
@@ -571,7 +580,14 @@ const evaluateOnePr = (
         mode: decided.mode,
         summary: decided.summary,
         rationale: decided.rationale,
+        autoApproveEligible: decided.autoApproveEligible,
         nowNano: ctx.now(),
+      });
+      yield* autoAcceptIfEligible({
+        mode: args.mode,
+        recommendationId,
+        autoApproveEligible: decided.autoApproveEligible,
+        now: ctx.now,
       });
       args.proposed.push(recommendationId);
 
@@ -597,6 +613,13 @@ interface DecidedRecommendation {
       };
   readonly summary: string;
   readonly rationale: string;
+  /**
+   * VA-481: bot CHANGES-REQUESTED (mechanical parsed-fix path) is
+   * auto-approve-eligible; human-comment LLM interpretations are
+   * NOT — the LLM might mis-read the intent, so the operator should
+   * always click accept even in `auto` mode.
+   */
+  readonly autoApproveEligible: boolean;
 }
 
 const decideRecommendation = (
@@ -627,16 +650,20 @@ const decideRecommendation = (
         );
         return null;
       }
-      // CHANGES-REQUESTED → parsed fix path.
+      // CHANGES-REQUESTED → parsed fix path. Mechanical parse, safe
+      // for auto-approve under VA-481.
       return {
         mode: { kind: "fix-request" as const, fix: verdict.fix },
         summary: `CHANGES-REQUESTED — ${truncate(verdict.fix, 100)}`,
         rationale:
           "Bot reviewer emitted REVIEW: CHANGES-REQUESTED with a parsed fix line.",
+        autoApproveEligible: true,
       };
     }
 
-    // Human path — consult the LLM.
+    // Human path — consult the LLM. LLM interpretation is NOT
+    // auto-approve-eligible: even in `auto` mode, the operator
+    // accepts/rejects so a mis-interpretation doesn't run away.
     const interpreter = ctx.interpretComment ?? VERBATIM_INTERPRETER;
     const interpretation = yield* interpreter({
       commentBody: comment.body,
@@ -652,6 +679,7 @@ const decideRecommendation = (
       },
       summary: interpretation.summary,
       rationale: interpretation.rationale,
+      autoApproveEligible: false,
     };
   });
 
@@ -665,6 +693,7 @@ interface EmitProposedArgs {
   readonly mode: DecidedRecommendation["mode"];
   readonly summary: string;
   readonly rationale: string;
+  readonly autoApproveEligible: boolean;
   readonly nowNano: string;
 }
 
@@ -687,7 +716,7 @@ const emitProposed = (args: EmitProposedArgs): Effect.Effect<void> => {
       target: `PR-${args.prNumber}`,
       summary: args.summary,
       evidence: JSON.stringify(evidence),
-      autoApproveEligible: "false",
+      autoApproveEligible: String(args.autoApproveEligible),
       timestampUnixNano: args.nowNano,
     }),
   );
