@@ -2,19 +2,9 @@ import { claudeCode } from "@ai-hero/sandcastle";
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
 import { Duration, Effect } from "effect";
 import type { Config } from "./config.js";
-import type {
-  CheckRun,
-  GithubError,
-  GithubGateway,
-  PrComment,
-} from "./github.js";
+import type { GithubError, GithubGateway } from "./github.js";
 import type { RunwayIssue } from "./linear.js";
-import {
-  renderShepherdCiFixPrompt,
-  renderShepherdRebasePrompt,
-  renderShepherdReviewFixPrompt,
-  renderShepherdReviewRespondPrompt,
-} from "./prompts.js";
+import { renderShepherdRebasePrompt } from "./prompts.js";
 import {
   dockerEnv,
   runSandcastle,
@@ -274,277 +264,23 @@ export type {
 } from "./planner-ci.js";
 
 // ---------------------------------------------------------------------------
-// VA-463 — reviewer-comment responder (subscription C)
+// VA-463 → VA-479: reviewer-comment responder (subscription C)
+// Relocated to src/planner-reviewer.ts; re-exported here for the
+// orchestrator's inline-shepherd wiring.
 // ---------------------------------------------------------------------------
 
-/**
- * VA-463: the adversarial PR-reviewer agent's verdict markers, as
- * documented in `prompts/pr-review.md`. Distinct from
- * `parseReviewVerdict` in `src/review.ts`, which parses the in-run
- * reviewer agent's `REJECTED-RETRY` / `REJECTED-HITL` markers — those
- * never appear in PR comments, only in the implementation-side
- * review loop.
- */
-export type PrReviewVerdict =
-  | { readonly kind: "approved" }
-  | { readonly kind: "changes-requested"; readonly fix: string }
-  | { readonly kind: "needs-discussion"; readonly decision: string }
-  | { readonly kind: "none" };
-
-/**
- * VA-463: parse a PR-reviewer-bot comment for its `REVIEW: ...` line.
- * Returns `{ kind: "none" }` when the body has no marker (e.g., a
- * status update comment from the bot before the verdict). The regex
- * matches the LAST occurrence — the prompt structure has the verdict
- * line at the end of the comment body.
- */
-export function parsePrReviewVerdict(body: string): PrReviewVerdict {
-  const matches = Array.from(
-    body.matchAll(
-      /^REVIEW:\s*(APPROVED|CHANGES-REQUESTED|NEEDS-DISCUSSION)(?:\s*[—-]\s*(.*))?$/gim,
-    ),
-  );
-  if (matches.length === 0) return { kind: "none" };
-  const last = matches[matches.length - 1]!;
-  const kind = last[1]!.toUpperCase();
-  const detail = (last[2] ?? "").trim();
-  if (kind === "APPROVED") return { kind: "approved" };
-  if (kind === "CHANGES-REQUESTED") {
-    return { kind: "changes-requested", fix: detail };
-  }
-  return { kind: "needs-discussion", decision: detail };
-}
-
-/**
- * VA-463: result of one reviewer-response invocation. `done` means
- * the agent reported `IMPL: DONE` (commit + push, or non-actionable
- * no-op); `blocked` carries the agent's reported reason.
- */
-export type ReviewerResponseResult =
-  | { readonly kind: "done" }
-  | { readonly kind: "blocked"; readonly reason: string };
-
-export interface ReviewerResponseInvocation {
-  readonly issue: RunwayIssue;
-  readonly branch: string;
-  readonly cwd: string;
-  readonly config: Config;
-  /** Distinguishes the two prompt templates. */
-  readonly mode:
-    | { readonly kind: "fix-request"; readonly fix: string }
-    | {
-        readonly kind: "verbatim";
-        readonly commentAuthor: string;
-        readonly commentSource: string;
-        readonly commentBody: string;
-      };
-}
-
-/**
- * Production reviewer-response invocation: pick the right template
- * (parsed CHANGES-REQUESTED fix vs. verbatim human comment), run one
- * sandcastle iteration, parse the IMPL: verdict.
- */
-export const defaultInvokeReviewerResponseAgent = (
-  args: ReviewerResponseInvocation,
-): Effect.Effect<ReviewerResponseResult, { readonly message: string }> =>
-  Effect.gen(function* () {
-    const prompt = yield* Effect.promise(() =>
-      args.mode.kind === "fix-request"
-        ? renderShepherdReviewFixPrompt({
-            issue: args.issue,
-            branch: args.branch,
-            fixRequest: args.mode.fix,
-          })
-        : renderShepherdReviewRespondPrompt({
-            issue: args.issue,
-            branch: args.branch,
-            commentAuthor: args.mode.commentAuthor,
-            commentSource: args.mode.commentSource,
-            commentBody: args.mode.commentBody,
-          }),
-    );
-    const result = yield* runSandcastle({
-      agent: claudeCode("claude-opus-4-7"),
-      sandbox: docker({ env: dockerEnv(args.config) }),
-      cwd: args.cwd,
-      prompt,
-      branchStrategy: { type: "branch", branch: args.branch },
-      maxIterations: 1,
-      name: `shepherd-review-${args.issue.identifier}-${args.mode.kind}`,
-    });
-    return parseReviewerResponseVerdict(stringifyResult(result));
-  });
-
-export function parseReviewerResponseVerdict(
-  output: string,
-): ReviewerResponseResult {
-  const blocked = output.match(/^IMPL:\s*BLOCKED(?:\s*[—-]\s*(.*))?$/im);
-  if (blocked) {
-    return { kind: "blocked", reason: (blocked[1] ?? "").trim() };
-  }
-  if (/^IMPL:\s*DONE\b/im.test(output)) {
-    return { kind: "done" };
-  }
-  return {
-    kind: "blocked",
-    reason: "reviewer-response agent produced no IMPL: marker",
-  };
-}
-
-export interface ReviewerWatcherDeps {
-  readonly github: GithubGateway;
-  readonly config: Config;
-  /** Production default; tests inject a stub. */
-  readonly invokeReviewerResponseAgent?: typeof defaultInvokeReviewerResponseAgent;
-}
-
-/**
- * VA-463: subscription C — reviewer-comment responder.
- *
- * Polls PR comments (top-level + review thread + review summaries) on
- * every shepherd tick. Partitions by author:
- *
- *   * Adversarial reviewer bot (`config.prReviewerBotLogin`): parse
- *     for `REVIEW:` marker. APPROVED → quiet. CHANGES-REQUESTED →
- *     fix-request prompt with the parsed fix line. NEEDS-DISCUSSION
- *     → immediate hitl with the canonical reason verbatim.
- *   * Anyone else (human): pass the comment body verbatim to the
- *     respond prompt; agent decides actionable vs. not. BLOCKED →
- *     hitl with the agent's reason.
- *
- * Dedup: per-shepherd-pass Set of responded comment IDs. The first
- * unhandled comment each tick wins; subsequent comments wait for the
- * next iteration. The next pass picks up whatever's still unhandled.
- *
- * Initial snapshot: the first poll records every existing comment ID
- * as already-seen WITHOUT acting on them — only comments posted AFTER
- * the shepherd loop started should trigger work. The PR was just
- * opened; pre-existing comments are noise from prior runs.
- */
-export function makeReviewerWatcher(deps: ReviewerWatcherDeps): Subscription {
-  const invoke =
-    deps.invokeReviewerResponseAgent ?? defaultInvokeReviewerResponseAgent;
-  const respondedTo = new Set<number>();
-  let primed = false;
-
-  return (ctx) =>
-    Effect.gen(function* () {
-      const pr = yield* deps.github.getPullRequest({
-        repoPath: ctx.cwd,
-        prNumber: ctx.prNumber,
-      });
-      if (pr.merged) return { kind: "quiet" } as const;
-
-      const comments = yield* deps.github.getPullRequestComments({
-        repoPath: ctx.cwd,
-        prNumber: ctx.prNumber,
-      });
-
-      // Initial-snapshot priming: on the first poll, snapshot every
-      // existing comment ID into the responded set so we only act on
-      // NEW comments posted during this shepherd loop's lifetime.
-      // Pre-existing comments (from prior runway runs, manual reviews,
-      // etc.) are noise.
-      if (!primed) {
-        for (const c of comments) respondedTo.add(c.id);
-        primed = true;
-        return { kind: "quiet" } as const;
-      }
-
-      // First unhandled comment wins. Sorted ascending by createdAt
-      // already (gateway contract), so this picks the oldest unseen
-      // one — gives human reviewers a chance to be answered in order.
-      const next = comments.find((c) => !respondedTo.has(c.id));
-      if (!next) return { kind: "quiet" } as const;
-
-      // Mark before processing so a poll mid-action doesn't double-fire.
-      respondedTo.add(next.id);
-
-      const botLogin = deps.config.prReviewerBotLogin?.trim();
-      const isBot =
-        Boolean(botLogin) && next.authorLogin === botLogin;
-
-      if (isBot) {
-        const verdict = parsePrReviewVerdict(next.body);
-        if (verdict.kind === "approved" || verdict.kind === "none") {
-          // APPROVED is a positive signal — the shepherd keeps
-          // watching CI/mergeability but doesn't fire. NONE is the
-          // bot posting a status update without a verdict; same
-          // treatment.
-          return { kind: "quiet" } as const;
-        }
-        if (verdict.kind === "needs-discussion") {
-          return {
-            kind: "hitl",
-            reason: `Reviewer flagged needs-discussion: ${verdict.decision || "(no detail provided)"}`,
-          } as const;
-        }
-        // CHANGES-REQUESTED → fix-request prompt path.
-        return buildFixSignal(ctx, deps, invoke, {
-          kind: "fix-request",
-          fix: verdict.fix,
-        }, next);
-      }
-
-      // Human (non-bot) comment path. Pass the body verbatim — the
-      // agent decides whether it's actionable.
-      return buildFixSignal(ctx, deps, invoke, {
-        kind: "verbatim",
-        commentAuthor: next.authorLogin,
-        commentSource: next.source,
-        commentBody: next.body,
-      }, next);
-    });
-}
-
-function buildFixSignal(
-  ctx: ShepherdContext,
-  deps: ReviewerWatcherDeps,
-  invoke: typeof defaultInvokeReviewerResponseAgent,
-  mode: ReviewerResponseInvocation["mode"],
-  comment: PrComment,
-): SubscriptionSignal {
-  const summary =
-    mode.kind === "fix-request"
-      ? `CHANGES-REQUESTED — ${truncate(mode.fix, 60)}`
-      : `${comment.authorLogin || "unknown"} (${comment.source})`;
-  return {
-    kind: "fix",
-    description: `Respond to PR comment: ${summary}`,
-    action: Effect.gen(function* () {
-      const result = yield* invoke({
-        issue: ctx.issue,
-        branch: ctx.branch,
-        cwd: ctx.cwd,
-        config: deps.config,
-        mode,
-      });
-      if (result.kind === "blocked") {
-        return {
-          kind: "hitl",
-          reason:
-            mode.kind === "fix-request"
-              ? `Reviewer CHANGES-REQUESTED BLOCKED: ${result.reason}`
-              : `Reviewer comment BLOCKED (${comment.authorLogin || "unknown"}): ${result.reason}`,
-        } as const;
-      }
-      return {
-        kind: "fixed",
-        detail:
-          mode.kind === "fix-request"
-            ? `Addressed reviewer fix-request`
-            : `Responded to ${comment.authorLogin || "reviewer"} comment`,
-      } as const;
-    }),
-  };
-}
-
-function truncate(s: string, n: number): string {
-  const flat = s.replace(/\s+/g, " ").trim();
-  if (flat.length <= n) return flat;
-  return `${flat.slice(0, n - 1)}…`;
-}
+export {
+  defaultInvokeReviewerResponseAgent,
+  makeReviewerWatcher,
+  parsePrReviewVerdict,
+  parseReviewerResponseVerdict,
+} from "./planner-reviewer.js";
+export type {
+  PrReviewVerdict,
+  ReviewerResponseInvocation,
+  ReviewerResponseResult,
+  ReviewerWatcherDeps,
+} from "./planner-reviewer.js";
 
 function extractConflictFilesFromReason(reason: string): readonly string[] {
   // Format we instruct the agent to produce: "Mergeability: conflict

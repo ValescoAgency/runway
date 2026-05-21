@@ -20,6 +20,7 @@ import {
   type DecisionEmitter,
   type RunningPlannerHttpServer,
 } from "../planner-http.js";
+import { makeAnthropicCommentInterpreter } from "../planner-reviewer.js";
 import { createPlannerReadClient } from "../planner-storage.js";
 import { TelemetryLive } from "../telemetry.js";
 
@@ -212,6 +213,23 @@ export async function plannerCommand(argv: readonly string[]): Promise<void> {
                   config,
                   cwd: process.cwd(),
                   baseBranch: config.baseBranch,
+                  now: nowNano,
+                },
+                // VA-479: reviewer capability. LLM interpreter is
+                // wired only when ANTHROPIC_API_KEY is in the env;
+                // absent → verbatim-comment fallback (operator sees
+                // the raw body in evidence).
+                reviewer: {
+                  readClient,
+                  github: createGithubGateway(),
+                  config,
+                  cwd: process.cwd(),
+                  baseBranch: config.baseBranch,
+                  interpretComment: process.env.ANTHROPIC_API_KEY
+                    ? makeAnthropicCommentInterpreter({
+                        apiKey: process.env.ANTHROPIC_API_KEY,
+                      })
+                    : undefined,
                   now: nowNano,
                 },
               }
