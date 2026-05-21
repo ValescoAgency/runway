@@ -1669,15 +1669,17 @@ function renderExternalAnchor(rawUrl: unknown, label: string): string {
 // ---------------------------------------------------------------------------
 
 /**
- * VA-481: capability + recommendation panel. Renders the per-capability
- * mode chips (manual / suggest / auto) and the most-recent
- * recommendations + their decision status. Buttons are intentionally
- * not wired in this slice — the planner's HTTP API is reachable via
- * Tailscale and operates under same-origin CORS, so any
- * cross-process button click would need either a dashboard-side
- * proxy or an explicit CORS allowlist for the dashboard's origin.
- * The view ships with copy-paste curl snippets so operators can
- * exercise the API immediately; the interactive UI is a follow-up.
+ * VA-481: capability + recommendation panel. Renders the per-
+ * capability mode chips (manual / suggest / auto) with a `mode`
+ * select + Update form per capability, the most-recent
+ * recommendations table, and Accept / Reject forms per `proposed`
+ * recommendation. All forms POST to `/planner-actions/*` on the
+ * dashboard origin, which proxies through to the Tailscale-gated
+ * planner HTTP API server-side (preserving the planner's same-
+ * origin CORS guard). Decided recommendations show a "decided"
+ * label instead of buttons. A collapsible `<details>` block at the
+ * bottom keeps the equivalent curl invocations one click away for
+ * operators who prefer the direct API.
  */
 
 export interface PlannerPanelViewModel {
