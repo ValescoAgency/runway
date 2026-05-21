@@ -1928,3 +1928,281 @@ describe("createStorage — VA-465 shepherding lifecycle", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// VA-474: planner event-model storage.
+// ---------------------------------------------------------------------------
+
+describe("createStorage — VA-474 planner recommendations", () => {
+  const REC_ID = "rec-1";
+  const ACT_ID = "act-1";
+  const TS_PROPOSED = "1715000010000000000";
+  const TS_DECIDED = "1715000011000000000";
+  const TS_STARTED = "1715000012000000000";
+  const TS_ENDED = "1715000013000000000";
+
+  it("records a proposed recommendation and surfaces it via getRecentPlannerRecommendations", () => {
+    storage.recordPlannerRecommendationProposed({
+      recommendationId: REC_ID,
+      capability: "shepherd-mergeability",
+      target: "PR-142",
+      summary: "rebase PR #142 — base moved",
+      evidence: { files: ["src/foo.ts"], headSha: "abc123" },
+      autoApproveEligible: false,
+      timestampUnixNano: TS_PROPOSED,
+    });
+
+    const recent = storage.getRecentPlannerRecommendations(10);
+    expect(recent).toHaveLength(1);
+    expect(recent[0]).toMatchObject({
+      recommendationId: REC_ID,
+      capability: "shepherd-mergeability",
+      target: "PR-142",
+      summary: "rebase PR #142 — base moved",
+      status: "proposed",
+      autoApproveEligible: false,
+    });
+    expect(recent[0]?.evidence).toEqual({
+      files: ["src/foo.ts"],
+      headSha: "abc123",
+    });
+    expect(recent[0]?.decidedUnixNano).toBeNull();
+    expect(recent[0]?.decidedBy).toBeNull();
+  });
+
+  it("recordPlannerRecommendationProposed is idempotent on recommendation_id", () => {
+    const baseMarker = {
+      recommendationId: REC_ID,
+      capability: "shepherd-ci" as const,
+      target: "PR-7",
+      summary: "first summary",
+      evidence: { run: 1 },
+      autoApproveEligible: false,
+      timestampUnixNano: TS_PROPOSED,
+    };
+    storage.recordPlannerRecommendationProposed(baseMarker);
+    // Duplicate delivery with mutated summary: should NOT overwrite.
+    storage.recordPlannerRecommendationProposed({
+      ...baseMarker,
+      summary: "would-be overwrite",
+      evidence: { run: 999 },
+      timestampUnixNano: "1715000099000000000",
+    });
+
+    const fetched = storage.getPlannerRecommendation(REC_ID);
+    expect(fetched?.summary).toBe("first summary");
+    expect(fetched?.evidence).toEqual({ run: 1 });
+    expect(fetched?.proposedUnixNano).toBe(TS_PROPOSED);
+  });
+
+  it("recordPlannerRecommendationDecision updates a proposed row to accepted with source + reason", () => {
+    storage.recordPlannerRecommendationProposed({
+      recommendationId: REC_ID,
+      capability: "queue-selection",
+      target: "VA-200",
+      summary: "pick VA-200 next",
+      evidence: {},
+      autoApproveEligible: true,
+      timestampUnixNano: TS_PROPOSED,
+    });
+    storage.recordPlannerRecommendationDecision({
+      recommendationId: REC_ID,
+      status: "accepted",
+      source: "operator",
+      reason: null,
+      timestampUnixNano: TS_DECIDED,
+    });
+
+    const fetched = storage.getPlannerRecommendation(REC_ID);
+    expect(fetched?.status).toBe("accepted");
+    expect(fetched?.decidedBy).toBe("operator");
+    expect(fetched?.decidedUnixNano).toBe(TS_DECIDED);
+    expect(fetched?.decisionReason).toBeNull();
+  });
+
+  it("recordPlannerRecommendationDecision is a no-op once the row is already decided (idempotent against OTLP retries / double-clicks)", () => {
+    storage.recordPlannerRecommendationProposed({
+      recommendationId: REC_ID,
+      capability: "shepherd-reviewer",
+      target: "PR-9",
+      summary: "respond to reviewer",
+      evidence: {},
+      autoApproveEligible: false,
+      timestampUnixNano: TS_PROPOSED,
+    });
+    storage.recordPlannerRecommendationDecision({
+      recommendationId: REC_ID,
+      status: "accepted",
+      source: "operator",
+      reason: null,
+      timestampUnixNano: TS_DECIDED,
+    });
+    // Second decision (e.g. retry) should NOT flip to rejected.
+    storage.recordPlannerRecommendationDecision({
+      recommendationId: REC_ID,
+      status: "rejected",
+      source: "operator",
+      reason: "changed mind",
+      timestampUnixNano: "1715000020000000000",
+    });
+
+    const fetched = storage.getPlannerRecommendation(REC_ID);
+    expect(fetched?.status).toBe("accepted");
+    expect(fetched?.decisionReason).toBeNull();
+  });
+
+  it("recordPlannerRecommendationDecision drops a decision arriving without a prior proposed row", () => {
+    storage.recordPlannerRecommendationDecision({
+      recommendationId: "ghost",
+      status: "accepted",
+      source: "operator",
+      reason: null,
+      timestampUnixNano: TS_DECIDED,
+    });
+    expect(storage.getPlannerRecommendation("ghost")).toBeUndefined();
+  });
+
+  it("getRecentPlannerRecommendations orders newest-first", () => {
+    storage.recordPlannerRecommendationProposed({
+      recommendationId: "r-old",
+      capability: "shepherd-ci",
+      target: "PR-1",
+      summary: "old",
+      evidence: {},
+      autoApproveEligible: false,
+      timestampUnixNano: "1715000001000000000",
+    });
+    storage.recordPlannerRecommendationProposed({
+      recommendationId: "r-new",
+      capability: "shepherd-ci",
+      target: "PR-2",
+      summary: "new",
+      evidence: {},
+      autoApproveEligible: false,
+      timestampUnixNano: "1715000099000000000",
+    });
+    const out = storage.getRecentPlannerRecommendations(10);
+    expect(out.map((r) => r.recommendationId)).toEqual(["r-new", "r-old"]);
+  });
+
+  // Action lifecycle: started -> completed
+  it("action.started → action.completed updates status, ended_unix_nano, outcome", () => {
+    storage.recordPlannerActionStarted({
+      actionId: ACT_ID,
+      recommendationId: REC_ID,
+      capability: "shepherd-mergeability",
+      target: "PR-142",
+      timestampUnixNano: TS_STARTED,
+    });
+    expect(storage.getActivePlannerActions()).toHaveLength(1);
+
+    storage.recordPlannerActionCompleted({
+      actionId: ACT_ID,
+      outcome: "rebased",
+      timestampUnixNano: TS_ENDED,
+    });
+    // Completed actions are no longer "active" (status='started').
+    expect(storage.getActivePlannerActions()).toHaveLength(0);
+  });
+
+  it("action.started → action.failed records the error", () => {
+    storage.recordPlannerActionStarted({
+      actionId: ACT_ID,
+      recommendationId: REC_ID,
+      capability: "shepherd-ci",
+      target: "PR-7",
+      timestampUnixNano: TS_STARTED,
+    });
+    storage.recordPlannerActionFailed({
+      actionId: ACT_ID,
+      error: "sandcastle exited non-zero",
+      timestampUnixNano: TS_ENDED,
+    });
+    expect(storage.getActivePlannerActions()).toHaveLength(0);
+  });
+
+  it("recordPlannerActionStarted is idempotent on action_id", () => {
+    storage.recordPlannerActionStarted({
+      actionId: ACT_ID,
+      recommendationId: REC_ID,
+      capability: "shepherd-ci",
+      target: "PR-7",
+      timestampUnixNano: TS_STARTED,
+    });
+    // Duplicate delivery with mutated target — should NOT overwrite.
+    storage.recordPlannerActionStarted({
+      actionId: ACT_ID,
+      recommendationId: REC_ID,
+      capability: "shepherd-ci",
+      target: "PR-999",
+      timestampUnixNano: "1715000099000000000",
+    });
+    const active = storage.getActivePlannerActions();
+    expect(active).toHaveLength(1);
+    expect(active[0]?.target).toBe("PR-7");
+  });
+
+  it("action.completed without a prior started row is dropped silently", () => {
+    storage.recordPlannerActionCompleted({
+      actionId: "ghost-action",
+      outcome: "rebased",
+      timestampUnixNano: TS_ENDED,
+    });
+    expect(storage.getActivePlannerActions()).toHaveLength(0);
+  });
+
+  it("getActivePlannerActions filters out completed and failed rows", () => {
+    storage.recordPlannerActionStarted({
+      actionId: "a-active",
+      recommendationId: null,
+      capability: "queue-selection",
+      target: "VA-100",
+      timestampUnixNano: TS_STARTED,
+    });
+    storage.recordPlannerActionStarted({
+      actionId: "a-done",
+      recommendationId: null,
+      capability: "queue-selection",
+      target: "VA-101",
+      timestampUnixNano: TS_STARTED,
+    });
+    storage.recordPlannerActionCompleted({
+      actionId: "a-done",
+      outcome: "opened",
+      timestampUnixNano: TS_ENDED,
+    });
+    storage.recordPlannerActionStarted({
+      actionId: "a-broken",
+      recommendationId: null,
+      capability: "queue-selection",
+      target: "VA-102",
+      timestampUnixNano: TS_STARTED,
+    });
+    storage.recordPlannerActionFailed({
+      actionId: "a-broken",
+      error: "boom",
+      timestampUnixNano: TS_ENDED,
+    });
+
+    const active = storage.getActivePlannerActions();
+    expect(active.map((a) => a.actionId)).toEqual(["a-active"]);
+  });
+
+  it("evidence_json malformed → empty object on read (defensive)", () => {
+    // Insert directly via a fresh storage to inject malformed JSON,
+    // simulating a future emitter bug.
+    storage.recordPlannerRecommendationProposed({
+      recommendationId: REC_ID,
+      capability: "shepherd-ci",
+      target: "PR-7",
+      summary: "test",
+      // Cast through unknown so TypeScript allows the malformed shape
+      // we're synthesising; the helper round-trips JSON.stringify.
+      evidence: JSON.parse('{"k": 1}') as Record<string, unknown>,
+      autoApproveEligible: false,
+      timestampUnixNano: TS_PROPOSED,
+    });
+    const out = storage.getPlannerRecommendation(REC_ID);
+    expect(out?.evidence).toEqual({ k: 1 });
+  });
+});

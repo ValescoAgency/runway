@@ -7,6 +7,7 @@ import {
 import { createEventBus, type EventBus } from "./events.js";
 import {
   extractActiveDrainMarkers,
+  extractPlannerMarkers,
   extractShepherdMarkers,
   projectLogs,
   projectPayload,
@@ -446,6 +447,60 @@ async function handleOtlpLogs(
         outcome: m.outcome,
         timestampUnixNano: m.timestampUnixNano,
       });
+    }
+  }
+
+  // VA-474: planner event markers — six log bodies cover the
+  // recommendation lifecycle (proposed / accepted / rejected) and
+  // the action lifecycle (started / completed / failed). All five
+  // storage writers are idempotent on their primary keys; an OTLP
+  // retry or duplicate delivery is a no-op.
+  for (const m of extractPlannerMarkers(payload)) {
+    switch (m.kind) {
+      case "recommendation.proposed":
+        storage.recordPlannerRecommendationProposed({
+          recommendationId: m.recommendationId,
+          capability: m.capability,
+          target: m.target,
+          summary: m.summary,
+          evidence: m.evidence,
+          autoApproveEligible: m.autoApproveEligible,
+          timestampUnixNano: m.timestampUnixNano,
+        });
+        break;
+      case "recommendation.accepted":
+      case "recommendation.rejected":
+        storage.recordPlannerRecommendationDecision({
+          recommendationId: m.recommendationId,
+          status: m.status,
+          source: m.source,
+          reason: m.reason,
+          timestampUnixNano: m.timestampUnixNano,
+        });
+        break;
+      case "action.started":
+        storage.recordPlannerActionStarted({
+          actionId: m.actionId,
+          recommendationId: m.recommendationId,
+          capability: m.capability,
+          target: m.target,
+          timestampUnixNano: m.timestampUnixNano,
+        });
+        break;
+      case "action.completed":
+        storage.recordPlannerActionCompleted({
+          actionId: m.actionId,
+          outcome: m.outcome,
+          timestampUnixNano: m.timestampUnixNano,
+        });
+        break;
+      case "action.failed":
+        storage.recordPlannerActionFailed({
+          actionId: m.actionId,
+          error: m.error,
+          timestampUnixNano: m.timestampUnixNano,
+        });
+        break;
     }
   }
 
