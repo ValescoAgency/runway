@@ -8,6 +8,11 @@ import {
 } from "effect";
 import { ConfigTag } from "./config.js";
 import {
+  CI_CAPABILITY,
+  evaluateCi,
+  type CiCapabilityContext,
+} from "./planner-ci.js";
+import {
   evaluateMergeability,
   MERGEABILITY_CAPABILITY,
   type MergeabilityCapabilityContext,
@@ -95,6 +100,7 @@ export const PLANNER_SHUTDOWN_LOG = "planner.shutdown";
 export interface PlannerCapabilities {
   readonly queueSelection?: QueueSelectionContext;
   readonly mergeability?: MergeabilityCapabilityContext;
+  readonly ci?: CiCapabilityContext;
 }
 
 /**
@@ -156,6 +162,21 @@ export const makeOneTick = (
           Effect.logError("planner.capability.error").pipe(
             Effect.annotateLogs({
               capability: MERGEABILITY_CAPABILITY,
+              cause: cause.toString(),
+            }),
+          ),
+        ),
+      );
+    }
+
+    if (capabilities.ci) {
+      // VA-478: CI capability has the same per-PR error containment
+      // as mergeability. Outer guard catches projection-side failures.
+      yield* evaluateCi(capabilities.ci).pipe(
+        Effect.catchAllCause((cause) =>
+          Effect.logError("planner.capability.error").pipe(
+            Effect.annotateLogs({
+              capability: CI_CAPABILITY,
               cause: cause.toString(),
             }),
           ),
