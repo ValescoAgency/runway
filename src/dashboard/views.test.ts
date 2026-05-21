@@ -1438,7 +1438,6 @@ describe("renderPlannerPanel (VA-481)", () => {
       ],
       plannerBaseUrl: "http://100.64.0.5:3002",
     });
-    expect(html).toContain("queue-selection:");
     expect(html).toContain("cap-mode-auto");
     expect(html).toContain("cap-mode-suggest");
     expect(html).toContain("Pick up VA-300");
@@ -1446,8 +1445,13 @@ describe("renderPlannerPanel (VA-481)", () => {
     expect(html).toContain("rec-status-proposed");
     expect(html).toContain("rec-status-accepted");
     expect(html).toContain("auto-eligible");
-    expect(html).toContain("http://100.64.0.5:3002/planner/recommendations/queue-selection:VA-300/accept");
-    // No JavaScript buttons — operator pastes curl into a terminal.
+    // Accept/Reject controls + capability mode form for proposed rows.
+    expect(html).toContain("/planner-actions/recommendations/queue-selection:VA-300/accept");
+    expect(html).toContain("/planner-actions/recommendations/queue-selection:VA-300/reject");
+    expect(html).toContain("/planner-actions/capabilities/queue-selection");
+    // Decided rows hide the controls.
+    expect(html).not.toContain("/planner-actions/recommendations/shepherd-mergeability:PR-7/accept");
+    // Curl examples still available in the disclosure.
     expect(html).toContain("curl -X PUT");
   });
 

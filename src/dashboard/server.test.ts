@@ -1291,3 +1291,156 @@ describe("dashboard HTTP server — /meta-reviews (VA-407)", () => {
     expect(html).toContain("tighten");
   });
 });
+
+// VA-481 — planner panel + dashboard → planner proxy.
+describe("dashboard HTTP server — /planner panel + proxy (VA-481)", () => {
+  it("GET /planner renders mode chips + recommendations", async () => {
+    storage.recordPlannerRecommendationProposed({
+      recommendationId: "rec-1",
+      capability: "queue-selection",
+      target: "VA-100",
+      summary: "pick up VA-100",
+      evidence: {},
+      autoApproveEligible: true,
+      timestampUnixNano: "1715000000000000000",
+    });
+    storage.recordPlannerCapabilityModeChange({
+      capability: "shepherd-ci",
+      mode: "manual",
+      updatedBy: "operator",
+      timestampUnixNano: "1715000010000000000",
+    });
+    const res = await fetch(`${base}/planner`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("VA-100");
+    expect(html).toContain("cap-mode-manual");
+    expect(html).toContain("cap-mode-suggest");
+    // Accept/Reject forms are rendered for proposed recommendations.
+    expect(html).toContain("/planner-actions/recommendations/rec-1/accept");
+    expect(html).toContain("/planner-actions/recommendations/rec-1/reject");
+    // Capability-mode update form.
+    expect(html).toContain("/planner-actions/capabilities/shepherd-ci");
+  });
+
+  it("POST /planner-actions/recommendations/:id/accept proxies to planner and 303 redirects", async () => {
+    // Stand up a tiny stub planner that records the inbound call.
+    const calls: Array<{ url: string; method: string; body: string }> = [];
+    const stubPlanner = await import("node:http").then(({ createServer }) =>
+      new Promise<{ url: string; close: () => Promise<void> }>((resolve) => {
+        const srv = createServer((req, res) => {
+          let body = "";
+          req.on("data", (c) => (body += String(c)));
+          req.on("end", () => {
+            calls.push({ url: req.url ?? "", method: req.method ?? "", body });
+            res.writeHead(202, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true }));
+          });
+        });
+        srv.listen(0, "127.0.0.1", () => {
+          const addr = srv.address();
+          if (typeof addr !== "object" || addr === null)
+            throw new Error("listen failed");
+          resolve({
+            url: `http://127.0.0.1:${addr.port}`,
+            close: () =>
+              new Promise<void>((r) => srv.close(() => r())),
+          });
+        });
+      }),
+    );
+    process.env.RUNWAY_PLANNER_BASE_URL = stubPlanner.url;
+    try {
+      const res = await fetch(
+        `${base}/planner-actions/recommendations/rec-1/accept`,
+        {
+          method: "POST",
+          headers: {
+            Accept: "text/html",
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body: "",
+          redirect: "manual",
+        },
+      );
+      // Browser form redirect to /planner after success.
+      expect(res.status).toBe(303);
+      expect(res.headers.get("location")).toBe("/planner");
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.url).toBe("/planner/recommendations/rec-1/accept");
+      expect(calls[0]!.method).toBe("POST");
+    } finally {
+      delete process.env.RUNWAY_PLANNER_BASE_URL;
+      await stubPlanner.close();
+    }
+  });
+
+  it("POST /planner-actions/capabilities/:cap proxies PUT with mode body", async () => {
+    const calls: Array<{ url: string; method: string; body: string }> = [];
+    const stubPlanner = await import("node:http").then(({ createServer }) =>
+      new Promise<{ url: string; close: () => Promise<void> }>((resolve) => {
+        const srv = createServer((req, res) => {
+          let body = "";
+          req.on("data", (c) => (body += String(c)));
+          req.on("end", () => {
+            calls.push({ url: req.url ?? "", method: req.method ?? "", body });
+            res.writeHead(202, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true }));
+          });
+        });
+        srv.listen(0, "127.0.0.1", () => {
+          const addr = srv.address();
+          if (typeof addr !== "object" || addr === null)
+            throw new Error("listen failed");
+          resolve({
+            url: `http://127.0.0.1:${addr.port}`,
+            close: () =>
+              new Promise<void>((r) => srv.close(() => r())),
+          });
+        });
+      }),
+    );
+    process.env.RUNWAY_PLANNER_BASE_URL = stubPlanner.url;
+    try {
+      const res = await fetch(
+        `${base}/planner-actions/capabilities/queue-selection`,
+        {
+          method: "POST",
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body: "mode=auto",
+          redirect: "manual",
+        },
+      );
+      expect(res.status).toBe(202);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.url).toBe("/planner/capabilities/queue-selection");
+      expect(calls[0]!.method).toBe("PUT");
+      expect(JSON.parse(calls[0]!.body)).toEqual({ mode: "auto" });
+    } finally {
+      delete process.env.RUNWAY_PLANNER_BASE_URL;
+      await stubPlanner.close();
+    }
+  });
+
+  it("returns 502 when the planner is unreachable", async () => {
+    process.env.RUNWAY_PLANNER_BASE_URL = "http://127.0.0.1:1";
+    try {
+      const res = await fetch(
+        `${base}/planner-actions/recommendations/rec-x/accept`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body: "",
+        },
+      );
+      expect(res.status).toBe(502);
+    } finally {
+      delete process.env.RUNWAY_PLANNER_BASE_URL;
+    }
+  });
+});

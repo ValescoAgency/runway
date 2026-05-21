@@ -294,6 +294,52 @@ async function handle(
     return;
   }
 
+  // VA-481: proxy routes that forward to the Tailscale-gated planner
+  // HTTP API. Browser forms POST to the dashboard's same-origin path;
+  // the dashboard server-side forwards to RUNWAY_PLANNER_BASE_URL so
+  // the planner's same-origin CORS guard is satisfied. The
+  // dashboard never inspects request bodies beyond passthrough — the
+  // planner remains the source of truth.
+  const pathOnly = url.split("?")[0] ?? "";
+  if (method === "POST") {
+    const acceptMatch = pathOnly.match(
+      /^\/planner-actions\/recommendations\/([^/]+)\/accept$/,
+    );
+    if (acceptMatch) {
+      await handlePlannerProxy(
+        req,
+        res,
+        `/planner/recommendations/${encodeURIComponent(acceptMatch[1] ?? "")}/accept`,
+        "POST",
+      );
+      return;
+    }
+    const rejectMatch = pathOnly.match(
+      /^\/planner-actions\/recommendations\/([^/]+)\/reject$/,
+    );
+    if (rejectMatch) {
+      await handlePlannerProxy(
+        req,
+        res,
+        `/planner/recommendations/${encodeURIComponent(rejectMatch[1] ?? "")}/reject`,
+        "POST",
+      );
+      return;
+    }
+    const capMatch = pathOnly.match(
+      /^\/planner-actions\/capabilities\/([a-z-]+)$/i,
+    );
+    if (capMatch) {
+      await handlePlannerProxy(
+        req,
+        res,
+        `/planner/capabilities/${encodeURIComponent(capMatch[1] ?? "")}`,
+        "PUT",
+      );
+      return;
+    }
+  }
+
   if (method === "GET" && url === "/healthz") {
     res.writeHead(200, { "content-type": "text/plain" });
     res.end("ok");
@@ -911,6 +957,94 @@ const KNOWN_PLANNER_CAPABILITIES: ReadonlyArray<{
   { capability: "shepherd-ci" },
   { capability: "shepherd-reviewer" },
 ];
+
+/**
+ * VA-481: forward an operator-initiated POST/PUT from the dashboard
+ * UI to the planner's HTTP API. The dashboard runs as a separate
+ * process; making the call server-side preserves the planner's
+ * same-origin CORS guard without an allowlist. Body is parsed from
+ * the operator's HTML form (urlencoded `reason=...` for reject,
+ * `mode=...` for capability toggle) and re-serialized as JSON for
+ * the planner. On success/202 from the planner, the dashboard 303s
+ * back to `/planner` so the operator sees the refreshed list.
+ */
+async function handlePlannerProxy(
+  req: IncomingMessage,
+  res: ServerResponse,
+  plannerPath: string,
+  method: "POST" | "PUT",
+): Promise<void> {
+  const baseUrl =
+    process.env.RUNWAY_PLANNER_BASE_URL ?? "http://127.0.0.1:3002";
+  // Parse the form body — content-type may be application/json (api)
+  // or application/x-www-form-urlencoded (form submit).
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    chunks.push(chunk as Buffer);
+    // Match the planner's 64 KiB cap so a giant body doesn't OOM.
+    const total = chunks.reduce((s, c) => s + c.length, 0);
+    if (total > 64 * 1024) {
+      res.writeHead(413, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({ error: { code: "payload_too_large", message: "body too large" } }),
+      );
+      return;
+    }
+  }
+  const raw = Buffer.concat(chunks).toString("utf8");
+  const ct = String(req.headers["content-type"] ?? "").toLowerCase();
+  let bodyJson: string;
+  if (ct.includes("application/x-www-form-urlencoded")) {
+    const params = new URLSearchParams(raw);
+    const obj: Record<string, string> = {};
+    for (const [k, v] of params.entries()) {
+      if (v.length > 0) obj[k] = v;
+    }
+    bodyJson = JSON.stringify(obj);
+  } else if (raw.length === 0) {
+    bodyJson = "{}";
+  } else {
+    bodyJson = raw; // assume JSON; let planner validate
+  }
+  let upstream: Response;
+  try {
+    upstream = await fetch(`${baseUrl}${plannerPath}`, {
+      method,
+      headers: { "content-type": "application/json" },
+      body: bodyJson,
+    });
+  } catch (err) {
+    res.writeHead(502, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        error: {
+          code: "planner_unreachable",
+          message: err instanceof Error ? err.message : String(err),
+        },
+      }),
+    );
+    return;
+  }
+  // Form submissions expect a 303 redirect back to the panel. JSON
+  // clients (curl / fetch from a script) get the planner's status
+  // mirrored verbatim. The dashboard distinguishes via the
+  // `Accept` header — browser form posts default to text/html.
+  const accept = String(req.headers.accept ?? "").toLowerCase();
+  const wantsRedirect =
+    accept.includes("text/html") &&
+    upstream.status >= 200 &&
+    upstream.status < 400;
+  if (wantsRedirect) {
+    res.writeHead(303, { Location: "/planner" });
+    res.end();
+    return;
+  }
+  const upstreamBody = await upstream.text();
+  res.writeHead(upstream.status, {
+    "content-type": upstream.headers.get("content-type") ?? "application/json",
+  });
+  res.end(upstreamBody);
+}
 
 function handlePlannerPanel(res: ServerResponse, storage: Storage): void {
   const explicit = storage.listPlannerCapabilityModes();

@@ -892,4 +892,95 @@ describe("evaluateCi — capability dispatcher (VA-478)", () => {
       reader.close();
     }
   });
+
+  // VA-481 — mode gating
+  it("manual mode → capability stays silent", async () => {
+    seedIssueProcess(writer, {
+      branch: "agent/va-481",
+      prUrl: PR_URL_A,
+      identifier: "VA-481",
+      ts: "1715000000000000000",
+    });
+    writer.recordPlannerCapabilityModeChange({
+      capability: "shepherd-ci",
+      mode: "manual",
+      updatedBy: "operator",
+      timestampUnixNano: "1715000000000000000",
+    });
+    const github = makeGithub({ getPullRequest: vi.fn() });
+    const reader = createPlannerReadClient({ sqlitePath: dbPath });
+    try {
+      const result = await Effect.runPromise(
+        evaluateCi({
+          readClient: reader,
+          github,
+          config: makeConfig(),
+          cwd: "/tmp/repo",
+          baseBranch: "main",
+          now: () => "1715000010000000000",
+        }),
+      );
+      expect(result.proposed).toEqual([]);
+      // GH gateway never even called — capability returns before
+      // hitting the read path.
+      expect((github.getPullRequest as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
+    } finally {
+      reader.close();
+    }
+  });
+
+  it("auto mode → emits both proposed AND accepted (source=auto)", async () => {
+    seedIssueProcess(writer, {
+      branch: "agent/va-481",
+      prUrl: PR_URL_A,
+      identifier: "VA-481",
+      ts: "1715000000000000000",
+    });
+    writer.recordPlannerCapabilityModeChange({
+      capability: "shepherd-ci",
+      mode: "auto",
+      updatedBy: "operator",
+      timestampUnixNano: "1715000000000000000",
+    });
+    const github = makeGithub({
+      getPullRequest: vi
+        .fn()
+        .mockReturnValue(Effect.succeed(makePr({ merged: false }))),
+      getCheckRuns: vi
+        .fn()
+        .mockReturnValue(
+          Effect.succeed([makeCheckRun({ name: "pnpm test" })]),
+        ),
+      getRequiredChecks: vi.fn().mockReturnValue(Effect.succeed(["pnpm test"])),
+      getCheckRunLogTail: vi.fn().mockReturnValue(Effect.succeed("FAIL ci")),
+    });
+    const sink: CapturedLog[] = [];
+    const reader = createPlannerReadClient({ sqlitePath: dbPath });
+    try {
+      await Effect.runPromise(
+        evaluateCi({
+          readClient: reader,
+          github,
+          config: makeConfig(),
+          cwd: "/tmp/repo",
+          baseBranch: "main",
+          now: () => "1715000010000000000",
+        }).pipe(
+          Effect.provide(captureLogger(sink)),
+          Logger.withMinimumLogLevel(LogLevel.Info),
+        ),
+      );
+      const proposed = sink.find(
+        (l) => l.message === PLANNER_RECOMMENDATION_PROPOSED_LOG,
+      );
+      const accepted = sink.find(
+        (l) => l.message === "planner.recommendation.accepted",
+      );
+      expect(proposed?.attrs.autoApproveEligible).toBe("true");
+      expect(accepted).toBeDefined();
+      expect(accepted?.attrs.source).toBe("auto");
+    } finally {
+      reader.close();
+    }
+  });
 });

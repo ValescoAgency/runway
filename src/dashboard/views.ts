@@ -1704,25 +1704,56 @@ export function renderPlannerPanel(vm: PlannerPanelViewModel): string {
   const capabilityChips = vm.capabilities
     .map((c) => {
       const cls = `cap-mode cap-mode-${escapeHtml(c.mode)}`;
-      return `<span class="${cls}" title="updated by ${escapeHtml(c.updatedBy ?? "default")}">${escapeHtml(c.capability)}: <strong>${escapeHtml(c.mode)}</strong></span>`;
+      const modes: ReadonlyArray<"manual" | "suggest" | "auto"> = [
+        "manual",
+        "suggest",
+        "auto",
+      ];
+      const options = modes
+        .map(
+          (m) =>
+            `<option value="${escapeHtml(m)}"${m === c.mode ? " selected" : ""}>${escapeHtml(m)}</option>`,
+        )
+        .join("");
+      return `<form class="cap-mode-form" method="POST" action="/planner-actions/capabilities/${escapeHtml(c.capability)}">
+  <span class="${cls}" title="updated by ${escapeHtml(c.updatedBy ?? "default")}">${escapeHtml(c.capability)}</span>
+  <select name="mode">${options}</select>
+  <button type="submit">Update</button>
+</form>`;
     })
-    .join(" ");
+    .join("\n");
 
   const recommendationRows =
     vm.recommendations.length === 0
-      ? `<tr><td colspan="5" class="muted">No recommendations yet.</td></tr>`
+      ? `<tr><td colspan="6" class="muted">No recommendations yet.</td></tr>`
       : vm.recommendations
           .map((r) => {
             const statusCls = `rec-status rec-status-${escapeHtml(r.status)}`;
             const eligibility = r.autoApproveEligible
               ? `<span class="rec-eligible">auto-eligible</span>`
               : `<span class="rec-eligible muted">manual-only</span>`;
+            // Accept/Reject controls only when still proposed. The
+            // planner's PATCH-style transition rejects re-decisions,
+            // so we hide the buttons after decision lands.
+            const controls =
+              r.status === "proposed"
+                ? `<div class="rec-controls">
+  <form method="POST" action="/planner-actions/recommendations/${escapeHtml(r.recommendationId)}/accept">
+    <button type="submit" class="btn-accept">Accept</button>
+  </form>
+  <form method="POST" action="/planner-actions/recommendations/${escapeHtml(r.recommendationId)}/reject" class="reject-form">
+    <input type="text" name="reason" placeholder="reason (required)" required maxlength="200" />
+    <button type="submit" class="btn-reject">Reject</button>
+  </form>
+</div>`
+                : `<span class="muted">decided</span>`;
             return `<tr>
   <td><code>${escapeHtml(r.recommendationId)}</code></td>
   <td>${escapeHtml(r.capability)}</td>
   <td>${escapeHtml(r.target)}</td>
   <td>${escapeHtml(r.summary)}</td>
   <td><span class="${statusCls}">${escapeHtml(r.status)}</span>${r.decidedBy ? ` <span class="muted">(${escapeHtml(r.decidedBy)})</span>` : ""} ${eligibility}</td>
+  <td>${controls}</td>
 </tr>`;
           })
           .join("");
@@ -1730,13 +1761,9 @@ export function renderPlannerPanel(vm: PlannerPanelViewModel): string {
   const baseUrl = escapeHtml(vm.plannerBaseUrl);
   const exampleId = vm.recommendations[0]?.recommendationId ?? "<recommendationId>";
   const exampleCap = "queue-selection";
-  const curlBlock = `# Accept a recommendation
+  const curlBlock = `# Equivalent direct-to-planner calls (Tailscale-gated):
 curl -X POST '${baseUrl}/planner/recommendations/${escapeHtml(exampleId)}/accept' -H 'Content-Type: application/json' -d '{}'
-
-# Reject a recommendation (reason required)
 curl -X POST '${baseUrl}/planner/recommendations/${escapeHtml(exampleId)}/reject' -H 'Content-Type: application/json' -d '{"reason":"out of scope"}'
-
-# Promote a capability to auto
 curl -X PUT  '${baseUrl}/planner/capabilities/${exampleCap}' -H 'Content-Type: application/json' -d '{"mode":"auto"}'`;
 
   return `<!doctype html>
@@ -1749,11 +1776,17 @@ curl -X PUT  '${baseUrl}/planner/capabilities/${exampleCap}' -H 'Content-Type: a
   .cap-mode-manual { background: #fdd; border-color: #c66; }
   .cap-mode-suggest { background: #eee; border-color: #999; }
   .cap-mode-auto { background: #dfd; border-color: #393; }
+  .cap-mode-form { display: inline-flex; gap: 6px; align-items: center; margin: 4px 12px 4px 0; }
   .rec-status { padding: 2px 6px; border-radius: 3px; font-size: 0.85em; }
   .rec-status-proposed { background: #eef; border: 1px solid #99c; }
   .rec-status-accepted { background: #dfd; border: 1px solid #393; }
   .rec-status-rejected { background: #fdd; border: 1px solid #c66; }
   .rec-eligible { font-size: 0.8em; margin-left: 6px; }
+  .rec-controls { display: flex; gap: 8px; align-items: center; }
+  .reject-form { display: flex; gap: 4px; align-items: center; }
+  .reject-form input { padding: 2px 4px; }
+  .btn-accept { background: #cfc; border: 1px solid #393; padding: 2px 8px; }
+  .btn-reject { background: #fcc; border: 1px solid #c66; padding: 2px 8px; }
   .planner-cmds { background: #f4f4f4; border-radius: 4px; padding: 8px 12px; overflow-x: auto; }
 </style>
 </head>
@@ -1763,17 +1796,18 @@ curl -X PUT  '${baseUrl}/planner/capabilities/${exampleCap}' -H 'Content-Type: a
   <p><a href="/">← back to runway dashboard</a></p>
 
   <h2>Capabilities</h2>
-  <p>${capabilityChips}</p>
+  <div class="capabilities">${capabilityChips}</div>
 
   <h2>Recent recommendations</h2>
   <table>
-    <thead><tr><th>id</th><th>capability</th><th>target</th><th>summary</th><th>status</th></tr></thead>
+    <thead><tr><th>id</th><th>capability</th><th>target</th><th>summary</th><th>status</th><th>actions</th></tr></thead>
     <tbody>${recommendationRows}</tbody>
   </table>
 
-  <h2>Operator commands</h2>
-  <p>The planner HTTP API runs separately (Tailscale-gated). Interact via:</p>
-  <pre class="planner-cmds"><code>${escapeHtml(curlBlock)}</code></pre>
+  <details>
+    <summary>Direct-to-planner curl examples</summary>
+    <pre class="planner-cmds"><code>${escapeHtml(curlBlock)}</code></pre>
+  </details>
 </main>
 </body>
 </html>`;
