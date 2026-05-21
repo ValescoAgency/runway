@@ -213,6 +213,31 @@ export interface RunwayConfig {
    * `RUNWAY_SHEPHERD_MAX_WALL_SECONDS`.
    */
   readonly shepherdMaxWallSeconds: number;
+  /**
+   * VA-473: tick cadence for the planner daemon (`runway planner run`).
+   * Each tick the planner emits a `planner.tick` heartbeat marker and
+   * (in later sub-issues) consults its capabilities. Default 30s
+   * balances responsiveness against the GitHub API budget the
+   * shepherd capabilities will consume. Source:
+   * `RUNWAY_PLANNER_TICK_SECONDS`.
+   */
+  readonly plannerTickSeconds: number;
+  /**
+   * VA-473: bind host for the planner's HTTP API (wired in VA-475).
+   * Default `127.0.0.1` so a fresh `runway planner run` is
+   * loopback-only — the operator binds it to a Tailscale interface IP
+   * to expose it to other devices on their tailnet. The planner uses
+   * Tailscale ACLs for auth (ADR 0004 § HTTP API surface); no
+   * application-layer auth is wired. Source: `RUNWAY_PLANNER_HOST`.
+   */
+  readonly plannerHost: string;
+  /**
+   * VA-473: bind port for the planner's HTTP API (wired in VA-475).
+   * Default 3002 sits next to the dashboard (3001) and OTLP receiver
+   * (4318) in the typical Mac mini topology. Source:
+   * `RUNWAY_PLANNER_PORT`.
+   */
+  readonly plannerPort: number;
 }
 
 // Back-compat alias — existing consumers (orchestrator, gateways)
@@ -330,6 +355,27 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
       validation: (n): n is number => n > 0,
     }),
   ),
+  // VA-473: planner daemon scaffold. Tick cadence + bind address for
+  // the long-running process. No capabilities wired yet — these
+  // values are consumed by `runway planner run` (heartbeat loop) and
+  // by the HTTP listener wired in VA-475.
+  plannerTickSeconds: EConfig.integer("RUNWAY_PLANNER_TICK_SECONDS").pipe(
+    EConfig.withDefault(30),
+    EConfig.validate({
+      message: "RUNWAY_PLANNER_TICK_SECONDS must be a positive integer",
+      validation: (n): n is number => n > 0,
+    }),
+  ),
+  plannerHost: EConfig.string("RUNWAY_PLANNER_HOST").pipe(
+    EConfig.withDefault("127.0.0.1"),
+  ),
+  plannerPort: EConfig.integer("RUNWAY_PLANNER_PORT").pipe(
+    EConfig.withDefault(3002),
+    EConfig.validate({
+      message: "RUNWAY_PLANNER_PORT must be a positive integer",
+      validation: (n): n is number => n > 0 && n < 65536,
+    }),
+  ),
 }).pipe(
   Effect.map(
     (raw): RunwayConfig => ({
@@ -362,6 +408,9 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
       prReviewerBotLogin: Option.getOrUndefined(raw.prReviewerBotLogin),
       shepherdMaxIterations: raw.shepherdMaxIterations,
       shepherdMaxWallSeconds: raw.shepherdMaxWallSeconds,
+      plannerTickSeconds: raw.plannerTickSeconds,
+      plannerHost: raw.plannerHost,
+      plannerPort: raw.plannerPort,
     }),
   ),
 );

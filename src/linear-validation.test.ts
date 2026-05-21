@@ -42,6 +42,9 @@ const config = {
   shepherdPollIntervalSeconds: 15,
   shepherdMaxIterations: 3,
   shepherdMaxWallSeconds: 3600,
+  plannerTickSeconds: 30,
+  plannerHost: "127.0.0.1",
+  plannerPort: 3002,
 } as const;
 
 beforeEach(() => {

@@ -4,6 +4,12 @@ All notable changes to runway are documented here. Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); breaking
 changes bump the major.
 
+## Unreleased
+
+Begins the **VA-472 planner-daemon epic** (replatform shepherd onto a long-running host daemon per [ADR 0004](docs/adr/0004-planner-daemon-architecture.md)).
+
+- VA-473 — `runway planner run` foreground scaffold. Boots an Effect tick loop that emits a `planner.tick` OTLP heartbeat each `RUNWAY_PLANNER_TICK_SECONDS` (default 30s); SIGINT / SIGTERM resolves a shutdown deferred and the loop unwinds cleanly through telemetry-flush finalizers. No capabilities wired yet — those arrive in VA-474..VA-482 (event model, HTTP API, queue selection, shepherd-watcher ports, drain spawn, capability toggle, inline-shepherd retirement). Three new config keys (`RUNWAY_PLANNER_TICK_SECONDS`, `RUNWAY_PLANNER_HOST`, `RUNWAY_PLANNER_PORT`); `templates/com.valescoagency.runway-planner.plist` ships for launchd-supervised installs on a Mac mini host.
+
 ## 0.15.0 — 2026-05-20
 
 Minor release. Seven PRs since 0.14.3 — the entire **VA-459 shepherd epic** (6 sub-issues) plus an ADR capturing the long-term architecture conversation that came out of the design session. The shepherd is an inline post-finalize loop that drives an opened PR toward merge by reacting to three signals: mergeability conflicts, failing required CI checks, and reviewer-feedback comments. It's gated off by default behind `RUNWAY_SHEPHERD_ENABLED` — flip the gate to opt in; the historical "open the PR and move on" composer behavior is otherwise unchanged.
