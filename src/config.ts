@@ -238,6 +238,18 @@ export interface RunwayConfig {
    * `RUNWAY_PLANNER_PORT`.
    */
   readonly plannerPort: number;
+  /**
+   * VA-475: host path to the dashboard's SQLite file. When the
+   * dashboard runs in Docker, operators bind-mount its `/data`
+   * volume to a host path (e.g. `~/.runway/dashboard/runway.sqlite`)
+   * and point the planner at the same file. The planner opens it
+   * with `{ readOnly: true }` — schema migrations stay owned by the
+   * dashboard per ADR 0004 § Writer model. When unset, the
+   * planner's GET endpoints return 503; POST endpoints still emit
+   * OTLP (the dashboard validates against its own storage on
+   * receive). Source: `RUNWAY_PLANNER_SQLITE_PATH`.
+   */
+  readonly plannerSqlitePath?: string;
 }
 
 // Back-compat alias — existing consumers (orchestrator, gateways)
@@ -376,6 +388,7 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
       validation: (n): n is number => n > 0 && n < 65536,
     }),
   ),
+  plannerSqlitePath: EConfig.option(EConfig.string("RUNWAY_PLANNER_SQLITE_PATH")),
 }).pipe(
   Effect.map(
     (raw): RunwayConfig => ({
@@ -411,6 +424,7 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
       plannerTickSeconds: raw.plannerTickSeconds,
       plannerHost: raw.plannerHost,
       plannerPort: raw.plannerPort,
+      plannerSqlitePath: Option.getOrUndefined(raw.plannerSqlitePath),
     }),
   ),
 );

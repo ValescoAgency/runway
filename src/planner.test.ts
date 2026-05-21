@@ -20,6 +20,7 @@ import {
   installSignalHandlers,
   makeOneTick,
   makePlannerLoop,
+  makePlannerState,
 } from "./planner.js";
 
 interface CapturedLog {
@@ -55,21 +56,25 @@ const HermeticConfig = makeConfigLive({
 });
 
 describe("makeOneTick", () => {
-  it("emits a planner.tick log with tickNumber + wallClockSinceStartSeconds", async () => {
+  it("emits a planner.tick log with tickNumber + wallClockSinceStartSeconds and updates the state ref", async () => {
     const sink: CapturedLog[] = [];
+    const startMs = Date.now() - 5_000; // pretend planner started 5s ago
     const program = Effect.gen(function* () {
-      const tickRef = yield* Ref.make(0);
-      const startMs = Date.now() - 5_000; // pretend planner started 5s ago
-      yield* makeOneTick(tickRef, startMs);
-      yield* makeOneTick(tickRef, startMs);
-      return yield* Ref.get(tickRef);
+      const stateRef = yield* makePlannerState(startMs);
+      yield* makeOneTick(stateRef, startMs);
+      yield* makeOneTick(stateRef, startMs);
+      // Read final state from the same ref so we exercise the
+      // shared-state path the HTTP /planner/health endpoint relies on.
+      return yield* Ref.get(stateRef);
     }).pipe(
       Effect.provide(makeCapturingLogger(sink)),
       Logger.withMinimumLogLevel(LogLevel.Info),
     );
 
-    const total = await Effect.runPromise(program);
-    expect(total).toBe(2);
+    const finalState = await Effect.runPromise(program);
+    expect(finalState.tickCount).toBe(2);
+    expect(finalState.lastTickAtUnixMs).not.toBeNull();
+    expect(finalState.startMs).toBe(startMs);
 
     const tickLogs = sink.filter((l) => l.message === PLANNER_TICK_LOG);
     expect(tickLogs).toHaveLength(2);
@@ -88,10 +93,11 @@ describe("makePlannerLoop", () => {
     const sink: CapturedLog[] = [];
     const program = Effect.gen(function* () {
       const shutdown = yield* Deferred.make<void>();
+      const stateRef = yield* makePlannerState(Date.now());
 
       // Spawn the loop, then trip the shutdown shortly after — gives
       // it time to emit boot + the first immediate tick.
-      const fiber = yield* Effect.fork(makePlannerLoop(shutdown));
+      const fiber = yield* Effect.fork(makePlannerLoop(shutdown, stateRef));
       yield* Effect.sleep("100 millis");
       yield* Deferred.succeed(shutdown, void 0);
       yield* fiber.await;
@@ -125,7 +131,8 @@ describe("makePlannerLoop", () => {
     const sink: CapturedLog[] = [];
     const program = Effect.gen(function* () {
       const shutdown = yield* Deferred.make<void>();
-      const fiber = yield* Effect.fork(makePlannerLoop(shutdown));
+      const stateRef = yield* makePlannerState(Date.now());
+      const fiber = yield* Effect.fork(makePlannerLoop(shutdown, stateRef));
 
       // tickSeconds=1 (HermeticConfig). At t=0 the immediate tick fires.
       // Advancing 3s should produce 3 additional ticks (t=1,2,3).
