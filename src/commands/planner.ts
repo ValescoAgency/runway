@@ -8,6 +8,7 @@ import {
   makeHealthReader,
   makePlannerLoop,
   makePlannerState,
+  type PlannerCapabilities,
 } from "../planner.js";
 import {
   PLANNER_RECOMMENDATION_ACCEPTED_LOG,
@@ -174,7 +175,21 @@ export async function plannerCommand(argv: readonly string[]): Promise<void> {
       `[runway planner] http listening on ${config.plannerHost}:${httpServer.port}`,
     );
 
-    yield* makePlannerLoop(shutdownSignal, stateRef);
+    // VA-476: queue-selection capability is wired when we have a
+    // SQLite read client. Absent → tick body skips it (the daemon
+    // still serves /planner/health and the POST endpoints, just no
+    // recommendations get proposed).
+    const capabilities: PlannerCapabilities = readClient
+      ? {
+          queueSelection: {
+            readClient,
+            readyLabel: config.readyLabel,
+            now: () => String(Date.now() * 1_000_000),
+          },
+        }
+      : {};
+
+    yield* makePlannerLoop(shutdownSignal, stateRef, capabilities);
   }).pipe(Effect.scoped, Effect.provide(MainLayer));
 
   await Effect.runPromise(program);

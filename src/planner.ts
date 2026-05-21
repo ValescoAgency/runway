@@ -8,6 +8,10 @@ import {
 } from "effect";
 import { ConfigTag } from "./config.js";
 import type { PlannerHealth } from "./planner-http.js";
+import {
+  evaluateQueueSelection,
+  type QueueSelectionContext,
+} from "./planner-queue-selection.js";
 
 /**
  * VA-473: planner daemon — long-running host process that will own
@@ -78,18 +82,30 @@ export const PLANNER_TICK_LOG = "planner.tick";
 export const PLANNER_SHUTDOWN_LOG = "planner.shutdown";
 
 /**
- * One tick of the planner loop. In Sub-1 it only emits the heartbeat
- * marker; Sub-4..7 will dispatch capability evaluators here. Exposed
- * so tests can assert the marker shape without driving the whole
- * `Effect.repeat` schedule.
+ * VA-476: capabilities are bundled into a single `PlannerCapabilities`
+ * object the loop dispatches each tick. Each entry is optional so
+ * the foundation tests (no SQLite, no Linear) can run with an empty
+ * bag, and later sub-issues (VA-477..479) just slot more entries in.
+ */
+export interface PlannerCapabilities {
+  readonly queueSelection?: QueueSelectionContext;
+}
+
+/**
+ * One tick of the planner loop. Emits the heartbeat marker, updates
+ * the shared `PlannerStateSnapshot`, then dispatches each capability
+ * sequentially. Capability errors are caught + logged — one
+ * capability's failure must not poison the loop.
  *
- * VA-475: also writes through to the shared `PlannerStateSnapshot`
- * so the HTTP health endpoint sees fresh tickCount + lastTickAtUnixMs
- * after each tick.
+ * VA-475: writes through to the shared state so the HTTP health
+ * endpoint sees fresh tickCount + lastTickAtUnixMs after each tick.
+ *
+ * VA-476: invokes queue-selection when configured.
  */
 export const makeOneTick = (
   stateRef: Ref.Ref<PlannerStateSnapshot>,
   startMs: number,
+  capabilities: PlannerCapabilities = {},
 ): Effect.Effect<void> =>
   Effect.gen(function* () {
     const updated = yield* Ref.updateAndGet(stateRef, (s) => ({
@@ -106,6 +122,23 @@ export const makeOneTick = (
         wallClockSinceStartSeconds,
       }),
     );
+
+    if (capabilities.queueSelection) {
+      yield* evaluateQueueSelection(capabilities.queueSelection).pipe(
+        // A capability throw stays local — log it as a structured
+        // error and continue. The alternative (whole-loop crash) is
+        // worse: a stale linear_snapshots row would take down the
+        // entire planner.
+        Effect.catchAllCause((cause) =>
+          Effect.logError("planner.capability.error").pipe(
+            Effect.annotateLogs({
+              capability: "queue-selection",
+              cause: cause.toString(),
+            }),
+          ),
+        ),
+      );
+    }
   });
 
 /**
@@ -121,6 +154,7 @@ export const makeOneTick = (
 export const makePlannerLoop = (
   shutdownSignal: Deferred.Deferred<void>,
   stateRef: Ref.Ref<PlannerStateSnapshot>,
+  capabilities: PlannerCapabilities = {},
 ): Effect.Effect<void, never, ConfigTag> =>
   Effect.gen(function* () {
     const config = yield* ConfigTag;
@@ -135,13 +169,16 @@ export const makePlannerLoop = (
         tickSeconds: runtime.tickSeconds,
         host: runtime.host,
         port: runtime.port,
+        capabilities: Object.keys(capabilities).filter(
+          (k) => capabilities[k as keyof PlannerCapabilities] !== undefined,
+        ).join(",") || "(none)",
       }),
     );
 
     const initialState = yield* Ref.get(stateRef);
     const startMs = initialState.startMs;
 
-    const tickStream = makeOneTick(stateRef, startMs).pipe(
+    const tickStream = makeOneTick(stateRef, startMs, capabilities).pipe(
       Effect.repeat(
         Schedule.spaced(Duration.seconds(runtime.tickSeconds)),
       ),
