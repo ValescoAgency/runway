@@ -92,11 +92,10 @@ function makeGithub(): GithubGateway {
     openPullRequest: vi
       .fn()
       .mockReturnValue(Effect.succeed("https://example/pr/1")),
-    // VA-461: shepherd subscriptions consume these. Defaulting to
-    // `merged: true` keeps the existing orchestrator fixtures
-    // shepherd-neutral — if shepherdEnabled flips on for a test that
-    // wasn't designed around it, the loop exits `merged` immediately
-    // rather than hanging on subscription stubs.
+    // VA-482: PR-state getters retained for orchestrator paths that
+    // inspect `pr.merged` (e.g., finalize-time rebase). The inline
+    // shepherd loop was retired; the planner daemon now consumes
+    // these via its own gateway instance.
     getPullRequest: vi.fn().mockReturnValue(
       Effect.succeed({
         number: 1,
@@ -135,10 +134,6 @@ const config: Config = {
   reviewRetries: 0,
   metaReviewModel: "claude-sonnet-4-6",
   metaProjectName: "runway-meta",
-  shepherdEnabled: false,
-  shepherdPollIntervalSeconds: 15,
-  shepherdMaxIterations: 3,
-  shepherdMaxWallSeconds: 3600,
   plannerTickSeconds: 30,
   plannerHost: "127.0.0.1",
   plannerPort: 3002,

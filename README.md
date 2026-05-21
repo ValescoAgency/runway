@@ -219,13 +219,18 @@ export LINEAR_API_KEY=lin_api_...
 # export RUNWAY_READY_LABEL="ready-for-agent"
 # export RUNWAY_HITL_LABEL="ready-for-human"
 # export RUNWAY_MAX_ITERATIONS=5
-# export RUNWAY_SHEPHERD_ENABLED=true                # VA-460: opt into post-PR shepherd loop (default off)
-# export RUNWAY_SHEPHERD_MAX_ITERATIONS=3            # VA-464: max fix attempts per PR before HITL
-# export RUNWAY_SHEPHERD_MAX_WALL_SECONDS=3600       # VA-464: wall-clock budget per PR before HITL
-# export RUNWAY_SHEPHERD_POLL_INTERVAL_SECONDS=15    # VA-460: polling cadence for the shepherd loop
+# VA-482: the four RUNWAY_SHEPHERD_* env vars have been retired.
+#   Mergeability / CI / reviewer-feedback work now flows through the
+#   `runway planner` daemon (capabilities VA-477..479). Boot the
+#   planner separately (`runway planner run`) and configure it with
+#   the RUNWAY_PLANNER_* env vars; the planner reads from the
+#   dashboard's SQLite file and emits OTLP back to the dashboard.
 # export RUNWAY_PR_REVIEWER_BOT_LOGIN="runway-reviewer-bot"
-#   VA-463: GitHub login of the adversarial PR-reviewer agent.
-#   Unset → all PR comments routed to the human-feedback path.
+#   VA-463 / VA-479: GitHub login of the adversarial PR-reviewer
+#   agent. Consumed by the planner's reviewer dispatcher to
+#   distinguish bot CHANGES-REQUESTED comments from human feedback
+#   (the latter routes through the LLM interpretation path).
+#   Unset → every comment lands on the human-feedback path.
 # export RUNWAY_COMMENT_AUTHOR_ALLOWLIST="Reviewer Bot,Jane Reviewer"
 #   optional, comma-separated Linear user names whose comments on a
 #   re-queued issue surface as "Review feedback from prior attempts"

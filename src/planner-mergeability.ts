@@ -1,3 +1,5 @@
+import { claudeCode } from "@ai-hero/sandcastle";
+import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
 import { Effect } from "effect";
 import type { Config } from "./config.js";
 import {
@@ -10,19 +12,18 @@ import {
   autoAcceptIfEligible,
   resolveCapabilityMode,
 } from "./planner-capability-mode.js";
-import type { GithubGateway } from "./github.js";
+import type { GithubError, GithubGateway } from "./github.js";
 import type { RunwayIssue } from "./linear.js";
 import type {
   OpenShepherdedPrRow,
   PlannerReadClient,
 } from "./planner-storage.js";
+import { renderShepherdRebasePrompt } from "./prompts.js";
 import {
-  defaultInvokeRebaseAgent,
-  parsePrNumber,
-  type ShepherdContext,
-  type Subscription,
-  type SubscriptionSignal,
-} from "./shepherd.js";
+  dockerEnv,
+  runSandcastle,
+  stringifyResult,
+} from "./sandcastle.js";
 
 /**
  * VA-477: mergeability capability for the planner daemon. The
@@ -38,8 +39,9 @@ import {
  *   - existing `accepted` recommendation, no in-flight action → run
  *     the fix action, then `action.started` + `action.completed` /
  *     `action.failed` framing
- *   - `quiet` or `hitl` → no emission (`hitl` goes through the
- *     legacy inline path until VA-482 retires it)
+ *   - `quiet` or `hitl` → no emission. HITL routing is the operator's
+ *     job now: they see the recommendation row, reject it, and
+ *     handle the PR manually in GitHub.
  *
  * Recommendation IDs are stable per PR (`shepherd-mergeability:PR-<n>`)
  * so an `INSERT OR IGNORE` on the dashboard side absorbs duplicate
@@ -50,7 +52,144 @@ import {
 export const MERGEABILITY_CAPABILITY = "shepherd-mergeability";
 
 // ---------------------------------------------------------------------------
-// Relocated subscription (VA-461) — unchanged from src/shepherd.ts.
+// VA-482: primitives relocated here from the retired `src/shepherd.ts`.
+// The watcher Subscription / ShepherdContext / SubscriptionSignal types
+// retained internally only — `evaluateMergeability` is the sole caller.
+// ---------------------------------------------------------------------------
+
+interface ShepherdContext {
+  readonly issue: RunwayIssue;
+  readonly branch: string;
+  readonly prUrl: string;
+  readonly prNumber: number;
+  readonly cwd: string;
+  readonly baseBranch: string;
+  readonly config: Config;
+  readonly github: GithubGateway;
+  readonly iteration: number;
+}
+
+type SubscriptionSignal =
+  | { readonly kind: "quiet" }
+  | { readonly kind: "hitl"; readonly reason: string }
+  | {
+      readonly kind: "fix";
+      readonly description: string;
+      readonly action: Effect.Effect<
+        FixOutcome,
+        GithubError | { readonly message: string }
+      >;
+    };
+
+type FixOutcome =
+  | { readonly kind: "fixed"; readonly detail: string }
+  | { readonly kind: "hitl"; readonly reason: string };
+
+type Subscription = (
+  ctx: ShepherdContext,
+) => Effect.Effect<
+  SubscriptionSignal,
+  GithubError | { readonly message: string }
+>;
+
+export type RebaseAgentResult =
+  | { readonly kind: "done" }
+  | {
+      readonly kind: "blocked";
+      readonly reason: string;
+      readonly conflictFiles: readonly string[];
+    };
+
+export interface RebaseAgentInvocation {
+  readonly issue: RunwayIssue;
+  readonly branch: string;
+  readonly baseBranch: string;
+  readonly mergeableState: string;
+  readonly conflictFiles: readonly string[];
+  readonly cwd: string;
+  readonly config: Config;
+}
+
+/**
+ * Production rebase-agent invocation. Render the prompt, run one
+ * sandcastle iteration, parse the agent's `IMPL:` verdict. The
+ * dispatcher's `fix` action wraps this; tests stub via
+ * `MergeabilityCapabilityContext.invokeRebaseAgent`.
+ */
+export const defaultInvokeRebaseAgent = (
+  args: RebaseAgentInvocation,
+): Effect.Effect<RebaseAgentResult, { readonly message: string }> =>
+  Effect.gen(function* () {
+    const prompt = yield* Effect.promise(() =>
+      renderShepherdRebasePrompt({
+        issue: args.issue,
+        branch: args.branch,
+        baseBranch: args.baseBranch,
+        mergeableState: args.mergeableState,
+        conflictFiles: args.conflictFiles,
+      }),
+    );
+    const result = yield* runSandcastle({
+      agent: claudeCode("claude-opus-4-7"),
+      sandbox: docker({ env: dockerEnv(args.config) }),
+      cwd: args.cwd,
+      prompt,
+      branchStrategy: { type: "branch", branch: args.branch },
+      maxIterations: 1,
+      name: `shepherd-rebase-${args.issue.identifier}`,
+    });
+    return parseRebaseVerdict(stringifyResult(result));
+  });
+
+export function parseRebaseVerdict(output: string): RebaseAgentResult {
+  const blocked = output.match(/^IMPL:\s*BLOCKED(?:\s*[—-]\s*(.*))?$/im);
+  if (blocked) {
+    const reason = (blocked[1] ?? "").trim();
+    const files = extractConflictFilesFromReason(reason);
+    return { kind: "blocked", reason, conflictFiles: files };
+  }
+  if (/^IMPL:\s*DONE\b/im.test(output)) {
+    return { kind: "done" };
+  }
+  // No marker at all is treated as BLOCKED — the loop should
+  // escalate rather than silently believe the rebase succeeded.
+  return {
+    kind: "blocked",
+    reason: "rebase agent produced no IMPL: marker",
+    conflictFiles: [],
+  };
+}
+
+function extractConflictFilesFromReason(reason: string): readonly string[] {
+  // Format we instruct the agent to produce: "Mergeability: conflict
+  // in <file1>, <file2> required human resolution". File paths
+  // legitimately contain `.` (extensions), so the inner character
+  // class only excludes `;` and newlines.
+  const m = reason.match(
+    /(?:conflict|conflicts|files)\s+(?:in\s+)?([^;\n]+?)(?:\s+required\s|\s*$)/i,
+  );
+  if (!m) return [];
+  return m[1]!
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Parse the PR number from a GitHub PR URL
+ * (`https://github.com/<owner>/<repo>/pull/<n>`). Throws on a URL
+ * that doesn't match — `finalize` only hands us GitHub PR URLs.
+ */
+export function parsePrNumber(prUrl: string): number {
+  const m = prUrl.match(/\/pull\/(\d+)(?:[/?#]|$)/);
+  if (!m) {
+    throw new Error(`planner-mergeability: cannot parse PR number from ${prUrl}`);
+  }
+  return Number.parseInt(m[1]!, 10);
+}
+
+// ---------------------------------------------------------------------------
+// Internal watcher (only called from evaluateMergeability below).
 // ---------------------------------------------------------------------------
 
 /**
@@ -301,10 +440,10 @@ const evaluateOnePr = (
     if (signal.kind === "quiet") return;
 
     if (signal.kind === "hitl") {
-      // v1: HITL handling stays with the inline shepherd loop until
-      // VA-482 retires it. The planner-side capability deliberately
-      // does NOT emit a recommendation for the no-fix case — the
-      // operator already sees the inline shepherd's HITL routing.
+      // The capability emits a log marker for operator visibility but
+      // deliberately does NOT propose a recommendation for the
+      // unactionable case — there's nothing for `accept` to do. The
+      // operator handles the PR manually in GitHub.
       yield* Effect.logInfo("planner.mergeability.hitl_signal").pipe(
         Effect.annotateLogs({
           target: `PR-${row.prNumber}`,
@@ -439,7 +578,3 @@ const runAcceptedAction = (
     args.actionsFailed.push(actionId);
   });
 
-// parsePrNumber re-exported so callers building OpenShepherdedPrRow
-// from external sources (tests, future capabilities) don't reach into
-// shepherd.ts directly.
-export { parsePrNumber };

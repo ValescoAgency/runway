@@ -269,3 +269,22 @@ This ADR is the explicit "promote to daemon" path ADR 0001
 contemplated. ADR 0001 is left as-is; this ADR is the supplement,
 not the replacement. The "tail-during-run" pattern remains correct
 for drain telemetry; the planner just adds a parallel emitter.
+
+## Migration status
+
+The VA-472 epic that landed this ADR completed across ten sub-issues:
+VA-473 (scaffold), VA-474 (event model + projection),
+VA-475 (HTTP API), VA-476 (queue-selection), VA-477..479 (shepherd
+capabilities ported), VA-480 (drain spawn + accept→action lifecycle),
+VA-481 (per-capability mode toggle + dashboard panel), and VA-482
+(retire inline shepherd). The original inline post-finalize shepherd
+loop is gone; `runway run` now returns immediately after `finalize`
+opens the PR, and all post-PR drive-to-merge work flows through the
+`runway planner` daemon.
+
+The `RUNWAY_SHEPHERD_*` env vars and the `shepherdEnabled` config
+key were removed in VA-482 — a minor-bump breaking change. Operators
+upgrading from `0.15.0` who set any of those vars will see a Config
+validation error at boot. `RUNWAY_PR_REVIEWER_BOT_LOGIN` survives
+because the planner's reviewer dispatcher still uses it to
+distinguish bot CHANGES-REQUESTED comments from human feedback.

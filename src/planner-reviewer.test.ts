@@ -36,7 +36,6 @@ vi.mock("@ai-hero/sandcastle/sandboxes/docker", () => ({
 
 const {
   evaluateReviewer,
-  makeReviewerWatcher,
   parsePrReviewVerdict,
   parseReviewerResponseVerdict,
   REVIEWER_CAPABILITY,
@@ -54,8 +53,6 @@ const PR_URL = "https://github.com/ValescoAgency/runway/pull/123";
 
 function makeConfig(over: Partial<Config> = {}): Config {
   return {
-    shepherdEnabled: true,
-    shepherdPollIntervalSeconds: 0,
     prReviewerBotLogin: "review-bot",
     ...over,
   } as unknown as Config;
@@ -159,136 +156,6 @@ describe("parseReviewerResponseVerdict — relocated", () => {
   });
 });
 
-describe("makeReviewerWatcher — relocated", () => {
-  it("first poll primes the snapshot (no action on pre-existing comments)", async () => {
-    const invokeReviewerResponseAgent = vi.fn();
-    const github = makeGithub({
-      getPullRequest: vi
-        .fn()
-        .mockReturnValue(Effect.succeed(makePr({ merged: false }))),
-      getPullRequestComments: vi
-        .fn()
-        .mockReturnValue(Effect.succeed([makeComment({ id: 1 })])),
-    });
-    const watcher = makeReviewerWatcher({
-      github,
-      config: makeConfig(),
-      invokeReviewerResponseAgent,
-    });
-    const t1 = await Effect.runPromise(watcher({ ...baseCtx, github }));
-    expect(t1.kind).toBe("quiet");
-    expect(invokeReviewerResponseAgent).not.toHaveBeenCalled();
-  });
-
-  it("bot APPROVED comment → quiet", async () => {
-    const invokeReviewerResponseAgent = vi.fn();
-    let call = 0;
-    const github = makeGithub({
-      getPullRequest: vi
-        .fn()
-        .mockReturnValue(Effect.succeed(makePr({ merged: false }))),
-      getPullRequestComments: vi.fn().mockImplementation(() => {
-        call += 1;
-        return Effect.succeed(
-          call === 1
-            ? []
-            : [
-                makeComment({
-                  id: 1,
-                  authorLogin: "review-bot",
-                  body: "REVIEW: APPROVED",
-                }),
-              ],
-        );
-      }),
-    });
-    const watcher = makeReviewerWatcher({
-      github,
-      config: makeConfig(),
-      invokeReviewerResponseAgent,
-    });
-    await Effect.runPromise(watcher({ ...baseCtx, github })); // prime
-    const t2 = await Effect.runPromise(
-      watcher({ ...baseCtx, github, iteration: 2 }),
-    );
-    expect(t2.kind).toBe("quiet");
-    expect(invokeReviewerResponseAgent).not.toHaveBeenCalled();
-  });
-
-  it("bot CHANGES-REQUESTED → fix-request with parsed fix", async () => {
-    const invokeReviewerResponseAgent = vi
-      .fn()
-      .mockReturnValue(Effect.succeed({ kind: "done" as const }));
-    let call = 0;
-    const github = makeGithub({
-      getPullRequest: vi
-        .fn()
-        .mockReturnValue(Effect.succeed(makePr({ merged: false }))),
-      getPullRequestComments: vi.fn().mockImplementation(() => {
-        call += 1;
-        return Effect.succeed(
-          call === 1
-            ? []
-            : [
-                makeComment({
-                  id: 7,
-                  authorLogin: "review-bot",
-                  body: "REVIEW: CHANGES-REQUESTED — add null guard",
-                }),
-              ],
-        );
-      }),
-    });
-    const watcher = makeReviewerWatcher({
-      github,
-      config: makeConfig(),
-      invokeReviewerResponseAgent,
-    });
-    await Effect.runPromise(watcher({ ...baseCtx, github }));
-    const signal = await Effect.runPromise(
-      watcher({ ...baseCtx, github, iteration: 2 }),
-    );
-    expect(signal.kind).toBe("fix");
-    if (signal.kind !== "fix") return;
-    const outcome = await Effect.runPromise(signal.action);
-    expect(outcome.kind).toBe("fixed");
-    expect(invokeReviewerResponseAgent.mock.calls[0]![0]).toMatchObject({
-      mode: { kind: "fix-request", fix: "add null guard" },
-    });
-  });
-
-  it("bot NEEDS-DISCUSSION → hitl verbatim", async () => {
-    let call = 0;
-    const github = makeGithub({
-      getPullRequest: vi
-        .fn()
-        .mockReturnValue(Effect.succeed(makePr({ merged: false }))),
-      getPullRequestComments: vi.fn().mockImplementation(() => {
-        call += 1;
-        return Effect.succeed(
-          call === 1
-            ? []
-            : [
-                makeComment({
-                  id: 42,
-                  authorLogin: "review-bot",
-                  body: "REVIEW: NEEDS-DISCUSSION — review the architecture",
-                }),
-              ],
-        );
-      }),
-    });
-    const watcher = makeReviewerWatcher({ github, config: makeConfig() });
-    await Effect.runPromise(watcher({ ...baseCtx, github }));
-    const t = await Effect.runPromise(
-      watcher({ ...baseCtx, github, iteration: 2 }),
-    );
-    expect(t.kind).toBe("hitl");
-    if (t.kind === "hitl") {
-      expect(t.reason).toMatch(/review the architecture/);
-    }
-  });
-});
 
 // ---------------------------------------------------------------------------
 // VA-479 — capability dispatcher tests + integration loop.

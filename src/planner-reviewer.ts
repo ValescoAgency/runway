@@ -28,46 +28,41 @@ import {
   runSandcastle,
   stringifyResult,
 } from "./sandcastle.js";
-import type { Subscription, SubscriptionSignal, ShepherdContext } from "./shepherd.js";
-
 /**
- * VA-479: reviewer-comment capability for the planner harness.
+ * VA-479 + VA-482: reviewer-comment capability for the planner
+ * harness. The dispatcher (`evaluateReviewer`) scans every comment on
+ * every open shepherded PR per tick and emits a planner recommendation
+ * per comment. Recommendation IDs are stable per comment
+ * (`shepherd-reviewer:PR-<n>:comment-<id>`); the dashboard's
+ * `INSERT OR IGNORE` collapses re-emits.
  *
- * Relocates the watcher + agent primitives from `src/shepherd.ts`
- * unchanged (`makeReviewerWatcher`, `parsePrReviewVerdict`,
- * `defaultInvokeReviewerResponseAgent`, etc.); shepherd.ts re-exports
- * for the legacy inline path. The planner-side dispatcher
- * (`evaluateReviewer`) iterates open shepherded PRs from the
- * read-projection, scans new comments, and emits planner OTLP events.
- *
- * Two branches per comment:
+ * Branches per comment:
  *
  *   - Bot author + `REVIEW: CHANGES-REQUESTED — <fix>` parses cleanly
  *     → recommendation summary = parsed fix line. Mode in evidence:
- *     `fix-request`.
- *   - Anything else from a human + bot NEEDS-DISCUSSION / no marker
- *     → consult LLM (ADR 0004 § Smartness — consult point #2) to
- *     interpret the comment as a short actionable fix. The LLM's
- *     summary becomes the recommendation summary; evidence carries
- *     the raw comment body + the LLM's rationale so the operator
- *     can override.
- *
- * Bot APPROVED / NONE → skipped (positive signal, no action needed).
- *
- * Dedup is via stable recommendation IDs that encode the comment ID:
- * `shepherd-reviewer:PR-<n>:comment-<id>`. The dashboard's
- * `INSERT OR IGNORE` absorbs re-emits across ticks.
+ *     `fix-request`. Auto-approve-eligible.
+ *   - Anything else from a human (or bot NEEDS-DISCUSSION / no
+ *     marker) → consult LLM (ADR 0004 § Smartness consult point #2)
+ *     to interpret the comment. The LLM's summary becomes the
+ *     recommendation summary; evidence carries the raw comment +
+ *     the LLM's rationale. NOT auto-approve-eligible (the operator
+ *     still confirms even in `auto` mode).
+ *   - Bot APPROVED / NONE → skipped (positive signal, no action).
  *
  * On `accept`, the dispatcher reconstructs the
- * `ReviewerResponseInvocation.mode` from the recommendation's evidence
- * and invokes `defaultInvokeReviewerResponseAgent`, then emits
- * `action.started` → `action.completed` / `action.failed`.
+ * `ReviewerResponseInvocation.mode` from the live comment + bot-author
+ * config and invokes `defaultInvokeReviewerResponseAgent`, then
+ * emits `action.started` → `action.completed` / `action.failed`.
+ *
+ * VA-482 retired the inline-shepherd `makeReviewerWatcher` factory and
+ * the Subscription / ShepherdContext abstraction it consumed; this
+ * dispatcher is now the only call site for the agent primitives.
  */
 
 export const REVIEWER_CAPABILITY = "shepherd-reviewer";
 
 // ---------------------------------------------------------------------------
-// Relocated VA-463 primitives — verbatim from shepherd.ts.
+// Reviewer-response agent primitives.
 // ---------------------------------------------------------------------------
 
 export type PrReviewVerdict =
@@ -168,132 +163,6 @@ export function parseReviewerResponseVerdict(
   return {
     kind: "blocked",
     reason: "reviewer-response agent produced no IMPL: marker",
-  };
-}
-
-export interface ReviewerWatcherDeps {
-  readonly github: GithubGateway;
-  readonly config: Config;
-  /** Production default; tests inject a stub. */
-  readonly invokeReviewerResponseAgent?: typeof defaultInvokeReviewerResponseAgent;
-}
-
-/**
- * Legacy inline-shepherd reviewer-comment watcher. Verbatim relocation
- * of the VA-463 implementation. The planner-side capability does NOT
- * call this — it re-implements the per-PR scan inline so the
- * recommendation / action emission can fall out cleanly without
- * round-tripping through the `Subscription` ADT.
- */
-export function makeReviewerWatcher(deps: ReviewerWatcherDeps): Subscription {
-  const invoke =
-    deps.invokeReviewerResponseAgent ?? defaultInvokeReviewerResponseAgent;
-  const respondedTo = new Set<number>();
-  let primed = false;
-
-  return (ctx) =>
-    Effect.gen(function* () {
-      const pr = yield* deps.github.getPullRequest({
-        repoPath: ctx.cwd,
-        prNumber: ctx.prNumber,
-      });
-      if (pr.merged) return { kind: "quiet" } as const;
-
-      const comments = yield* deps.github.getPullRequestComments({
-        repoPath: ctx.cwd,
-        prNumber: ctx.prNumber,
-      });
-
-      // Initial-snapshot priming: on the first poll, snapshot every
-      // existing comment ID into the responded set so we only act on
-      // NEW comments posted during this shepherd loop's lifetime.
-      if (!primed) {
-        for (const c of comments) respondedTo.add(c.id);
-        primed = true;
-        return { kind: "quiet" } as const;
-      }
-
-      const next = comments.find((c) => !respondedTo.has(c.id));
-      if (!next) return { kind: "quiet" } as const;
-      respondedTo.add(next.id);
-
-      const botLogin = deps.config.prReviewerBotLogin?.trim();
-      const isBot = Boolean(botLogin) && next.authorLogin === botLogin;
-
-      if (isBot) {
-        const verdict = parsePrReviewVerdict(next.body);
-        if (verdict.kind === "approved" || verdict.kind === "none") {
-          return { kind: "quiet" } as const;
-        }
-        if (verdict.kind === "needs-discussion") {
-          return {
-            kind: "hitl",
-            reason: `Reviewer flagged needs-discussion: ${verdict.decision || "(no detail provided)"}`,
-          } as const;
-        }
-        return buildFixSignal(
-          ctx,
-          deps,
-          invoke,
-          { kind: "fix-request", fix: verdict.fix },
-          next,
-        );
-      }
-
-      return buildFixSignal(
-        ctx,
-        deps,
-        invoke,
-        {
-          kind: "verbatim",
-          commentAuthor: next.authorLogin,
-          commentSource: next.source,
-          commentBody: next.body,
-        },
-        next,
-      );
-    });
-}
-
-function buildFixSignal(
-  ctx: ShepherdContext,
-  deps: ReviewerWatcherDeps,
-  invoke: typeof defaultInvokeReviewerResponseAgent,
-  mode: ReviewerResponseInvocation["mode"],
-  comment: PrComment,
-): SubscriptionSignal {
-  const summary =
-    mode.kind === "fix-request"
-      ? `CHANGES-REQUESTED — ${truncate(mode.fix, 60)}`
-      : `${comment.authorLogin || "unknown"} (${comment.source})`;
-  return {
-    kind: "fix",
-    description: `Respond to PR comment: ${summary}`,
-    action: Effect.gen(function* () {
-      const result = yield* invoke({
-        issue: ctx.issue,
-        branch: ctx.branch,
-        cwd: ctx.cwd,
-        config: deps.config,
-        mode,
-      });
-      if (result.kind === "blocked") {
-        return {
-          kind: "hitl",
-          reason:
-            mode.kind === "fix-request"
-              ? `Reviewer CHANGES-REQUESTED BLOCKED: ${result.reason}`
-              : `Reviewer comment BLOCKED (${comment.authorLogin || "unknown"}): ${result.reason}`,
-        } as const;
-      }
-      return {
-        kind: "fixed",
-        detail:
-          mode.kind === "fix-request"
-            ? `Addressed reviewer fix-request`
-            : `Responded to ${comment.authorLogin || "reviewer"} comment`,
-      } as const;
-    }),
   };
 }
 

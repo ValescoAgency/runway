@@ -14,13 +14,6 @@ import {
 } from "./prompts.js";
 import { runReviewPass } from "./review.js";
 import {
-  makeCiWatcher,
-  makeIsMerged,
-  makeMergeabilityWatcher,
-  makeReviewerWatcher,
-  runShepherdPass,
-} from "./shepherd.js";
-import {
   finalize,
   formatRebaseConflictReason,
   formatRebaseFailureReason,
@@ -518,54 +511,12 @@ const processIssue = (
           yield* flagHitl(issue, deps, reason);
           return { kind: "hitl", detail: reason };
         }
-        // VA-460: post-finalize shepherd loop. Gated off by default —
-        // first ship lands the scaffolding only; VA-461..463 wire the
-        // mergeability / CI / reviewer subscriptions, VA-464 the
-        // budget knobs. When gated off the composer returns the
-        // `opened` outcome verbatim, preserving the historical
-        // behavior.
-        if (deps.config.shepherdEnabled) {
-          const shepherd = yield* runShepherdPass(
-            issue,
-            {
-              config: deps.config,
-              cwd: deps.cwd,
-              baseBranch: deps.baseBranch,
-              github: deps.github,
-              // VA-461 / VA-462 / VA-463: three real subscriptions
-              // wired in precedence order. Mergeability runs first
-              // (a dirty base would prevent CI from even running);
-              // CI second; reviewer feedback last (CI fixes that
-              // address reviewer concerns push commits which will
-              // be seen on the next tick).
-              isMerged: makeIsMerged(deps.github),
-              subscriptions: [
-                makeMergeabilityWatcher({
-                  github: deps.github,
-                  config: deps.config,
-                }),
-                makeCiWatcher({
-                  github: deps.github,
-                  config: deps.config,
-                }),
-                makeReviewerWatcher({
-                  github: deps.github,
-                  config: deps.config,
-                }),
-              ],
-            },
-            branch,
-            finalized.detail,
-          );
-          if (shepherd.kind === "hitl") {
-            const reason = `Shepherd routed PR to HITL: ${shepherd.reason}`;
-            yield* flagHitl(issue, deps, reason);
-            return { kind: "hitl", detail: reason };
-          }
-          // `merged` and `ready` both preserve the `opened` outcome —
-          // the PR exists; whether it's merged yet doesn't change the
-          // per-issue verdict the operator sees in the exit summary.
-        }
+        // VA-482: the post-finalize inline shepherd loop is gone.
+        // Mergeability / CI / reviewer-feedback work now flows
+        // through the long-running `runway planner` daemon
+        // (capabilities VA-477..479); the per-issue `runway run`
+        // pass returns immediately after `finalize.opened` without
+        // blocking on PR drive-to-merge.
         return finalized;
       }
       if (review.kind === "hitl") {
