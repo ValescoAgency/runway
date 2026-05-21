@@ -115,6 +115,17 @@ export interface PlannerReadClient {
   readonly getActionsForRecommendation: (
     recommendationId: string,
   ) => readonly PlannerActionRow[];
+  /**
+   * VA-480: accepted recommendations for a given capability whose
+   * `recommendation_id` is not yet referenced by any
+   * `planner_actions` row. Used by the drain-spawn capability to
+   * find pending queue-selection accepts that still need an action
+   * spawn. Ordered by proposed_unix_nano ASC so the oldest accept
+   * goes first.
+   */
+  readonly listAcceptedRecommendationsWithoutAction: (
+    capability: string,
+  ) => readonly PlannerRecommendationRow[];
   readonly close: () => void;
 }
 
@@ -238,6 +249,22 @@ export function createPlannerReadClient(
     WHERE recommendation_id = ?
     ORDER BY CAST(started_unix_nano AS INTEGER) DESC
   `);
+  // VA-480: accepted recommendations that don't yet have a
+  // corresponding planner_actions row. LEFT JOIN absent row → pending
+  // accept. Ordered oldest-first so FIFO accepts fire in the order the
+  // operator approved them.
+  const listAcceptedRecommendationsWithoutActionStmt = db.prepare(`
+    SELECT
+      r.recommendation_id, r.capability, r.target, r.summary, r.evidence_json,
+      r.status, r.proposed_unix_nano, r.decided_unix_nano, r.decided_by,
+      r.decision_reason, r.auto_approve_eligible
+    FROM planner_recommendations r
+    LEFT JOIN planner_actions a ON a.recommendation_id = r.recommendation_id
+    WHERE r.capability = ?
+      AND r.status = 'accepted'
+      AND a.action_id IS NULL
+    ORDER BY CAST(r.proposed_unix_nano AS INTEGER) ASC
+  `);
 
   const getRecentRecommendations = (
     opts: { status?: RecommendationStatus | "all"; limit?: number } = {},
@@ -357,6 +384,14 @@ export function createPlannerReadClient(
     ) as unknown as ReadonlyArray<Record<string, unknown>>;
     return rows.map(rowToAction);
   };
+  const listAcceptedRecommendationsWithoutAction = (
+    capability: string,
+  ): readonly PlannerRecommendationRow[] => {
+    const rows = listAcceptedRecommendationsWithoutActionStmt.all(
+      capability,
+    ) as unknown as ReadonlyArray<Record<string, unknown>>;
+    return rows.map(rowToRecommendation);
+  };
 
   return {
     getRecentRecommendations,
@@ -367,6 +402,7 @@ export function createPlannerReadClient(
     listInFlightActionTargets,
     listOpenShepherdedPrs,
     getActionsForRecommendation,
+    listAcceptedRecommendationsWithoutAction,
     close: () => db.close(),
   };
 }

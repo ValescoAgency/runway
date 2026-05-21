@@ -232,6 +232,14 @@ export async function plannerCommand(argv: readonly string[]): Promise<void> {
                     : undefined,
                   now: nowNano,
                 },
+                // VA-480: drain-spawn capability completes the
+                // queue-selection accept → action lifecycle by
+                // spawning `runway run --target <issue>`.
+                drain: {
+                  readClient,
+                  cwd: process.cwd(),
+                  now: nowNano,
+                },
               }
             : {}),
         }

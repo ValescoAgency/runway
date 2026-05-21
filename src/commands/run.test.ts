@@ -147,4 +147,36 @@ describe("parseRunArgs", () => {
       );
     });
   });
+
+  describe("--target (VA-480)", () => {
+    it("parses --target VA-123", () => {
+      expect(parseRunArgs(["--target", "VA-123"])).toEqual({ target: "VA-123" });
+    });
+
+    it("parses --target=VA-123 (inline form)", () => {
+      expect(parseRunArgs(["--target=VA-456"])).toEqual({ target: "VA-456" });
+    });
+
+    it("rejects --target with no value", () => {
+      expect(() => parseRunArgs(["--target"])).toThrow(
+        /--target requires a Linear issue identifier/,
+      );
+    });
+
+    it("rejects malformed identifier", () => {
+      expect(() => parseRunArgs(["--target", "not-a-real-id"])).toThrow(
+        /must be a Linear issue identifier/,
+      );
+      expect(() => parseRunArgs(["--target=lowercase-7"])).toThrow(
+        /must be a Linear issue identifier/,
+      );
+    });
+
+    it("combines with --max", () => {
+      expect(parseRunArgs(["--max", "1", "--target", "VA-200"])).toEqual({
+        max: 1,
+        target: "VA-200",
+      });
+    });
+  });
 });
