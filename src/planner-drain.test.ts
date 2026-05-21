@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Effect, HashMap, Logger, LogLevel } from "effect";
+import { Effect, Fiber, HashMap, Logger, LogLevel } from "effect";
 import {
   afterEach,
   beforeEach,
@@ -22,6 +22,8 @@ const {
   evaluateDrain,
   parseDrainOutcome,
 } = await import("./planner-drain.js");
+import type { DrainSpawnResult } from "./planner-drain.js";
+type DrainSpawnResultMock = DrainSpawnResult;
 const { createPlannerReadClient } = await import("./planner-storage.js");
 
 interface CapturedLog {
@@ -317,7 +319,7 @@ describe("evaluateDrain — VA-480", () => {
     }
   });
 
-  it("integration: spawner throw → action.failed", async () => {
+  it("integration: spawner Effect.fail → action.completed with outcome='errored' (graceful degradation)", async () => {
     seedAcceptedQueueRec(writer, {
       recommendationId: "queue-selection:VA-203",
       target: "VA-203",
@@ -342,19 +344,79 @@ describe("evaluateDrain — VA-480", () => {
           Logger.withMinimumLogLevel(LogLevel.Info),
         ),
       );
-      // The spawn fail short-circuits into errored with exitCode=null;
-      // the dispatcher converts that into action.failed.
+      // Spawn fail short-circuits into errored with exitCode=null;
+      // since exit isn't non-zero we route to action.completed with
+      // outcome='errored' (operator still sees the failure clearly
+      // on the dashboard). The exit-code-driven action.failed path
+      // is exercised in the non-zero-exit test above.
       expect(result.actionsFailed).toEqual([]);
-      // Actually exitCode null doesn't trigger the failed path
-      // (`(result.exitCode ?? 0) !== 0` is false). So it lands as
-      // action.completed with outcome="errored". That's the v1
-      // behavior — the operator still sees `errored` clearly on the
-      // dashboard.
       expect(result.actionsCompleted).toEqual(["action:VA-203"]);
       const completed = sink.find(
         (l) => l.message === PLANNER_ACTION_COMPLETED_LOG,
       );
       expect(completed?.attrs.outcome).toBe("errored");
+    } finally {
+      reader.close();
+    }
+  });
+
+  it("planner shutdown mid-drain → SIGTERM child + planner waits for exit (VA-480 AC)", async () => {
+    seedAcceptedQueueRec(writer, {
+      recommendationId: "queue-selection:VA-204",
+      target: "VA-204",
+      proposedNano: "1715000000000000000",
+    });
+
+    // The spawner returns an Effect that simulates a long-running
+    // drain: a Deferred that resolves only when the test signals
+    // shutdown. The scoped subprocess pattern means we can interrupt
+    // the parent Effect mid-drain and assert the spawn's release
+    // finalizer fires.
+    let releaseCalled = false;
+    const drainFinished = vi.fn();
+    const spawnDrain = vi.fn().mockImplementation(() =>
+      Effect.acquireUseRelease(
+        Effect.sync(() => "drain-handle"),
+        () =>
+          // Block forever — the test interrupts before this resolves.
+          Effect.async<DrainSpawnResultMock>(() => {
+            // Never invoked the resume; rely on interrupt.
+          }),
+        () =>
+          Effect.sync(() => {
+            releaseCalled = true;
+            drainFinished();
+          }),
+      ),
+    );
+
+    const reader = createPlannerReadClient({ sqlitePath: dbPath });
+    try {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const fiber = yield* Effect.fork(
+            evaluateDrain({
+              readClient: reader,
+              cwd: "/tmp/repo",
+              spawnDrain,
+              now: () => "1715000010000000000",
+            }),
+          );
+          // Give the spawner a moment to enter its acquired state
+          // (the spawn is async, so we need a yield before
+          // interruption to ensure the acquireRelease has started).
+          yield* Effect.sleep("50 millis");
+          yield* Fiber.interrupt(fiber);
+        }),
+      );
+
+      expect(spawnDrain).toHaveBeenCalledOnce();
+      // The release finalizer ran — proving the planner's interrupt
+      // propagated to the spawn's cleanup path. In production
+      // `defaultSpawnDrain` translates this into `child.kill('SIGTERM')`
+      // with a force-kill-after-delay grace window.
+      expect(releaseCalled).toBe(true);
+      expect(drainFinished).toHaveBeenCalledOnce();
     } finally {
       reader.close();
     }

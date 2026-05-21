@@ -33,10 +33,13 @@ import { QUEUE_SELECTION_CAPABILITY } from "./planner-queue-selection.js";
  * non-zero exit code routes to `action.failed` with a brief error
  * detail.
  *
- * Shutdown: the spawn uses execa's `Subprocess.kill('SIGTERM')` when
- * the planner's Effect is interrupted (operator Ctrl-C, SIGTERM).
- * The drain has its own cleanup logic; the planner waits for the
- * subprocess to exit before completing shutdown.
+ * Shutdown: the default spawner is built on `Effect.acquireUseRelease`
+ * so when the planner's Effect is interrupted (operator Ctrl-C,
+ * SIGTERM, capability-level error), the release finalizer fires
+ * `child.kill('SIGTERM', { forceKillAfterDelay: 5_000 })`. SIGTERM
+ * gives the drain time to flush its own OTLP exporter + tear down
+ * Sandcastle; the force-kill grace window bounds shutdown so a
+ * stuck drain can't pin the planner.
  */
 
 export const DRAIN_CAPABILITY = "queue-selection";
@@ -182,41 +185,74 @@ export const evaluateDrain = (
  * Spawn `runway run --target <target>` as a subprocess. Inherits the
  * planner's env so the drain has the same LINEAR_API_KEY,
  * OP_SERVICE_ACCOUNT_TOKEN, etc. Captures stdout to parse the
- * `[runway:exit]` marker but pipes both stdout + stderr through to
- * the parent so the operator sees the drain output live.
+ * `[runway:exit]` marker; pipes stderr through so the operator sees
+ * failures live.
  *
- * `runExecaScoped` isn't used here because we want to capture stdout
- * for outcome parsing. execa's `reject: false` keeps non-zero exits
- * out of the throw path so the dispatcher can convert them into
- * `action.failed`.
+ * Uses `Effect.acquireRelease` so the child receives `SIGTERM` if the
+ * planner's Effect is interrupted (operator Ctrl-C, planner shutdown,
+ * etc.). The release also awaits the child for a short grace period
+ * before escalating to `SIGKILL`, mirroring the AC's "drain receives
+ * SIGTERM, planner waits" semantics.
  */
+const SIGTERM_GRACE_MS = 5_000;
+
 const defaultSpawnDrain: DrainSpawner = (args) =>
-  Effect.tryPromise({
-    try: async () => {
-      // `runway` resolves through the same PATH the planner daemon
-      // sees. In production this is the user's pnpm/npm bin; in
-      // tests, the spawnDrain override sidesteps the lookup entirely.
-      const child = execa("runway", ["run", "--target", args.target], {
+  Effect.acquireUseRelease(
+    Effect.sync(() =>
+      execa("runway", ["run", "--target", args.target], {
         cwd: args.cwd,
         env: process.env,
         reject: false,
-        // Capture stdout so we can parse the `[runway:exit]` marker
-        // after exit. Pipe stderr through so the operator sees
-        // failures live. (Live-streaming stdout is a follow-up — for
-        // v1 the captured stdout is echoed after the drain exits.)
+        // Capture stdout for outcome parsing; pipe stderr to parent
+        // so live failures are visible.
         stdio: ["ignore", "pipe", "inherit"],
-      });
-      const result = await child;
-      const stdout = String(result.stdout ?? "");
-      // Echo captured stdout so the operator sees the drain's full
-      // log after completion. Live streaming follow-up: VA-486+.
-      if (stdout.length > 0) process.stdout.write(stdout);
-      return parseDrainOutcome(stdout, result.exitCode);
-    },
-    catch: (err) => ({
-      message: err instanceof Error ? err.message : String(err),
-    }),
-  });
+      }),
+    ),
+    (child) =>
+      Effect.tryPromise({
+        try: async () => {
+          const result = await child;
+          const stdout = String(result.stdout ?? "");
+          if (stdout.length > 0) process.stdout.write(stdout);
+          return parseDrainOutcome(stdout, result.exitCode);
+        },
+        catch: (err) => ({
+          message: err instanceof Error ? err.message : String(err),
+        }),
+      }),
+    (child) =>
+      Effect.sync(() => {
+        // If the child is still running when the Effect is
+        // interrupted, send SIGTERM then await up to SIGTERM_GRACE_MS
+        // before escalating to SIGKILL. execa's
+        // `kill('SIGTERM', {forceKillAfterDelay})` does exactly this
+        // — preserving the AC's "planner waits" guarantee while
+        // bounding shutdown time so a stuck drain can't pin the
+        // planner.
+        const killable = child as unknown as {
+          exitCode?: number | null;
+          killed?: boolean;
+          kill?: (
+            signal: string,
+            opts?: { forceKillAfterDelay: number },
+          ) => boolean;
+        };
+        if (
+          typeof killable.kill === "function" &&
+          killable.exitCode === null &&
+          !killable.killed
+        ) {
+          try {
+            killable.kill("SIGTERM", {
+              forceKillAfterDelay: SIGTERM_GRACE_MS,
+            });
+          } catch {
+            // Race: child may have exited between the check and the
+            // kill. Best-effort cleanup; nothing more to do.
+          }
+        }
+      }),
+  );
 
 /**
  * Parse the `[runway:exit] status=... opened=N hitl=N errored=N

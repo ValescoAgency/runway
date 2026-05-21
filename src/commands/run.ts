@@ -276,12 +276,18 @@ export async function runCommand(argv: readonly string[]): Promise<void> {
   console.log(
     `[runway] done — attempts=${result.attempts} opened=${result.opened} hitl=${result.hitl} errored=${result.errored} skipped=${result.skipped}`,
   );
+  // VA-480: when `--target` was specified but no issue was attempted,
+  // the target wasn't in the ready queue. Surface as a non-zero
+  // exit so the planner's drain-spawn dispatcher routes the action
+  // to `action.failed` instead of `action.completed`. The drainQueue
+  // Effect already logged the warning; this is the exit-code half.
+  const targetMissed = opts.target !== undefined && result.attempts === 0;
   // Single-line, parser-friendly completion marker. Background
   // watchers (Claude Code's `run_in_background` bash task, CI,
   // scripts) can grep for `[runway:exit]` instead of guessing
   // whether the drain is still in flight.
   console.log(
-    `[runway:exit] status=success attempts=${result.attempts} opened=${result.opened} hitl=${result.hitl} errored=${result.errored} skipped=${result.skipped}`,
+    `[runway:exit] status=${targetMissed ? "target_not_in_queue" : "success"} attempts=${result.attempts} opened=${result.opened} hitl=${result.hitl} errored=${result.errored} skipped=${result.skipped}`,
   );
   // Hard exit so any lingering handle (OTel BatchSpanProcessor's
   // interval when OTEL_EXPORTER_OTLP_ENDPOINT is set, a Docker
@@ -289,5 +295,5 @@ export async function runCommand(argv: readonly string[]): Promise<void> {
   // the background task that launched it — alive after the drain is
   // logically done. By this point `Effect.scoped` has already torn
   // down its finalizers.
-  process.exit(0);
+  process.exit(targetMissed ? 1 : 0);
 }
