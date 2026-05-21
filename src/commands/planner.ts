@@ -14,6 +14,7 @@ import {
   PLANNER_RECOMMENDATION_ACCEPTED_LOG,
   PLANNER_RECOMMENDATION_REJECTED_LOG,
 } from "../dashboard/projector.js";
+import { createGithubGateway } from "../github.js";
 import {
   startPlannerHttpServer,
   type DecisionEmitter,
@@ -179,13 +180,31 @@ export async function plannerCommand(argv: readonly string[]): Promise<void> {
     // SQLite read client. Absent → tick body skips it (the daemon
     // still serves /planner/health and the POST endpoints, just no
     // recommendations get proposed).
+    //
+    // VA-477: mergeability capability needs both the SQLite read
+    // client AND a `baseBranch` configured. Without baseBranch the
+    // rebase-target is unknown, so the capability is dormant rather
+    // than rebasing against a guessed default.
+    const nowNano = () => String(Date.now() * 1_000_000);
     const capabilities: PlannerCapabilities = readClient
       ? {
           queueSelection: {
             readClient,
             readyLabel: config.readyLabel,
-            now: () => String(Date.now() * 1_000_000),
+            now: nowNano,
           },
+          ...(config.baseBranch
+            ? {
+                mergeability: {
+                  readClient,
+                  github: createGithubGateway(),
+                  config,
+                  cwd: process.cwd(),
+                  baseBranch: config.baseBranch,
+                  now: nowNano,
+                },
+              }
+            : {}),
         }
       : {};
 

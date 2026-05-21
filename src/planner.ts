@@ -7,6 +7,11 @@ import {
   type Scope,
 } from "effect";
 import { ConfigTag } from "./config.js";
+import {
+  evaluateMergeability,
+  MERGEABILITY_CAPABILITY,
+  type MergeabilityCapabilityContext,
+} from "./planner-mergeability.js";
 import type { PlannerHealth } from "./planner-http.js";
 import {
   evaluateQueueSelection,
@@ -89,6 +94,7 @@ export const PLANNER_SHUTDOWN_LOG = "planner.shutdown";
  */
 export interface PlannerCapabilities {
   readonly queueSelection?: QueueSelectionContext;
+  readonly mergeability?: MergeabilityCapabilityContext;
 }
 
 /**
@@ -133,6 +139,23 @@ export const makeOneTick = (
           Effect.logError("planner.capability.error").pipe(
             Effect.annotateLogs({
               capability: "queue-selection",
+              cause: cause.toString(),
+            }),
+          ),
+        ),
+      );
+    }
+
+    if (capabilities.mergeability) {
+      // VA-477: mergeability capability already catches per-PR
+      // failures internally, but a higher-level guard here keeps the
+      // tick alive if `listOpenShepherdedPrs` itself throws (e.g.,
+      // SQLite I/O error).
+      yield* evaluateMergeability(capabilities.mergeability).pipe(
+        Effect.catchAllCause((cause) =>
+          Effect.logError("planner.capability.error").pipe(
+            Effect.annotateLogs({
+              capability: MERGEABILITY_CAPABILITY,
               cause: cause.toString(),
             }),
           ),

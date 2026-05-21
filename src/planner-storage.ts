@@ -24,6 +24,28 @@ export interface ReadyForAgentRow {
 }
 
 /**
+ * VA-477: one PR the planner's shepherd-mergeability capability
+ * iterates. Derived from `issue_processes` rows that finalized with
+ * `outcome_kind = 'opened'` and a non-null `pr_url`, deduplicated to
+ * the most recent record per PR URL.
+ *
+ * The `branch` column on `issue_processes` is nullable in the schema
+ * but populated for every `opened` outcome the orchestrator writes —
+ * filtered to non-null in SQL so the row interface can promise a
+ * concrete string.
+ */
+export interface OpenShepherdedPrRow {
+  readonly issueIdentifier: string;
+  readonly issueId: string | null;
+  readonly issueTitle: string | null;
+  readonly issueLabels: readonly string[];
+  readonly branch: string;
+  readonly prUrl: string;
+  /** Parsed from `pr_url`. */
+  readonly prNumber: number;
+}
+
+/**
  * VA-475: read-only SQLite client for the planner daemon. The planner
  * shares the dashboard's SQLite file but never writes to it — ADR
  * 0004 § Writer model establishes the dashboard as the sole writer.
@@ -72,6 +94,27 @@ export interface PlannerReadClient {
    * to `started` for the duration of the drain.
    */
   readonly listInFlightActionTargets: () => readonly string[];
+  /**
+   * VA-477: open shepherded PRs the mergeability capability iterates.
+   * One row per PR URL — issue_processes can fire multiple `opened`
+   * spans for the same PR (re-run of the same issue), so SQL picks
+   * the most recent record per `pr_url`. PRs that the GH gateway
+   * later reports as `merged: true` come back as `quiet` in the
+   * watcher and are dropped from the planner's view next tick by the
+   * dashboard's projection rebuild (out-of-scope for VA-477 — the
+   * watcher's defensive merged check handles the interim window).
+   */
+  readonly listOpenShepherdedPrs: () => readonly OpenShepherdedPrRow[];
+  /**
+   * VA-477: actions tied to a specific recommendation_id. The
+   * mergeability capability uses this to decide whether an
+   * accepted recommendation has already been acted on — if any
+   * row exists (started / completed / failed), the capability
+   * skips re-firing this tick.
+   */
+  readonly getActionsForRecommendation: (
+    recommendationId: string,
+  ) => readonly PlannerActionRow[];
   readonly close: () => void;
 }
 
@@ -163,6 +206,38 @@ export function createPlannerReadClient(
     FROM planner_actions
     WHERE status = 'started'
   `);
+  // VA-477: open shepherded PRs. Dedup to the most-recent record per
+  // pr_url so a re-run of the same issue (which writes a new
+  // issue_processes row with the same pr_url) collapses to one row.
+  // SQLite's GROUP BY semantics: when a non-aggregated column appears
+  // without aggregation, SQLite returns the value from the row that
+  // matched the MAX/MIN aggregate. We rely on this for issue_*
+  // columns paired with `MAX(inserted_at)`.
+  const listOpenShepherdedPrsStmt = db.prepare(`
+    SELECT
+      issue_identifier,
+      issue_id,
+      issue_title,
+      issue_labels,
+      branch,
+      pr_url,
+      MAX(inserted_at) AS latest
+    FROM issue_processes
+    WHERE outcome_kind = 'opened'
+      AND pr_url IS NOT NULL
+      AND branch IS NOT NULL
+    GROUP BY pr_url
+    ORDER BY latest DESC
+    LIMIT 100
+  `);
+  const getActionsForRecommendationStmt = db.prepare(`
+    SELECT
+      action_id, recommendation_id, capability, target, status,
+      started_unix_nano, ended_unix_nano, outcome, error
+    FROM planner_actions
+    WHERE recommendation_id = ?
+    ORDER BY CAST(started_unix_nano AS INTEGER) DESC
+  `);
 
   const getRecentRecommendations = (
     opts: { status?: RecommendationStatus | "all"; limit?: number } = {},
@@ -245,6 +320,43 @@ export function createPlannerReadClient(
     >;
     return rows.map((r) => String(r.target ?? "")).filter((t) => t.length > 0);
   };
+  const listOpenShepherdedPrs = (): readonly OpenShepherdedPrRow[] => {
+    const rows = listOpenShepherdedPrsStmt.all() as unknown as ReadonlyArray<
+      Record<string, unknown>
+    >;
+    const out: OpenShepherdedPrRow[] = [];
+    for (const r of rows) {
+      const prUrl = String(r.pr_url ?? "");
+      const branch = String(r.branch ?? "");
+      if (prUrl.length === 0 || branch.length === 0) continue;
+      const prNumber = parsePrNumberLoose(prUrl);
+      if (prNumber === null) continue;
+      out.push({
+        issueIdentifier: String(r.issue_identifier ?? ""),
+        issueId:
+          r.issue_id === null || r.issue_id === undefined
+            ? null
+            : String(r.issue_id),
+        issueTitle:
+          r.issue_title === null || r.issue_title === undefined
+            ? null
+            : String(r.issue_title),
+        issueLabels: parseLabelsJson(r.issue_labels),
+        branch,
+        prUrl,
+        prNumber,
+      });
+    }
+    return out;
+  };
+  const getActionsForRecommendation = (
+    recommendationId: string,
+  ): readonly PlannerActionRow[] => {
+    const rows = getActionsForRecommendationStmt.all(
+      recommendationId,
+    ) as unknown as ReadonlyArray<Record<string, unknown>>;
+    return rows.map(rowToAction);
+  };
 
   return {
     getRecentRecommendations,
@@ -253,8 +365,20 @@ export function createPlannerReadClient(
     listReadyForAgent,
     listKnownRecommendationTargets,
     listInFlightActionTargets,
+    listOpenShepherdedPrs,
+    getActionsForRecommendation,
     close: () => db.close(),
   };
+}
+
+// VA-477: local PR-number parser. Mirrors `parsePrNumber` in
+// shepherd.ts but returns null on a malformed URL instead of throwing
+// — this is row-level filtering, not a precondition assertion.
+function parsePrNumberLoose(prUrl: string): number | null {
+  const m = prUrl.match(/\/pull\/(\d+)(?:[/?#]|$)/);
+  if (!m) return null;
+  const n = Number.parseInt(m[1]!, 10);
+  return Number.isFinite(n) ? n : null;
 }
 
 // Tolerant labels-json decoder: malformed JSON or non-array payloads
