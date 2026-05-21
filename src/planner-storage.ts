@@ -56,11 +56,16 @@ export interface PlannerReadClient {
     readonly readyLabel: string;
   }) => readonly ReadyForAgentRow[];
   /**
-   * VA-476: targets currently carrying a recommendation in `proposed`
-   * or `accepted` status. Queue-selection skips these so the planner
-   * doesn't double-recommend the same issue tick after tick.
+   * VA-476: targets that already carry ANY recommendation row,
+   * regardless of status (proposed | accepted | rejected). Queue-
+   * selection skips these so the planner doesn't recommend the
+   * same issue tick after tick. A rejected target is treated as
+   * terminal — the operator removes + re-adds the ready-for-agent
+   * label on Linear to retry. (The dashboard's `INSERT OR IGNORE`
+   * absorbed duplicate emits before this fix, but the planner was
+   * generating needless OTLP traffic on every tick.)
    */
-  readonly listOpenRecommendationTargets: () => readonly string[];
+  readonly listKnownRecommendationTargets: () => readonly string[];
   /**
    * VA-476: targets with an action currently in `started` status.
    * Once VA-480 wires drain spawning, an `accept` flips the action
@@ -149,10 +154,9 @@ export function createPlannerReadClient(
       )
     ORDER BY queue_position ASC
   `);
-  const listOpenRecommendationTargetsStmt = db.prepare(`
+  const listKnownRecommendationTargetsStmt = db.prepare(`
     SELECT DISTINCT target
     FROM planner_recommendations
-    WHERE status IN ('proposed', 'accepted')
   `);
   const listInFlightActionTargetsStmt = db.prepare(`
     SELECT DISTINCT target
@@ -229,8 +233,8 @@ export function createPlannerReadClient(
     }
     return out;
   };
-  const listOpenRecommendationTargets = (): readonly string[] => {
-    const rows = listOpenRecommendationTargetsStmt.all() as unknown as ReadonlyArray<
+  const listKnownRecommendationTargets = (): readonly string[] => {
+    const rows = listKnownRecommendationTargetsStmt.all() as unknown as ReadonlyArray<
       Record<string, unknown>
     >;
     return rows.map((r) => String(r.target ?? "")).filter((t) => t.length > 0);
@@ -247,7 +251,7 @@ export function createPlannerReadClient(
     getRecommendation,
     getActions,
     listReadyForAgent,
-    listOpenRecommendationTargets,
+    listKnownRecommendationTargets,
     listInFlightActionTargets,
     close: () => db.close(),
   };

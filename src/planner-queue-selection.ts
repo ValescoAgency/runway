@@ -17,12 +17,15 @@ import type { PlannerReadClient, ReadyForAgentRow } from "./planner-storage.js";
  *
  * Recommendation ID is `queue-selection:<target>` — stable across
  * ticks so the dashboard's idempotent INSERT (VA-474) silently
- * absorbs duplicate emissions when a re-emit slips through the
- * dedup filter. Once a target is rejected, the planner won't
- * re-propose it (the rejected row still matches the open-target
- * filter is "proposed | accepted"; rejected is terminal). An
- * operator who wants to retry should remove + re-add the
- * ready-for-agent label.
+ * absorbs duplicate emissions if a re-emit slips through the dedup
+ * filter. The dedup is broad: ANY recommendation row for the target
+ * (proposed, accepted, OR rejected) causes the planner to skip on
+ * subsequent ticks. Rejected is treated as terminal — the operator
+ * removes + re-adds the ready-for-agent label on Linear to retry.
+ * This prevents OTLP noise for already-decided targets that the
+ * dashboard would only `ON CONFLICT DO NOTHING` anyway. (Initial
+ * cut filtered proposed|accepted only; PR #206 Cursor review
+ * surfaced the comment/behavior disagreement.)
  */
 
 export const QUEUE_SELECTION_CAPABILITY = "queue-selection";
@@ -60,15 +63,17 @@ export const evaluateQueueSelection = (
       return { kind: "no-ready" as const, target: null };
     }
 
-    // Hash the open + in-flight target sets into a single skip set —
-    // a target can be in either bucket. SET reads are O(N+M) with
-    // dashboard's typical N+M < 20, so no perf concern.
-    const open = new Set(ctx.readClient.listOpenRecommendationTargets());
+    // Hash the known-recommendation + in-flight target sets into a
+    // single skip set — a target can be in either bucket. SET reads
+    // are O(N+M) with dashboard's typical N+M < 20, so no perf
+    // concern. "Known" includes rejected so the planner respects the
+    // operator's decision on subsequent ticks (see module doc).
+    const known = new Set(ctx.readClient.listKnownRecommendationTargets());
     const inFlight = new Set(ctx.readClient.listInFlightActionTargets());
 
     const sorted = sortReady(ready);
     const pick = sorted.find(
-      (r) => !open.has(r.issueIdentifier) && !inFlight.has(r.issueIdentifier),
+      (r) => !known.has(r.issueIdentifier) && !inFlight.has(r.issueIdentifier),
     );
     if (!pick) {
       return { kind: "all-pending" as const, target: null };
