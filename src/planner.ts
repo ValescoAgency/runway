@@ -7,6 +7,7 @@ import {
   type Scope,
 } from "effect";
 import { ConfigTag } from "./config.js";
+import type { PlannerHealth } from "./planner-http.js";
 
 /**
  * VA-473: planner daemon — long-running host process that will own
@@ -31,6 +32,47 @@ export interface PlannerRuntime {
   readonly port: number;
 }
 
+/**
+ * VA-475: shared mutable state the HTTP health endpoint reads while
+ * the tick loop writes. Lives in a Ref so reads + writes are
+ * concurrency-safe across the Effect runtime.
+ */
+export interface PlannerStateSnapshot {
+  readonly tickCount: number;
+  readonly lastTickAtUnixMs: number | null;
+  readonly startMs: number;
+}
+
+export const makePlannerState = (
+  startMs: number,
+): Effect.Effect<Ref.Ref<PlannerStateSnapshot>> =>
+  Ref.make<PlannerStateSnapshot>({
+    tickCount: 0,
+    lastTickAtUnixMs: null,
+    startMs,
+  });
+
+/**
+ * Build a health-snapshot getter usable from the non-Effect HTTP
+ * handler context. Captures a synchronous `Ref.unsafeGet` so the
+ * handler can resolve health without invoking the Effect runtime
+ * per request.
+ */
+export const makeHealthReader =
+  (
+    stateRef: Ref.Ref<PlannerStateSnapshot>,
+    version: string,
+  ): (() => PlannerHealth) =>
+  () => {
+    const snap = Effect.runSync(Ref.get(stateRef));
+    return {
+      uptimeSeconds: Math.floor((Date.now() - snap.startMs) / 1000),
+      tickCount: snap.tickCount,
+      lastTickAtUnixMs: snap.lastTickAtUnixMs,
+      version,
+    };
+  };
+
 export const PLANNER_BOOT_LOG = "planner.boot";
 export const PLANNER_TICK_LOG = "planner.tick";
 export const PLANNER_SHUTDOWN_LOG = "planner.shutdown";
@@ -40,19 +82,27 @@ export const PLANNER_SHUTDOWN_LOG = "planner.shutdown";
  * marker; Sub-4..7 will dispatch capability evaluators here. Exposed
  * so tests can assert the marker shape without driving the whole
  * `Effect.repeat` schedule.
+ *
+ * VA-475: also writes through to the shared `PlannerStateSnapshot`
+ * so the HTTP health endpoint sees fresh tickCount + lastTickAtUnixMs
+ * after each tick.
  */
 export const makeOneTick = (
-  tickCountRef: Ref.Ref<number>,
+  stateRef: Ref.Ref<PlannerStateSnapshot>,
   startMs: number,
 ): Effect.Effect<void> =>
   Effect.gen(function* () {
-    const tickNumber = yield* Ref.updateAndGet(tickCountRef, (n) => n + 1);
+    const updated = yield* Ref.updateAndGet(stateRef, (s) => ({
+      ...s,
+      tickCount: s.tickCount + 1,
+      lastTickAtUnixMs: Date.now(),
+    }));
     const wallClockSinceStartSeconds = Math.floor(
       (Date.now() - startMs) / 1000,
     );
     yield* Effect.logInfo(PLANNER_TICK_LOG).pipe(
       Effect.annotateLogs({
-        tickNumber,
+        tickNumber: updated.tickCount,
         wallClockSinceStartSeconds,
       }),
     );
@@ -70,6 +120,7 @@ export const makeOneTick = (
  */
 export const makePlannerLoop = (
   shutdownSignal: Deferred.Deferred<void>,
+  stateRef: Ref.Ref<PlannerStateSnapshot>,
 ): Effect.Effect<void, never, ConfigTag> =>
   Effect.gen(function* () {
     const config = yield* ConfigTag;
@@ -87,10 +138,10 @@ export const makePlannerLoop = (
       }),
     );
 
-    const tickCountRef = yield* Ref.make(0);
-    const startMs = Date.now();
+    const initialState = yield* Ref.get(stateRef);
+    const startMs = initialState.startMs;
 
-    const tickStream = makeOneTick(tickCountRef, startMs).pipe(
+    const tickStream = makeOneTick(stateRef, startMs).pipe(
       Effect.repeat(
         Schedule.spaced(Duration.seconds(runtime.tickSeconds)),
       ),
@@ -99,9 +150,10 @@ export const makePlannerLoop = (
 
     yield* Effect.race(tickStream, Deferred.await(shutdownSignal));
 
+    const finalState = yield* Ref.get(stateRef);
     yield* Effect.logInfo(PLANNER_SHUTDOWN_LOG).pipe(
       Effect.annotateLogs({
-        totalTicks: yield* Ref.get(tickCountRef),
+        totalTicks: finalState.tickCount,
       }),
     );
   });
