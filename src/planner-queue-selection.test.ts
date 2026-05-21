@@ -259,13 +259,16 @@ describe("evaluateQueueSelection — VA-476", () => {
     ).toHaveLength(0);
   });
 
-  it("ignores rejected recommendations — target can be re-emitted", async () => {
-    // NOTE: v1 deliberately does NOT re-propose a rejected target,
-    // because the planner_recommendation rejected row also occupies
-    // the (capability, target) slot. The spec says the operator
-    // should remove + re-add the label to reset. This test
-    // documents the v1 behavior so a future change is visible.
+  it("dedup: skips targets with a rejected recommendation (operator decision is terminal)", async () => {
+    // PR #206 Cursor review surfaced a doc/code disagreement: the
+    // module comment said rejected was terminal, but the filter
+    // only matched proposed|accepted, so the planner re-emitted
+    // every tick (idempotent insert on the dashboard side absorbed
+    // it but the OTLP traffic was noise). Broadened to filter ANY
+    // recommendation row regardless of status. Operator removes +
+    // re-adds the ready-for-agent label to retry.
     seedSnapshot({ identifier: "VA-801", queuePosition: 0 });
+    seedSnapshot({ identifier: "VA-802", queuePosition: 1 });
     writer.recordPlannerRecommendationProposed({
       recommendationId: "queue-selection:VA-801",
       capability: "queue-selection",
@@ -284,14 +287,9 @@ describe("evaluateQueueSelection — VA-476", () => {
     });
 
     const result = (await runProgram(evaluateQueueSelection(ctx))) as {
-      target: string | null;
+      target: string;
     };
-    // Rejected row is NOT in the open set (status='rejected', not
-    // 'proposed' or 'accepted'), so the target IS re-emitted. The
-    // dashboard's idempotent INSERT then drops the duplicate id.
-    // Document this as the v1 behavior; tighten in a follow-up if it
-    // surprises operators.
-    expect(result.target).toBe("VA-801");
+    expect(result.target).toBe("VA-802");
   });
 
   it("sort is deterministic: queue_position ASC, then issue_identifier ASC", async () => {
