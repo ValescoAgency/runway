@@ -813,94 +813,17 @@ function extractConflictFilesFromReason(reason: string): readonly string[] {
 }
 
 /**
- * VA-461: subscription A — mergeability watcher.
+ * VA-461 → VA-477: subscription A — mergeability watcher.
  *
- * Polls the PR's `mergeable_state`. Acts on `dirty` (conflicts) and
- * `behind` (base moved). All other states — including `unknown` (GH
- * still computing) and `clean` (mergeable) — return `quiet`.
- *
- * The fix action launches sandcastle with the rebase prompt against
- * the impl branch (`branchStrategy: { type: "branch", branch }` per
- * VA-456's contract). If the agent reports `IMPL: BLOCKED`, the
- * outcome routes to HITL with the conflicted files surfaced in the
- * reason. On `IMPL: DONE`, the loop continues to the next iteration.
+ * Implementation moved to `src/planner-mergeability.ts` so both the
+ * inline shepherd loop (legacy) and the planner harness share a
+ * single body. Re-exported here for the orchestrator's existing
+ * `subscriptions: [makeMergeabilityWatcher(...)]` wiring.
  */
-export interface MergeabilityWatcherDeps {
-  readonly github: GithubGateway;
-  readonly config: Config;
-  /**
-   * Sandcastle invocation for the rebase agent. Defaulted to the
-   * production impl; tests inject a stub to assert prompt + branch
-   * strategy without booting Docker.
-   */
-  readonly invokeRebaseAgent?: typeof defaultInvokeRebaseAgent;
-}
-
-export function makeMergeabilityWatcher(
-  deps: MergeabilityWatcherDeps,
-): Subscription {
-  const invoke = deps.invokeRebaseAgent ?? defaultInvokeRebaseAgent;
-  return (ctx) =>
-    Effect.gen(function* () {
-      const pr = yield* deps.github.getPullRequest({
-        repoPath: ctx.cwd,
-        prNumber: ctx.prNumber,
-      });
-
-      // `merged` is handled by the merge-check upstream of subscription
-      // polls; defensive return here keeps the watcher idempotent if
-      // its merge-check sibling races slow.
-      if (pr.merged) return { kind: "quiet" } as const;
-
-      // Only `dirty` and `behind` warrant action. `unknown` happens
-      // briefly after a push while GH computes — treat as quiet so
-      // the next tick re-evaluates against settled state.
-      if (pr.mergeableState !== "dirty" && pr.mergeableState !== "behind") {
-        return { kind: "quiet" } as const;
-      }
-
-      // Pre-detect conflict files locally. `behind` typically returns
-      // an empty list (clean fast-forward); `dirty` returns the paths
-      // the agent will need to resolve.
-      const conflictFiles = yield* deps.github.getConflictFiles({
-        repoPath: ctx.cwd,
-        baseBranch: ctx.baseBranch,
-        branch: ctx.branch,
-      });
-
-      const mergeableState = pr.mergeableState;
-      return {
-        kind: "fix",
-        description: `Rebase ${ctx.branch} onto origin/${ctx.baseBranch} (mergeable_state=${mergeableState})`,
-        action: Effect.gen(function* () {
-          const result = yield* invoke({
-            issue: ctx.issue,
-            branch: ctx.branch,
-            baseBranch: ctx.baseBranch,
-            mergeableState,
-            conflictFiles,
-            cwd: ctx.cwd,
-            config: deps.config,
-          });
-          if (result.kind === "blocked") {
-            const files =
-              result.conflictFiles.length > 0
-                ? result.conflictFiles
-                : conflictFiles;
-            const fileList = files.length > 0 ? files.join(", ") : "(unknown)";
-            return {
-              kind: "hitl",
-              reason: `Mergeability: conflict in ${fileList} required human resolution`,
-            } as const;
-          }
-          return {
-            kind: "fixed",
-            detail: `Rebased ${ctx.branch} onto origin/${ctx.baseBranch}`,
-          } as const;
-        }),
-      } as const;
-    });
-}
+export {
+  makeMergeabilityWatcher,
+  type MergeabilityWatcherDeps,
+} from "./planner-mergeability.js";
 
 /**
  * Parse the PR number from a GitHub PR URL
