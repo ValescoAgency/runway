@@ -203,6 +203,17 @@ export async function plannerCommand(argv: readonly string[]): Promise<void> {
                   baseBranch: config.baseBranch,
                   now: nowNano,
                 },
+                // VA-478: CI capability shares the same gating
+                // (SQLite + baseBranch) so all per-PR shepherd
+                // capabilities light up or stay dark together.
+                ci: {
+                  readClient,
+                  github: createGithubGateway(),
+                  config,
+                  cwd: process.cwd(),
+                  baseBranch: config.baseBranch,
+                  now: nowNano,
+                },
               }
             : {}),
         }
