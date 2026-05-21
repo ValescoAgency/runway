@@ -39,8 +39,9 @@ import {
  *   - existing `accepted` recommendation, no in-flight action → run
  *     the fix action, then `action.started` + `action.completed` /
  *     `action.failed` framing
- *   - `quiet` or `hitl` → no emission (`hitl` goes through the
- *     legacy inline path until VA-482 retires it)
+ *   - `quiet` or `hitl` → no emission. HITL routing is the operator's
+ *     job now: they see the recommendation row, reject it, and
+ *     handle the PR manually in GitHub.
  *
  * Recommendation IDs are stable per PR (`shepherd-mergeability:PR-<n>`)
  * so an `INSERT OR IGNORE` on the dashboard side absorbs duplicate
@@ -439,10 +440,10 @@ const evaluateOnePr = (
     if (signal.kind === "quiet") return;
 
     if (signal.kind === "hitl") {
-      // v1: HITL handling stays with the inline shepherd loop until
-      // VA-482 retires it. The planner-side capability deliberately
-      // does NOT emit a recommendation for the no-fix case — the
-      // operator already sees the inline shepherd's HITL routing.
+      // The capability emits a log marker for operator visibility but
+      // deliberately does NOT propose a recommendation for the
+      // unactionable case — there's nothing for `accept` to do. The
+      // operator handles the PR manually in GitHub.
       yield* Effect.logInfo("planner.mergeability.hitl_signal").pipe(
         Effect.annotateLogs({
           target: `PR-${row.prNumber}`,

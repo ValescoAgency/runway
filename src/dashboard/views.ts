@@ -776,9 +776,10 @@ function computePhases(vm: DetailViewModel): readonly PhaseRow[] {
     phases.push({ name: "finalize", startNs, endNs });
   }
 
-  // VA-460: shepherd phase runs after finalize when the feature gate
-  // is on. Only present for drains with `shepherdEnabled=true`; pre-
-  // gate issue processes show the original three phases unchanged.
+  // VA-460 → VA-482: the inline post-finalize shepherd phase is
+  // retired. This branch still renders the fourth row for historical
+  // issue_processes rows (written before VA-482) so older traces
+  // don't lose their shepherd column on the timeline.
   const shepherd = vm.phaseSpans.find((p) => p.name === "shepherd");
   if (shepherd) {
     phases.push({

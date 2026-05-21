@@ -41,10 +41,10 @@ const DETAIL_PHASE_NAMES = [
   "review",
   "pushBranch",
   "openPullRequest",
-  // VA-460: shepherd span — emitted by runShepherdPass when
-  // `config.shepherdEnabled=true`. Surfaced alongside review so the
-  // operator sees post-finalize loop time on the timeline. Missing
-  // for any issue process whose drain ran without the feature gate.
+  // VA-460 → VA-482: legacy `shepherd` span surfaced inline by the
+  // retired post-finalize loop. Kept in the allowlist so historical
+  // traces (issue_processes rows written before VA-482) still
+  // render their fourth phase row; new traces never emit it.
   "shepherd",
 ] as const;
 const ISSUE_DETAIL_RE = /^\/issue\/([^/?#]+)\/([^/?#]+)\/?$/;

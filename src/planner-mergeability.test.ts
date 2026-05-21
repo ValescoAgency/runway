@@ -53,8 +53,6 @@ const PR_URL = "https://github.com/ValescoAgency/runway/pull/123";
 
 function makeConfig(): Config {
   return {
-    shepherdEnabled: true,
-    shepherdPollIntervalSeconds: 0,
   } as unknown as Config;
 }
 

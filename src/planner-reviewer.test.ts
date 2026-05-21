@@ -53,8 +53,6 @@ const PR_URL = "https://github.com/ValescoAgency/runway/pull/123";
 
 function makeConfig(over: Partial<Config> = {}): Config {
   return {
-    shepherdEnabled: true,
-    shepherdPollIntervalSeconds: 0,
     prReviewerBotLogin: "review-bot",
     ...over,
   } as unknown as Config;
