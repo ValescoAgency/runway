@@ -24,40 +24,27 @@ import {
   runSandcastle,
   stringifyResult,
 } from "./sandcastle.js";
-import type { Subscription } from "./shepherd.js";
-
 /**
- * VA-478: CI watcher relocated from `src/shepherd.ts` per ADR 0004
- * § Migration so both the legacy inline-shepherd loop and the planner
- * harness share one implementation. The original `makeCiWatcher` body
- * is kept verbatim (the inline path still uses it via shepherd.ts's
- * re-export). The planner-side dispatcher `evaluateCi` re-implements
- * the per-PR poll inline so it can wire each check failure to the
- * `recommendation.proposed → accept → action.{started,completed,failed}`
- * lifecycle.
- *
- * Dedup in the planner port differs from the inline path. The inline
- * watcher's closure state (`failureHistory`) survives across polls
- * inside one `runShepherdPass`; in the planner the tick boundary
- * resets any closure. Stability comes from the recommendation ID,
- * which encodes `(PR, sanitised check name, errorHash)`:
+ * VA-478 + VA-482: CI capability for the planner harness. The
+ * dispatcher polls each open shepherded PR's check-runs intersected
+ * with the branch's required checks and emits a planner
+ * recommendation per failure flavor. Recommendation IDs encode
+ * `(PR, sanitised check name, errorHash)`:
  *
  *   - Same failure on a new tick → same `recommendation_id` → the
  *     dashboard's `INSERT OR IGNORE` absorbs it. No re-emit.
  *   - Different log-tail hash → new `recommendation_id` → fresh
  *     recommendation row, ready for operator review.
  *
- * The inline path's "3 consecutive identical failures → HITL"
- * escalation is intentionally not ported here. The planner-side
- * recommendation model surfaces each failure flavor to the operator
- * exactly once; the operator decides retry vs. HITL via the
- * `accept` / `reject` HTTP endpoints.
+ * VA-482 retired the inline-shepherd `makeCiWatcher` factory and the
+ * Subscription / ShepherdContext abstraction it consumed; this
+ * dispatcher is now the only call site.
  */
 
 export const CI_CAPABILITY = "shepherd-ci";
 
 // ---------------------------------------------------------------------------
-// Relocated primitives (VA-462) — verbatim move from shepherd.ts.
+// CI-fix agent primitives.
 // ---------------------------------------------------------------------------
 
 export type CiFixAgentResult =
@@ -136,168 +123,6 @@ export function hashLogTail(s: string): string {
 
 export function sanitiseCheckName(name: string): string {
   return name.replace(/[^a-z0-9_-]+/gi, "-").slice(0, 40);
-}
-
-interface CiFailureRecord {
-  readonly errorHash: string;
-  readonly count: number;
-  readonly sha: string;
-}
-
-export interface CiWatcherDeps {
-  readonly github: GithubGateway;
-  readonly config: Config;
-  /** Production default; tests inject a stub. */
-  readonly invokeCiFixAgent?: typeof defaultInvokeCiFixAgent;
-  /**
-   * VA-462 AC: 3 consecutive identical failures (across SHAs) →
-   * HITL. Exposed as a knob mostly for tests, which set it to 2 so
-   * the dedup escalation fires without 3 mock sequences.
-   */
-  readonly maxConsecutiveSameFailure?: number;
-}
-
-const DEFAULT_MAX_CONSECUTIVE_SAME_FAILURE = 3;
-
-/**
- * Legacy inline-shepherd CI watcher. Verbatim relocation of the
- * VA-462 implementation. The planner-side capability does NOT call
- * this — it re-implements the per-PR scan inline so the recommendation
- * / action emission can fall out cleanly without round-tripping
- * through the `Subscription` ADT.
- */
-export function makeCiWatcher(deps: CiWatcherDeps): Subscription {
-  const invoke = deps.invokeCiFixAgent ?? defaultInvokeCiFixAgent;
-  const maxConsecutive =
-    deps.maxConsecutiveSameFailure ?? DEFAULT_MAX_CONSECUTIVE_SAME_FAILURE;
-  // Per-PR-shepherd state. The closure lives for the duration of one
-  // runShepherdPass invocation; a new PR opens fresh history.
-  const failureHistory = new Map<string, CiFailureRecord>();
-
-  return (ctx) =>
-    Effect.gen(function* () {
-      const pr = yield* deps.github.getPullRequest({
-        repoPath: ctx.cwd,
-        prNumber: ctx.prNumber,
-      });
-
-      // Merged PRs short-circuit before we burn an API call on
-      // check-runs. The merge-check upstream is the canonical exit;
-      // this is defense-in-depth.
-      if (pr.merged) return { kind: "quiet" } as const;
-
-      const checkRuns = yield* deps.github.getCheckRuns({
-        repoPath: ctx.cwd,
-        sha: pr.headSha,
-      });
-
-      const failing = checkRuns.filter(
-        (c) => c.status === "completed" && c.conclusion === "failure",
-      );
-      if (failing.length === 0) return { kind: "quiet" } as const;
-
-      // Branch-protection lookup can return null (no admin / no
-      // protection rule); the watcher then treats every check as
-      // required to err on the side of acting on failures rather
-      // than swallowing them silently.
-      const required = yield* deps.github.getRequiredChecks({
-        repoPath: ctx.cwd,
-        baseBranch: ctx.baseBranch,
-      });
-
-      const requiredFailing: readonly CheckRun[] =
-        required === null
-          ? failing
-          : failing.filter((c) => required.includes(c.name));
-
-      if (requiredFailing.length === 0) {
-        // Optional failures: surface in logs so the operator sees
-        // them but don't burn iteration budget. The AC pinpoints
-        // exactly this behavior.
-        const names = failing.map((c) => c.name).join(", ");
-        yield* Effect.logInfo(
-          `${ctx.issue.identifier}: shepherd.ci.optional_failure pr=${pr.number} checks=${names} (no action)`,
-        );
-        return { kind: "quiet" } as const;
-      }
-
-      // First required failure wins for this tick. The next iteration
-      // (after the fix lands) re-polls and picks up whatever's still
-      // broken.
-      const first = requiredFailing[0]!;
-      const logTail =
-        first.runId !== null
-          ? yield* deps.github.getCheckRunLogTail({
-              repoPath: ctx.cwd,
-              runId: first.runId,
-              lines: 50,
-            })
-          : "";
-
-      const errorHash = hashLogTail(logTail);
-      const prior = failureHistory.get(first.name);
-
-      // Rule 1: identical failure on the same SHA → quiet (already acted).
-      if (
-        prior &&
-        prior.errorHash === errorHash &&
-        prior.sha === pr.headSha
-      ) {
-        return { kind: "quiet" } as const;
-      }
-
-      // Rule 2: identical failure on a NEW SHA → escalate after the
-      // configured threshold.
-      if (prior && prior.errorHash === errorHash) {
-        const newCount = prior.count + 1;
-        failureHistory.set(first.name, {
-          errorHash,
-          count: newCount,
-          sha: pr.headSha,
-        });
-        if (newCount >= maxConsecutive) {
-          const lastLine = lastNonEmptyLine(logTail);
-          return {
-            kind: "hitl",
-            reason: `Repeated CI failure in \`${first.name}\`: ${lastLine}`,
-          } as const;
-        }
-        // else: fall through to fix
-      } else {
-        // Rule 3: fresh failure window.
-        failureHistory.set(first.name, {
-          errorHash,
-          count: 1,
-          sha: pr.headSha,
-        });
-      }
-
-      const checkName = first.name;
-      return {
-        kind: "fix",
-        description: `Re-impl after CI failure in \`${checkName}\``,
-        action: Effect.gen(function* () {
-          const result = yield* invoke({
-            issue: ctx.issue,
-            branch: ctx.branch,
-            checkName,
-            logTail,
-            cwd: ctx.cwd,
-            config: deps.config,
-          });
-          if (result.kind === "blocked") {
-            return {
-              kind: "hitl",
-              reason: `CI fix BLOCKED in \`${checkName}\`: ${result.reason}`,
-            } as const;
-          }
-          return {
-            kind: "fixed",
-            detail: `Re-impl after \`${checkName}\` failure`,
-          } as const;
-        }),
-      } as const;
-    });
 }
 
 export function lastNonEmptyLine(s: string): string {

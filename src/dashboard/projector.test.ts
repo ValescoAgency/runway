@@ -9,7 +9,6 @@ import {
   DRAIN_STARTED_LOG,
   extractActiveDrainMarkers,
   extractPlannerMarkers,
-  extractShepherdMarkers,
   PLANNER_ACTION_COMPLETED_LOG,
   PLANNER_ACTION_FAILED_LOG,
   PLANNER_ACTION_STARTED_LOG,
@@ -19,9 +18,6 @@ import {
   type PlannerRecommendationProposedLogMarker,
   projectLogs,
   projectPayload,
-  SHEPHERD_ENDED_LOG,
-  SHEPHERD_ITERATION_END_LOG,
-  SHEPHERD_ITERATION_START_LOG,
 } from "./projector.js";
 
 // VA-386: projector is the pure boundary between OTLP wire format and
@@ -765,129 +761,6 @@ describe("extractActiveDrainMarkers — VA-455", () => {
       ],
     });
     expect(markers.map((m) => m.traceId)).toEqual(["trace-1", "trace-2"]);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// VA-465 — extractShepherdMarkers
-// ---------------------------------------------------------------------------
-
-describe("extractShepherdMarkers — VA-465", () => {
-  it("recognises shepherd.iteration.start and projects the marker fields from attributes", () => {
-    const markers = extractShepherdMarkers(
-      logsPayload([
-        logRecord({
-          body: { stringValue: SHEPHERD_ITERATION_START_LOG },
-          attributes: [
-            { key: "pr", value: { stringValue: "142" } },
-            { key: "subscription", value: { stringValue: "subscription[0]" } },
-            { key: "iteration", value: { stringValue: "2" } },
-            { key: "maxIterations", value: { stringValue: "3" } },
-            { key: "description", value: { stringValue: "Rebase agent/x onto origin/main" } },
-          ],
-          traceId: "trace-shep",
-          timeUnixNano: "1715000010000000000",
-        }),
-      ]),
-    );
-    expect(markers).toEqual([
-      {
-        kind: "iteration.start",
-        traceId: "trace-shep",
-        prNumber: 142,
-        subscription: "subscription[0]",
-        iteration: 2,
-        maxIterations: 3,
-        description: "Rebase agent/x onto origin/main",
-        timestampUnixNano: "1715000010000000000",
-      },
-    ]);
-  });
-
-  it("recognises shepherd.iteration.end with outcome attribute", () => {
-    const markers = extractShepherdMarkers(
-      logsPayload([
-        logRecord({
-          body: { stringValue: SHEPHERD_ITERATION_END_LOG },
-          attributes: [
-            { key: "pr", value: { stringValue: "5" } },
-            { key: "outcome", value: { stringValue: "fixed" } },
-            { key: "detail", value: { stringValue: "Rebase complete" } },
-          ],
-          traceId: "trace-end",
-          timeUnixNano: "1715000020000000000",
-        }),
-      ]),
-    );
-    expect(markers).toEqual([
-      {
-        kind: "iteration.end",
-        traceId: "trace-end",
-        prNumber: 5,
-        outcome: "fixed",
-        detail: "Rebase complete",
-        timestampUnixNano: "1715000020000000000",
-      },
-    ]);
-  });
-
-  it("recognises shepherd.ended with outcome=merged|ready|hitl", () => {
-    for (const out of ["merged", "ready", "hitl"] as const) {
-      const markers = extractShepherdMarkers(
-        logsPayload([
-          logRecord({
-            body: { stringValue: SHEPHERD_ENDED_LOG },
-            attributes: [
-              { key: "pr", value: { stringValue: "1" } },
-              { key: "outcome", value: { stringValue: out } },
-            ],
-            traceId: "trace-z",
-            timeUnixNano: "1715000050000000000",
-          }),
-        ]),
-      );
-      expect(markers).toHaveLength(1);
-      expect(markers[0]).toMatchObject({ kind: "ended", outcome: out });
-    }
-  });
-
-  it("drops markers with non-shepherd body, missing trace_id, missing pr attribute, or missing timestamp", () => {
-    const markers = extractShepherdMarkers(
-      logsPayload([
-        logRecord({ body: { stringValue: "shepherd.start" } }), // unknown body
-        logRecord({
-          body: { stringValue: SHEPHERD_ITERATION_START_LOG },
-          traceId: undefined,
-        }),
-        logRecord({
-          body: { stringValue: SHEPHERD_ITERATION_START_LOG },
-          attributes: [], // no pr
-        }),
-        logRecord({
-          body: { stringValue: SHEPHERD_ITERATION_START_LOG },
-          attributes: [{ key: "pr", value: { stringValue: "1" } }],
-          timeUnixNano: undefined,
-          observedTimeUnixNano: undefined,
-        }),
-      ]),
-    );
-    expect(markers).toHaveLength(0);
-  });
-
-  it("falls back to outcome=hitl when shepherd.ended carries an unrecognised value (conservative default)", () => {
-    const markers = extractShepherdMarkers(
-      logsPayload([
-        logRecord({
-          body: { stringValue: SHEPHERD_ENDED_LOG },
-          attributes: [
-            { key: "pr", value: { stringValue: "9" } },
-            { key: "outcome", value: { stringValue: "wat" } },
-          ],
-          traceId: "trace-fallback",
-        }),
-      ]),
-    );
-    expect(markers[0]).toMatchObject({ kind: "ended", outcome: "hitl" });
   });
 });
 

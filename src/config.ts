@@ -172,47 +172,19 @@ export interface RunwayConfig {
    */
   readonly metaWeeklyModel?: string;
   /**
-   * VA-460: feature gate for the post-PR shepherd phase. When `false`
-   * (default) the orchestrator returns immediately after `finalize`
-   * opens the PR — the historical behavior. When `true` the shepherd
-   * loop runs against the open PR until merged / ready / HITL.
-   * Source: `RUNWAY_SHEPHERD_ENABLED` ("1" / "true" accepted).
-   */
-  readonly shepherdEnabled: boolean;
-  /**
-   * VA-460: how often the shepherd loop polls the three subscriptions
-   * (mergeability / CI / reviewer). Default `15` seconds — picked to
-   * keep GitHub API calls under the unauthenticated 60/hour limit
-   * even with several PRs in flight. Source:
-   * `RUNWAY_SHEPHERD_POLL_INTERVAL_SECONDS`.
-   */
-  readonly shepherdPollIntervalSeconds: number;
-  /**
-   * VA-463: GitHub login of the adversarial PR-reviewer bot that
-   * posts `REVIEW: APPROVED / CHANGES-REQUESTED / NEEDS-DISCUSSION`
-   * verdicts. The shepherd's reviewer watcher parses comments from
-   * THIS login as `REVIEW:` markers; comments from any other author
-   * are treated as verbatim human feedback. Unset (default) means no
-   * comment is treated as bot-authored — all comments route to the
-   * human-feedback path. Source: `RUNWAY_PR_REVIEWER_BOT_LOGIN`.
+   * VA-463 + VA-479: GitHub login of the adversarial PR-reviewer bot
+   * that posts `REVIEW: APPROVED / CHANGES-REQUESTED /
+   * NEEDS-DISCUSSION` verdicts. The planner's reviewer capability
+   * parses comments from THIS login as `REVIEW:` markers; comments
+   * from any other author are treated as verbatim human feedback
+   * (and routed through the LLM interpretation path). Unset
+   * (default) means no comment is treated as bot-authored — every
+   * comment lands on the human-feedback / LLM path. Source:
+   * `RUNWAY_PR_REVIEWER_BOT_LOGIN`. (VA-482 retired the inline
+   * shepherd loop; the same config key is now consumed by the
+   * planner's reviewer dispatcher.)
    */
   readonly prReviewerBotLogin?: string;
-  /**
-   * VA-464: max fix-attempts the shepherd loop will make per PR
-   * before escalating to HITL. Each time a subscription emits a
-   * `fix` signal counts as one iteration; quiet polls don't count.
-   * Default `3`. Source: `RUNWAY_SHEPHERD_MAX_ITERATIONS`.
-   */
-  readonly shepherdMaxIterations: number;
-  /**
-   * VA-464: wall-clock budget for the shepherd loop per PR, in
-   * seconds, measured from the start of `runShepherdPass`. On
-   * exhaustion, exit HITL with the elapsed-time reason. Default
-   * `3600` (1 hour) — enough for several CI cycles + rebase
-   * attempts but bounded so a stuck PR can't run all night. Source:
-   * `RUNWAY_SHEPHERD_MAX_WALL_SECONDS`.
-   */
-  readonly shepherdMaxWallSeconds: number;
   /**
    * VA-473: tick cadence for the planner daemon (`runway planner run`).
    * Each tick the planner emits a `planner.tick` heartbeat marker and
@@ -330,42 +302,15 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
     EConfig.string("RUNWAY_REPO_PROJECT_NAME"),
   ),
   metaWeeklyModel: EConfig.option(EConfig.string("RUNWAY_META_WEEKLY_MODEL")),
-  // VA-460: feature gate; default `false` for the first ship so the
-  // composer's post-finalize behavior is unchanged until VA-461..463
-  // wire the subscriptions.
-  shepherdEnabled: EConfig.boolean("RUNWAY_SHEPHERD_ENABLED").pipe(
-    EConfig.withDefault(false),
-  ),
-  shepherdPollIntervalSeconds: EConfig.integer(
-    "RUNWAY_SHEPHERD_POLL_INTERVAL_SECONDS",
-  ).pipe(
-    EConfig.withDefault(15),
-    EConfig.validate({
-      message:
-        "RUNWAY_SHEPHERD_POLL_INTERVAL_SECONDS must be a positive integer",
-      validation: (n): n is number => n > 0,
-    }),
-  ),
+  // VA-482: inline shepherd is retired — the four `RUNWAY_SHEPHERD_*`
+  // env vars (ENABLED / POLL_INTERVAL_SECONDS / MAX_ITERATIONS /
+  // MAX_WALL_SECONDS) are intentionally removed. Their work moved to
+  // the long-running `runway planner` daemon (capabilities VA-477..479)
+  // which has its own tick + budget knobs (`RUNWAY_PLANNER_*`).
+  // `RUNWAY_PR_REVIEWER_BOT_LOGIN` is preserved because the planner's
+  // reviewer dispatcher still consumes it.
   prReviewerBotLogin: EConfig.option(
     EConfig.string("RUNWAY_PR_REVIEWER_BOT_LOGIN"),
-  ),
-  shepherdMaxIterations: EConfig.integer(
-    "RUNWAY_SHEPHERD_MAX_ITERATIONS",
-  ).pipe(
-    EConfig.withDefault(3),
-    EConfig.validate({
-      message: "RUNWAY_SHEPHERD_MAX_ITERATIONS must be a positive integer",
-      validation: (n): n is number => n > 0,
-    }),
-  ),
-  shepherdMaxWallSeconds: EConfig.integer(
-    "RUNWAY_SHEPHERD_MAX_WALL_SECONDS",
-  ).pipe(
-    EConfig.withDefault(3600),
-    EConfig.validate({
-      message: "RUNWAY_SHEPHERD_MAX_WALL_SECONDS must be a positive integer",
-      validation: (n): n is number => n > 0,
-    }),
   ),
   // VA-473: planner daemon scaffold. Tick cadence + bind address for
   // the long-running process. No capabilities wired yet — these
@@ -416,11 +361,7 @@ const configEffect: Effect.Effect<RunwayConfig, ConfigError.ConfigError> = EConf
       ),
       runwayRepoProjectName: Option.getOrUndefined(raw.runwayRepoProjectName),
       metaWeeklyModel: Option.getOrUndefined(raw.metaWeeklyModel),
-      shepherdEnabled: raw.shepherdEnabled,
-      shepherdPollIntervalSeconds: raw.shepherdPollIntervalSeconds,
       prReviewerBotLogin: Option.getOrUndefined(raw.prReviewerBotLogin),
-      shepherdMaxIterations: raw.shepherdMaxIterations,
-      shepherdMaxWallSeconds: raw.shepherdMaxWallSeconds,
       plannerTickSeconds: raw.plannerTickSeconds,
       plannerHost: raw.plannerHost,
       plannerPort: raw.plannerPort,

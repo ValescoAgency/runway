@@ -332,50 +332,6 @@ function strArrayAttr(
 export const DRAIN_STARTED_LOG = "drain.started";
 
 /**
- * VA-465: log body strings the shepherd loop emits at three points.
- * Each carries structured attributes the projector reads to update
- * the `shepherding_prs` table. Kept in lock-step with `shepherd.ts`'s
- * `Effect.logInfo` call sites — drift between the two means the
- * sub-card stops rendering for the affected lifecycle event.
- */
-export const SHEPHERD_ITERATION_START_LOG = "shepherd.iteration.start";
-export const SHEPHERD_ITERATION_END_LOG = "shepherd.iteration.end";
-export const SHEPHERD_ENDED_LOG = "shepherd.ended";
-
-export interface ShepherdIterationStartLogMarker {
-  readonly kind: "iteration.start";
-  readonly traceId: string;
-  readonly prNumber: number;
-  readonly subscription: string;
-  readonly iteration: number;
-  readonly maxIterations: number | null;
-  readonly description: string;
-  readonly timestampUnixNano: string;
-}
-
-export interface ShepherdIterationEndLogMarker {
-  readonly kind: "iteration.end";
-  readonly traceId: string;
-  readonly prNumber: number;
-  readonly outcome: "fixed" | "hitl";
-  readonly detail: string;
-  readonly timestampUnixNano: string;
-}
-
-export interface ShepherdEndedLogMarker {
-  readonly kind: "ended";
-  readonly traceId: string;
-  readonly prNumber: number;
-  readonly outcome: "merged" | "ready" | "hitl";
-  readonly timestampUnixNano: string;
-}
-
-export type ShepherdLogMarker =
-  | ShepherdIterationStartLogMarker
-  | ShepherdIterationEndLogMarker
-  | ShepherdEndedLogMarker;
-
-/**
  * VA-474: log body strings the planner daemon emits for its six
  * event types (ADR 0004 § Writer model). Kept in lock-step with the
  * planner's `Effect.logInfo` call sites — drift between projector
@@ -681,86 +637,6 @@ export function extractActiveDrainMarkers(
   return out;
 }
 
-/**
- * VA-465: scan an OTLP logs payload for shepherd lifecycle markers.
- * Three body strings produce three marker kinds; each is tagged so
- * the server can dispatch to the right storage method. Records
- * missing trace_id, a recognised body, or a timestamp are dropped —
- * we won't fabricate any of those.
- *
- * Attribute reading is lenient: the gateway encodes numbers as
- * strings via OTLP's `stringValue`, so we re-parse with
- * `Number.parseInt`. Missing attributes get sensible defaults
- * (e.g., empty subscription, null max_iterations) rather than
- * causing the marker to be dropped — a partial marker is still
- * useful for the dashboard.
- */
-export function extractShepherdMarkers(
-  payload: OtlpLogsPayload,
-): readonly ShepherdLogMarker[] {
-  const out: ShepherdLogMarker[] = [];
-  for (const rl of payload.resourceLogs ?? []) {
-    for (const sl of rl.scopeLogs ?? []) {
-      for (const rec of sl.logRecords ?? []) {
-        const body = rec.body?.stringValue;
-        if (
-          body !== SHEPHERD_ITERATION_START_LOG &&
-          body !== SHEPHERD_ITERATION_END_LOG &&
-          body !== SHEPHERD_ENDED_LOG
-        ) {
-          continue;
-        }
-        const traceId = rec.traceId?.trim();
-        if (!traceId) continue;
-        const ts = rec.timeUnixNano ?? rec.observedTimeUnixNano;
-        if (!ts) continue;
-        const attrs = attributesToStringMap(rec.attributes);
-        const prNumber = Number.parseInt(attrs.pr ?? "", 10);
-        if (!Number.isFinite(prNumber)) continue;
-
-        if (body === SHEPHERD_ITERATION_START_LOG) {
-          const iteration = Number.parseInt(attrs.iteration ?? "", 10);
-          if (!Number.isFinite(iteration)) continue;
-          const maxIter = Number.parseInt(attrs.maxIterations ?? "", 10);
-          out.push({
-            kind: "iteration.start",
-            traceId,
-            prNumber,
-            subscription: attrs.subscription ?? "",
-            iteration,
-            maxIterations: Number.isFinite(maxIter) ? maxIter : null,
-            description: attrs.description ?? "",
-            timestampUnixNano: ts,
-          });
-        } else if (body === SHEPHERD_ITERATION_END_LOG) {
-          const outcome = attrs.outcome === "hitl" ? "hitl" : "fixed";
-          out.push({
-            kind: "iteration.end",
-            traceId,
-            prNumber,
-            outcome,
-            detail: attrs.detail ?? "",
-            timestampUnixNano: ts,
-          });
-        } else {
-          const raw = attrs.outcome;
-          const outcome =
-            raw === "merged" || raw === "ready" || raw === "hitl"
-              ? raw
-              : "hitl"; // Conservative fallback — terminal hitl is the safe default.
-          out.push({
-            kind: "ended",
-            traceId,
-            prNumber,
-            outcome,
-            timestampUnixNano: ts,
-          });
-        }
-      }
-    }
-  }
-  return out;
-}
 
 /**
  * VA-388: project an OTLP logs payload into `LogRecordRow`s. Records
