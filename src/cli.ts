@@ -2,6 +2,7 @@
 import { dashCommand, printDashUsage } from "./commands/dash.js";
 import { doctorCommand, printDoctorUsage } from "./commands/doctor.js";
 import { initCommand, printInitUsage } from "./commands/init.js";
+import { plannerCommand, printPlannerUsage } from "./commands/planner.js";
 import { reviewCommand, printReviewUsage } from "./commands/review.js";
 import { runCommand, printRunUsage } from "./commands/run.js";
 import { upgradeCommand, printUpgradeUsage } from "./commands/upgrade.js";
@@ -35,6 +36,12 @@ const SUBCOMMANDS: readonly Subcommand[] = [
     summary: "Scaffold a target repo (sandcastle init + varlock layer).",
     run: initCommand,
     help: printInitUsage,
+  },
+  {
+    name: "planner",
+    summary: "Run the planner daemon (queue selection + PR shepherding).",
+    run: plannerCommand,
+    help: printPlannerUsage,
   },
   {
     name: "review",

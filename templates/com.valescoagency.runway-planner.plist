@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  VA-473: launchd template for the runway planner daemon.
+
+  Install:
+    1. Copy to ~/Library/LaunchAgents/com.valescoagency.runway-planner.plist
+    2. Edit the placeholders below (RUNWAY_HOME, RUNWAY_RUN_DIR).
+    3. launchctl load ~/Library/LaunchAgents/com.valescoagency.runway-planner.plist
+
+  Unload:
+    launchctl unload ~/Library/LaunchAgents/com.valescoagency.runway-planner.plist
+
+  See logs:
+    tail -f ~/Library/Logs/runway-planner.stdout.log
+    tail -f ~/Library/Logs/runway-planner.stderr.log
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.valescoagency.runway-planner</string>
+
+  <!--
+    Use the runway binary from the user's pnpm global bin. If you
+    installed runway via `pnpm add -g @valescoagency/runway`, the
+    binary path is typically `$HOME/Library/pnpm/runway` on macOS.
+    Adjust as needed; `which runway` resolves it.
+  -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/REPLACE_ME_USERNAME/Library/pnpm/runway</string>
+    <string>planner</string>
+    <string>run</string>
+  </array>
+
+  <!--
+    The planner runs from the target repo's working directory so it
+    can shell out to gh/git/sandcastle in the right repo context.
+    Point this at whichever repo you want the planner to operate on.
+    The planner itself is stateless across drains; you can change
+    this and reload without losing data.
+  -->
+  <key>WorkingDirectory</key>
+  <string>/Users/REPLACE_ME_USERNAME/Developer/REPLACE_ME_REPO</string>
+
+  <!--
+    Environment passthrough. Add the same RUNWAY_* / LINEAR_*
+    keys you'd export in a shell. Secrets pulled at runtime via
+    1Password CLI should NOT be hardcoded here.
+  -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <!-- Replace with your tailnet IP to expose the API across Tailscale -->
+    <key>RUNWAY_PLANNER_HOST</key>
+    <string>127.0.0.1</string>
+    <key>RUNWAY_PLANNER_PORT</key>
+    <string>3002</string>
+    <key>RUNWAY_PLANNER_TICK_SECONDS</key>
+    <string>30</string>
+    <!-- Point at the dashboard's OTLP receiver. -->
+    <key>OTEL_EXPORTER_OTLP_ENDPOINT</key>
+    <string>http://127.0.0.1:4318</string>
+    <!-- LINEAR_API_KEY: prefer resolving via 1Password at boot;
+         do not hardcode here. The planner errors fast if it's
+         missing, which launchd's KeepAlive will treat as a crash. -->
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!--
+    Restart on crash. ThrottleInterval prevents a tight crash loop
+    from chewing through API budget; the default is 10s but we set
+    60s as a defensive measure for credential-related failures.
+  -->
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/REPLACE_ME_USERNAME/Library/Logs/runway-planner.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/REPLACE_ME_USERNAME/Library/Logs/runway-planner.stderr.log</string>
+</dict>
+</plist>
